@@ -38,7 +38,7 @@ pub const Pool = struct {
 
     pub fn init(allocator: std.mem.Allocator, conn_config: ConnConfig, pool_config: PoolConfig) !*Pool {
         if (pool_config.min_connections > pool_config.max_connections) {
-            log.err("invalid pool config: min_connections ({d}) > max_connections ({d})", .{
+            log.warn("invalid pool config: min_connections ({d}) > max_connections ({d})", .{
                 pool_config.min_connections,
                 pool_config.max_connections,
             });
@@ -327,4 +327,44 @@ test "pool stats structure" {
     };
     try std.testing.expectEqual(@as(u32, 5), stats.total);
     try std.testing.expectEqual(@as(u32, 2), stats.active);
+}
+
+test "pool config validation - min greater than max" {
+    const allocator = std.testing.allocator;
+    const conn_config = ConnConfig{
+        .host = "localhost",
+        .port = 5432,
+        .database = "test",
+        .user = "test",
+        .password = "test",
+    };
+
+    const invalid_config = PoolConfig{
+        .min_connections = 10,
+        .max_connections = 5,
+    };
+
+    const result = Pool.init(allocator, conn_config, invalid_config);
+    try std.testing.expectError(DbError.InvalidConfig, result);
+}
+
+test "pool config with zero connections allowed" {
+    const config = PoolConfig{
+        .min_connections = 0,
+        .max_connections = 5,
+    };
+    try std.testing.expectEqual(@as(u32, 0), config.min_connections);
+    try std.testing.expectEqual(@as(u32, 5), config.max_connections);
+}
+
+test "pooled conn structure" {
+    const pc = PooledConnection{
+        .conn = undefined,
+        .created_at = 1000,
+        .last_used_at = 2000,
+        .in_use = false,
+    };
+    try std.testing.expectEqual(@as(i64, 1000), pc.created_at);
+    try std.testing.expectEqual(@as(i64, 2000), pc.last_used_at);
+    try std.testing.expect(!pc.in_use);
 }

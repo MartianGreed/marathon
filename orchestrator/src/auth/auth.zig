@@ -121,3 +121,53 @@ test "api key generation" {
 
     try std.testing.expectEqual(@as(usize, 44), key.len);
 }
+
+test "authenticator register and authenticate" {
+    const allocator = std.testing.allocator;
+
+    var auth = Authenticator.init(allocator, "test-anthropic-key");
+    defer auth.deinit();
+
+    var client_id: [16]u8 = undefined;
+    @memset(&client_id, 0xAB);
+
+    try auth.registerApiKey("test-api-key-12345", client_id);
+
+    const result = auth.authenticate("test-api-key-12345");
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualSlices(u8, &client_id, &result.?);
+
+    const invalid = auth.authenticate("wrong-key");
+    try std.testing.expect(invalid == null);
+}
+
+test "authenticator getAnthropicKey" {
+    const allocator = std.testing.allocator;
+
+    var auth = Authenticator.init(allocator, "sk-ant-test-key");
+    defer auth.deinit();
+
+    try std.testing.expectEqualStrings("sk-ant-test-key", auth.getAnthropicKey());
+}
+
+test "authenticator generateClientId produces unique ids" {
+    const id1 = Authenticator.generateClientId();
+    const id2 = Authenticator.generateClientId();
+
+    try std.testing.expect(!std.mem.eql(u8, &id1, &id2));
+}
+
+test "client permissions" {
+    var client_id: [16]u8 = undefined;
+    @memset(&client_id, 0);
+
+    const perms = ClientPermissions{
+        .client_id = client_id,
+        .permissions = ClientPermissions.defaultPermissions(),
+    };
+
+    try std.testing.expect(perms.hasPermission(.submit_task));
+    try std.testing.expect(perms.hasPermission(.cancel_task));
+    try std.testing.expect(perms.hasPermission(.view_usage));
+    try std.testing.expect(!perms.hasPermission(.admin));
+}

@@ -154,3 +154,157 @@ test "metering basic operations" {
     try std.testing.expectEqual(@as(i64, 100), total.input_tokens);
     try std.testing.expectEqual(@as(i64, 50), total.output_tokens);
 }
+
+test "metering getUsageReport with time range" {
+    const allocator = std.testing.allocator;
+
+    var meter = Metering.init(allocator);
+    defer meter.deinit();
+
+    var client_id: types.ClientId = undefined;
+    @memset(&client_id, 1);
+
+    const base_time = std.time.milliTimestamp();
+
+    for (0..3) |i| {
+        var task_id: types.TaskId = undefined;
+        @memset(&task_id, @intCast(i));
+
+        const record = UsageRecord{
+            .client_id = client_id,
+            .task_id = task_id,
+            .timestamp = base_time + @as(i64, @intCast(i * 1000)),
+            .usage = .{
+                .compute_time_ms = 100,
+                .input_tokens = 10,
+                .output_tokens = 5,
+                .cache_read_tokens = 0,
+                .cache_write_tokens = 0,
+                .tool_calls = 1,
+            },
+        };
+        try meter.recordUsage(record);
+    }
+
+    const report = try meter.getUsageReport(client_id, base_time - 1, base_time + 5000);
+    defer allocator.free(report.tasks);
+
+    try std.testing.expectEqual(@as(usize, 3), report.tasks.len);
+    try std.testing.expectEqual(@as(i64, 30), report.total.input_tokens);
+    try std.testing.expectEqual(@as(i64, 15), report.total.output_tokens);
+}
+
+test "metering getUsageReport filters by client" {
+    const allocator = std.testing.allocator;
+
+    var meter = Metering.init(allocator);
+    defer meter.deinit();
+
+    var client1: types.ClientId = undefined;
+    @memset(&client1, 1);
+
+    var client2: types.ClientId = undefined;
+    @memset(&client2, 2);
+
+    var task_id: types.TaskId = undefined;
+    @memset(&task_id, 0);
+
+    const now = std.time.milliTimestamp();
+
+    try meter.recordUsage(.{
+        .client_id = client1,
+        .task_id = task_id,
+        .timestamp = now,
+        .usage = .{ .compute_time_ms = 100, .input_tokens = 100, .output_tokens = 50, .cache_read_tokens = 0, .cache_write_tokens = 0, .tool_calls = 1 },
+    });
+
+    try meter.recordUsage(.{
+        .client_id = client2,
+        .task_id = task_id,
+        .timestamp = now,
+        .usage = .{ .compute_time_ms = 200, .input_tokens = 200, .output_tokens = 100, .cache_read_tokens = 0, .cache_write_tokens = 0, .tool_calls = 2 },
+    });
+
+    const report1 = try meter.getUsageReport(client1, now - 1000, now + 1000);
+    defer allocator.free(report1.tasks);
+    try std.testing.expectEqual(@as(i64, 100), report1.total.input_tokens);
+
+    const report2 = try meter.getUsageReport(client2, now - 1000, now + 1000);
+    defer allocator.free(report2.tasks);
+    try std.testing.expectEqual(@as(i64, 200), report2.total.input_tokens);
+}
+
+test "metering pruneOlderThan removes old records" {
+    const allocator = std.testing.allocator;
+
+    var meter = Metering.init(allocator);
+    defer meter.deinit();
+
+    var client_id: types.ClientId = undefined;
+    @memset(&client_id, 1);
+
+    var task_id: types.TaskId = undefined;
+    @memset(&task_id, 0);
+
+    const old_time: i64 = 1000;
+    const new_time: i64 = 5000;
+
+    try meter.recordUsage(.{
+        .client_id = client_id,
+        .task_id = task_id,
+        .timestamp = old_time,
+        .usage = .{ .compute_time_ms = 100, .input_tokens = 10, .output_tokens = 5, .cache_read_tokens = 0, .cache_write_tokens = 0, .tool_calls = 1 },
+    });
+
+    try meter.recordUsage(.{
+        .client_id = client_id,
+        .task_id = task_id,
+        .timestamp = new_time,
+        .usage = .{ .compute_time_ms = 100, .input_tokens = 20, .output_tokens = 10, .cache_read_tokens = 0, .cache_write_tokens = 0, .tool_calls = 1 },
+    });
+
+    const removed = meter.pruneOlderThan(3000);
+    try std.testing.expectEqual(@as(usize, 1), removed);
+
+    const report = try meter.getUsageReport(client_id, 0, 10000);
+    defer allocator.free(report.tasks);
+    try std.testing.expectEqual(@as(usize, 1), report.tasks.len);
+    try std.testing.expectEqual(@as(i64, 20), report.total.input_tokens);
+}
+
+test "metering accumulates totals across multiple records" {
+    const allocator = std.testing.allocator;
+
+    var meter = Metering.init(allocator);
+    defer meter.deinit();
+
+    var client_id: types.ClientId = undefined;
+    @memset(&client_id, 1);
+
+    for (0..5) |i| {
+        var task_id: types.TaskId = undefined;
+        @memset(&task_id, @intCast(i));
+
+        try meter.recordUsage(.{
+            .client_id = client_id,
+            .task_id = task_id,
+            .timestamp = std.time.milliTimestamp(),
+            .usage = .{
+                .compute_time_ms = 100,
+                .input_tokens = 10,
+                .output_tokens = 5,
+                .cache_read_tokens = 2,
+                .cache_write_tokens = 1,
+                .tool_calls = 3,
+            },
+        });
+    }
+
+    const total = meter.getClientTotal(client_id);
+    try std.testing.expectEqual(@as(i64, 500), total.compute_time_ms);
+    try std.testing.expectEqual(@as(i64, 50), total.input_tokens);
+    try std.testing.expectEqual(@as(i64, 25), total.output_tokens);
+    try std.testing.expectEqual(@as(i64, 10), total.cache_read_tokens);
+    try std.testing.expectEqual(@as(i64, 5), total.cache_write_tokens);
+    try std.testing.expectEqual(@as(i64, 15), total.tool_calls);
+}

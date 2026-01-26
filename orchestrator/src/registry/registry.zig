@@ -152,3 +152,213 @@ test "node registry operations" {
     try std.testing.expect(retrieved != null);
     try std.testing.expectEqual(@as(u32, 10), retrieved.?.total_vm_slots);
 }
+
+test "node registry nodeCount" {
+    const allocator = std.testing.allocator;
+
+    var reg = NodeRegistry.init(allocator);
+    defer reg.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), reg.nodeCount());
+
+    var node_id: types.NodeId = undefined;
+    @memset(&node_id, 1);
+
+    const status = types.NodeStatus{
+        .node_id = node_id,
+        .hostname = "test-node",
+        .total_vm_slots = 10,
+        .active_vms = 0,
+        .warm_vms = 0,
+        .cpu_usage = 0.0,
+        .memory_usage = 0.0,
+        .disk_available_bytes = 100_000_000_000,
+        .healthy = true,
+        .draining = false,
+        .uptime_seconds = 3600,
+        .last_task_at = null,
+        .active_task_ids = &[_]types.TaskId{},
+    };
+
+    try reg.register(status);
+    try std.testing.expectEqual(@as(usize, 1), reg.nodeCount());
+}
+
+test "node registry update existing" {
+    const allocator = std.testing.allocator;
+
+    var reg = NodeRegistry.init(allocator);
+    defer reg.deinit();
+
+    var node_id: types.NodeId = undefined;
+    @memset(&node_id, 1);
+
+    const status1 = types.NodeStatus{
+        .node_id = node_id,
+        .hostname = "test-node",
+        .total_vm_slots = 10,
+        .active_vms = 2,
+        .warm_vms = 5,
+        .cpu_usage = 0.3,
+        .memory_usage = 0.4,
+        .disk_available_bytes = 100_000_000_000,
+        .healthy = true,
+        .draining = false,
+        .uptime_seconds = 3600,
+        .last_task_at = null,
+        .active_task_ids = &[_]types.TaskId{},
+    };
+
+    try reg.register(status1);
+
+    const status2 = types.NodeStatus{
+        .node_id = node_id,
+        .hostname = "test-node",
+        .total_vm_slots = 10,
+        .active_vms = 5,
+        .warm_vms = 3,
+        .cpu_usage = 0.8,
+        .memory_usage = 0.7,
+        .disk_available_bytes = 50_000_000_000,
+        .healthy = true,
+        .draining = false,
+        .uptime_seconds = 7200,
+        .last_task_at = null,
+        .active_task_ids = &[_]types.TaskId{},
+    };
+
+    try reg.register(status2);
+
+    try std.testing.expectEqual(@as(usize, 1), reg.nodeCount());
+
+    const retrieved = reg.getNode(node_id).?;
+    try std.testing.expectEqual(@as(u32, 5), retrieved.active_vms);
+    try std.testing.expect(retrieved.cpu_usage > 0.7);
+}
+
+test "node registry totalCapacity" {
+    const allocator = std.testing.allocator;
+
+    var reg = NodeRegistry.init(allocator);
+    defer reg.deinit();
+
+    var node1: types.NodeId = undefined;
+    @memset(&node1, 1);
+
+    var node2: types.NodeId = undefined;
+    @memset(&node2, 2);
+
+    try reg.register(.{
+        .node_id = node1,
+        .hostname = "node1",
+        .total_vm_slots = 10,
+        .active_vms = 3,
+        .warm_vms = 2,
+        .cpu_usage = 0.3,
+        .memory_usage = 0.4,
+        .disk_available_bytes = 100_000_000_000,
+        .healthy = true,
+        .draining = false,
+        .uptime_seconds = 3600,
+        .last_task_at = null,
+        .active_task_ids = &[_]types.TaskId{},
+    });
+
+    try reg.register(.{
+        .node_id = node2,
+        .hostname = "node2",
+        .total_vm_slots = 8,
+        .active_vms = 2,
+        .warm_vms = 1,
+        .cpu_usage = 0.2,
+        .memory_usage = 0.3,
+        .disk_available_bytes = 100_000_000_000,
+        .healthy = true,
+        .draining = false,
+        .uptime_seconds = 3600,
+        .last_task_at = null,
+        .active_task_ids = &[_]types.TaskId{},
+    });
+
+    const total = reg.totalCapacity();
+    try std.testing.expectEqual(@as(u32, 13), total);
+}
+
+test "node registry excludes unhealthy and draining from capacity" {
+    const allocator = std.testing.allocator;
+
+    var reg = NodeRegistry.init(allocator);
+    defer reg.deinit();
+
+    var healthy_id: types.NodeId = undefined;
+    @memset(&healthy_id, 1);
+
+    var unhealthy_id: types.NodeId = undefined;
+    @memset(&unhealthy_id, 2);
+
+    var draining_id: types.NodeId = undefined;
+    @memset(&draining_id, 3);
+
+    try reg.register(.{
+        .node_id = healthy_id,
+        .hostname = "healthy",
+        .total_vm_slots = 10,
+        .active_vms = 2,
+        .warm_vms = 0,
+        .cpu_usage = 0.3,
+        .memory_usage = 0.4,
+        .disk_available_bytes = 100_000_000_000,
+        .healthy = true,
+        .draining = false,
+        .uptime_seconds = 3600,
+        .last_task_at = null,
+        .active_task_ids = &[_]types.TaskId{},
+    });
+
+    try reg.register(.{
+        .node_id = unhealthy_id,
+        .hostname = "unhealthy",
+        .total_vm_slots = 10,
+        .active_vms = 0,
+        .warm_vms = 0,
+        .cpu_usage = 0.0,
+        .memory_usage = 0.0,
+        .disk_available_bytes = 100_000_000_000,
+        .healthy = false,
+        .draining = false,
+        .uptime_seconds = 3600,
+        .last_task_at = null,
+        .active_task_ids = &[_]types.TaskId{},
+    });
+
+    try reg.register(.{
+        .node_id = draining_id,
+        .hostname = "draining",
+        .total_vm_slots = 10,
+        .active_vms = 1,
+        .warm_vms = 0,
+        .cpu_usage = 0.3,
+        .memory_usage = 0.4,
+        .disk_available_bytes = 100_000_000_000,
+        .healthy = true,
+        .draining = true,
+        .uptime_seconds = 3600,
+        .last_task_at = null,
+        .active_task_ids = &[_]types.TaskId{},
+    });
+
+    try std.testing.expectEqual(@as(usize, 3), reg.nodeCount());
+    try std.testing.expectEqual(@as(u32, 8), reg.totalCapacity());
+}
+
+test "node registry getNode returns null for unknown" {
+    const allocator = std.testing.allocator;
+
+    var reg = NodeRegistry.init(allocator);
+    defer reg.deinit();
+
+    var unknown_id: types.NodeId = undefined;
+    @memset(&unknown_id, 0xFF);
+
+    try std.testing.expect(reg.getNode(unknown_id) == null);
+}
