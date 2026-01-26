@@ -1,6 +1,8 @@
 const std = @import("std");
 const common = @import("common");
 const types = common.types;
+const protocol = common.protocol;
+const grpc = common.grpc;
 
 const Command = enum {
     submit,
@@ -15,7 +17,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const config = try common.config.ClientConfig.fromEnv(allocator);
+    var config = try common.config.ClientConfig.fromEnv(allocator);
+    defer config.deinit();
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
@@ -93,10 +96,16 @@ fn printUsage() void {
 }
 
 fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
     var repo: ?[]const u8 = null;
     var branch: []const u8 = "main";
     var prompt: ?[]const u8 = null;
     var create_pr = false;
+    var pr_title: ?[]const u8 = null;
+    var pr_body: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -124,6 +133,20 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
             prompt = args[i];
         } else if (std.mem.eql(u8, arg, "--pr")) {
             create_pr = true;
+        } else if (std.mem.eql(u8, arg, "--pr-title")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --pr-title requires a value\n", .{});
+                return;
+            }
+            pr_title = args[i];
+        } else if (std.mem.eql(u8, arg, "--pr-body")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --pr-body requires a value\n", .{});
+                return;
+            }
+            pr_body = args[i];
         }
     }
 
@@ -142,12 +165,45 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         return;
     }
 
+    std.debug.print("Connecting to orchestrator at {s}:{d}...\n", .{ config.orchestrator_address, config.orchestrator_port });
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
     std.debug.print("Submitting task...\n", .{});
-    std.debug.print("  Repository: {s}\n", .{repo.?});
-    std.debug.print("  Branch: {s}\n", .{branch});
-    std.debug.print("  Prompt: {s}\n", .{prompt.?});
-    std.debug.print("  Create PR: {}\n", .{create_pr});
-    std.debug.print("  Orchestrator: {s}:{d}\n", .{ config.orchestrator_address, config.orchestrator_port });
+
+    const request = protocol.SubmitTaskRequest{
+        .repo_url = repo.?,
+        .branch = branch,
+        .prompt = prompt.?,
+        .github_token = config.github_token.?,
+        .create_pr = create_pr,
+        .pr_title = pr_title,
+        .pr_body = pr_body,
+    };
+
+    const CallbackContext = struct {
+        fn handleEvent(event: protocol.Message(protocol.TaskEvent)) bool {
+            const task_id_str = types.formatId(event.payload.task_id);
+            std.debug.print("[{s}] State: {s}\n", .{ &task_id_str, @tagName(event.payload.state) });
+
+            if (event.payload.event_type == .complete or event.payload.state.isTerminal()) {
+                std.debug.print("Task completed.\n", .{});
+                return false;
+            }
+            return true;
+        }
+    };
+
+    client.streamCall(.submit_task, request, protocol.TaskEvent, CallbackContext.handleEvent) catch |err| {
+        std.debug.print("Error: Failed to submit task: {}\n", .{err});
+        return;
+    };
 }
 
 fn handleStatus(args: []const []const u8) !void {

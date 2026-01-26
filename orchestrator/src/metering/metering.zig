@@ -2,6 +2,8 @@ const std = @import("std");
 const common = @import("common");
 const types = common.types;
 
+const log = std.log.scoped(.metering);
+
 pub const Metering = struct {
     allocator: std.mem.Allocator,
     records: std.ArrayListUnmanaged(UsageRecord),
@@ -33,6 +35,12 @@ pub const Metering = struct {
             entry.value_ptr.* = .{};
         }
         entry.value_ptr.add(record.usage);
+
+        log.info("usage recorded: task_id={s} input_tokens={d} output_tokens={d}", .{
+            &types.formatId(record.task_id),
+            record.usage.input_tokens,
+            record.usage.output_tokens,
+        });
     }
 
     pub fn getClientTotal(self: *Metering, client_id: types.ClientId) types.UsageMetrics {

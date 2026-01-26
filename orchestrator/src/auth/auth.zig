@@ -2,6 +2,8 @@ const std = @import("std");
 const common = @import("common");
 const types = common.types;
 
+const log = std.log.scoped(.auth);
+
 pub const Authenticator = struct {
     allocator: std.mem.Allocator,
     anthropic_api_key: []const u8,
@@ -27,12 +29,21 @@ pub const Authenticator = struct {
 
         const key_copy = try self.allocator.dupe(u8, api_key);
         try self.api_keys.put(key_copy, client_id);
+
+        log.info("api key registered: client_id={s}", .{&types.formatId(client_id)});
     }
 
     pub fn authenticate(self: *Authenticator, api_key: []const u8) ?types.ClientId {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.api_keys.get(api_key);
+
+        if (self.api_keys.get(api_key)) |client_id| {
+            log.info("auth success: client_id={s}", .{&types.formatId(client_id)});
+            return client_id;
+        }
+
+        log.warn("auth failed: invalid api key", .{});
+        return null;
     }
 
     pub fn getAnthropicKey(self: *Authenticator) []const u8 {

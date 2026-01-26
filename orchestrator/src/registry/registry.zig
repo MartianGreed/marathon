@@ -2,6 +2,8 @@ const std = @import("std");
 const common = @import("common");
 const types = common.types;
 
+const log = std.log.scoped(.registry);
+
 pub const NodeRegistry = struct {
     allocator: std.mem.Allocator,
     nodes: std.AutoHashMap(types.NodeId, types.NodeStatus),
@@ -30,6 +32,12 @@ pub const NodeRegistry = struct {
 
         try self.nodes.put(status.node_id, status);
         try self.last_heartbeat.put(status.node_id, std.time.milliTimestamp());
+
+        log.info("node registered: node_id={s} hostname={s} slots={d}", .{
+            &types.formatId(status.node_id),
+            status.hostname,
+            status.total_vm_slots,
+        });
     }
 
     pub fn updateHeartbeat(self: *NodeRegistry, node_id: types.NodeId, status: types.NodeStatus) !void {
@@ -83,6 +91,7 @@ pub const NodeRegistry = struct {
         }
 
         for (stale.items) |node_id| {
+            log.warn("removing stale node: node_id={s}", .{&types.formatId(node_id)});
             _ = self.nodes.remove(node_id);
             _ = self.last_heartbeat.remove(node_id);
         }

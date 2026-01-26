@@ -3,6 +3,8 @@ const common = @import("common");
 const types = common.types;
 const registry = @import("../registry/registry.zig");
 
+const log = std.log.scoped(.scheduler);
+
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
     node_registry: *registry.NodeRegistry,
@@ -40,6 +42,12 @@ pub const Scheduler = struct {
         try self.tasks.put(task.id, ctx);
         try self.task_queue.enqueue(task.id);
 
+        log.info("task submitted: task_id={s} client_id={s} repo={s}", .{
+            &types.formatId(task.id),
+            &types.formatId(task.client_id),
+            task.repo_url,
+        });
+
         return task.id;
     }
 
@@ -58,12 +66,18 @@ pub const Scheduler = struct {
 
         const node = self.selectNode() orelse {
             self.task_queue.enqueue(task_id) catch {};
+            log.warn("no available node, task requeued: task_id={s}", .{&types.formatId(task_id)});
             return null;
         };
 
         ctx.task.state = .starting;
         ctx.task.node_id = node.node_id;
         ctx.task.started_at = std.time.milliTimestamp();
+
+        log.info("task scheduled: task_id={s} node_id={s}", .{
+            &types.formatId(task_id),
+            &types.formatId(node.node_id),
+        });
 
         return .{
             .task = &ctx.task,
@@ -97,6 +111,8 @@ pub const Scheduler = struct {
         ctx.task.usage = result.usage;
         ctx.task.error_message = result.error_message;
         ctx.task.pr_url = result.pr_url;
+
+        log.info("task completed: task_id={s} state={s}", .{ &types.formatId(task_id), @tagName(result.state) });
     }
 
     pub fn cancelTask(self: *Scheduler, task_id: types.TaskId) bool {
@@ -104,10 +120,15 @@ pub const Scheduler = struct {
         defer self.mutex.unlock();
 
         const ctx = self.tasks.get(task_id) orelse return false;
-        if (ctx.task.state.isTerminal()) return false;
+        if (ctx.task.state.isTerminal()) {
+            log.warn("cancel failed, task already terminal: task_id={s}", .{&types.formatId(task_id)});
+            return false;
+        }
 
         ctx.task.state = .cancelled;
         ctx.task.completed_at = std.time.milliTimestamp();
+
+        log.info("task cancelled: task_id={s}", .{&types.formatId(task_id)});
         return true;
     }
 };
@@ -198,7 +219,8 @@ test "scheduler basic operations" {
     var client_id: types.ClientId = undefined;
     @memset(&client_id, 0);
 
-    const task = try types.Task.init(allocator, client_id, "https://github.com/test/repo", "main", "test prompt");
+    var task = try types.Task.init(allocator, client_id, "https://github.com/test/repo", "main", "test prompt");
+    defer task.deinit();
 
     const id = try sched.submitTask(task);
     const ctx = sched.getTask(id);

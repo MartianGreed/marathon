@@ -1,4 +1,4 @@
-.PHONY: all build test clean install run-orchestrator run-node-operator run-client snapshot rootfs kernel
+.PHONY: all build test clean install run-orchestrator run-node-operator run-client snapshot rootfs kernel infra-up infra-down
 
 ZIG ?= zig
 INSTALL_DIR ?= /usr/local/bin
@@ -55,6 +55,15 @@ docker-build:
 	docker build -t marathon-builder -f deploy/Dockerfile.builder .
 	docker run --rm -v $(PWD):/workspace marathon-builder zig build -Doptimize=ReleaseFast
 
+infra-up:
+	docker compose up -d
+	@echo "Waiting for services..."
+	@sleep 3
+	@docker compose ps
+
+infra-down:
+	docker compose down
+
 proto-check:
 	@echo "Validating proto files..."
 	protoc --proto_path=proto --descriptor_set_out=/dev/null proto/marathon/v1/*.proto
@@ -84,6 +93,8 @@ help:
 	@echo "  proto-check     Validate proto files"
 	@echo "  lint            Check code formatting"
 	@echo "  format          Format code"
+	@echo "  infra-up        Start Docker infrastructure (postgres, redis, etcd)"
+	@echo "  infra-down      Stop Docker infrastructure"
 	@echo ""
 	@echo "Environment:"
 	@echo "  ZIG             Zig compiler (default: zig)"

@@ -132,7 +132,15 @@ pub const Client = struct {
     }
 
     pub fn connect(self: *Client, host: []const u8, port: u16) !void {
-        const address = try net.Address.parseIp(host, port);
+        // Try parsing as IP first, fall back to DNS resolution
+        const address = net.Address.parseIp(host, port) catch {
+            // Resolve hostname via DNS
+            const list = try net.getAddressList(self.allocator, host, port);
+            defer list.deinit();
+            if (list.addrs.len == 0) return error.UnknownHostName;
+            self.stream = try net.tcpConnectToAddress(list.addrs[0]);
+            return;
+        };
         self.stream = try net.tcpConnectToAddress(address);
     }
 

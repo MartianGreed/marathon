@@ -6,3 +6,5 @@ zig-cache/
 *.so
 .DS_Store
 .claude-modified-files
+.env
+**/.env

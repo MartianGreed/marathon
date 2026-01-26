@@ -1,5 +1,74 @@
 const std = @import("std");
 
+pub const DotEnv = struct {
+    map: std.StringHashMap([]const u8),
+    allocator: std.mem.Allocator,
+    keys: std.ArrayListUnmanaged([]const u8),
+    values: std.ArrayListUnmanaged([]const u8),
+
+    pub fn load(allocator: std.mem.Allocator, path: []const u8) !?DotEnv {
+        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+            if (err == error.FileNotFound) return null;
+            return err;
+        };
+        defer file.close();
+
+        var env = DotEnv{
+            .map = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
+            .keys = .empty,
+            .values = .empty,
+        };
+
+        const content = try file.readToEndAlloc(allocator, 1024 * 1024);
+        defer allocator.free(content);
+
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+            if (std.mem.indexOfScalar(u8, trimmed, '=')) |eq_pos| {
+                const key = std.mem.trim(u8, trimmed[0..eq_pos], " \t");
+                var value = std.mem.trim(u8, trimmed[eq_pos + 1 ..], " \t");
+
+                // Strip quotes
+                if (value.len >= 2) {
+                    if ((value[0] == '"' and value[value.len - 1] == '"') or
+                        (value[0] == '\'' and value[value.len - 1] == '\''))
+                    {
+                        value = value[1 .. value.len - 1];
+                    }
+                }
+
+                const owned_key = try allocator.dupe(u8, key);
+                const owned_value = try allocator.dupe(u8, value);
+                try env.keys.append(allocator, owned_key);
+                try env.values.append(allocator, owned_value);
+                try env.map.put(owned_key, owned_value);
+            }
+        }
+
+        return env;
+    }
+
+    pub fn get(self: *const DotEnv, key: []const u8) ?[]const u8 {
+        return self.map.get(key);
+    }
+
+    pub fn deinit(self: *DotEnv) void {
+        for (self.keys.items) |key| {
+            self.allocator.free(key);
+        }
+        for (self.values.items) |value| {
+            self.allocator.free(value);
+        }
+        self.keys.deinit(self.allocator);
+        self.values.deinit(self.allocator);
+        self.map.deinit();
+    }
+};
+
 pub const OrchestratorConfig = struct {
     listen_address: []const u8 = "0.0.0.0",
     listen_port: u16 = 8080,
@@ -134,6 +203,7 @@ pub const VmAgentConfig = struct {
 };
 
 pub const ClientConfig = struct {
+    allocator: ?std.mem.Allocator = null,
     orchestrator_address: []const u8 = "localhost",
     orchestrator_port: u16 = 8080,
 
@@ -142,19 +212,55 @@ pub const ClientConfig = struct {
     tls_enabled: bool = false,
     tls_ca_path: ?[]const u8 = null,
 
-    pub fn fromEnv(allocator: std.mem.Allocator) !ClientConfig {
-        var config = ClientConfig{};
+    // Track which fields were allocated (from dotenv) vs borrowed (from system env)
+    allocated_address: bool = false,
+    allocated_token: bool = false,
 
+    pub fn deinit(self: *ClientConfig) void {
+        if (self.allocator) |alloc| {
+            if (self.allocated_address) {
+                alloc.free(self.orchestrator_address);
+            }
+            if (self.allocated_token) {
+                if (self.github_token) |token| {
+                    alloc.free(token);
+                }
+            }
+        }
+    }
+
+    pub fn fromEnv(allocator: std.mem.Allocator) !ClientConfig {
+        var config = ClientConfig{ .allocator = allocator };
+
+        var dotenv = try DotEnv.load(allocator, ".env");
+        defer if (dotenv) |*env| env.deinit();
+
+        // System env: use pointer directly (persists for program lifetime)
+        // Dotenv: must dupe (freed when dotenv.deinit called)
         if (std.posix.getenv("MARATHON_ORCHESTRATOR_ADDRESS")) |v| {
-            config.orchestrator_address = try allocator.dupe(u8, v);
+            config.orchestrator_address = v;
+        } else if (dotenv) |*env| {
+            if (env.get("MARATHON_ORCHESTRATOR_ADDRESS")) |v| {
+                config.orchestrator_address = try allocator.dupe(u8, v);
+                config.allocated_address = true;
+            }
         }
 
         if (std.posix.getenv("MARATHON_ORCHESTRATOR_PORT")) |v| {
             config.orchestrator_port = try std.fmt.parseInt(u16, v, 10);
+        } else if (dotenv) |*env| {
+            if (env.get("MARATHON_ORCHESTRATOR_PORT")) |v| {
+                config.orchestrator_port = try std.fmt.parseInt(u16, v, 10);
+            }
         }
 
         if (std.posix.getenv("GITHUB_TOKEN")) |v| {
-            config.github_token = try allocator.dupe(u8, v);
+            config.github_token = v;
+        } else if (dotenv) |*env| {
+            if (env.get("GITHUB_TOKEN")) |v| {
+                config.github_token = try allocator.dupe(u8, v);
+                config.allocated_token = true;
+            }
         }
 
         return config;

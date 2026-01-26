@@ -51,6 +51,7 @@ pub const UsageMetrics = struct {
 };
 
 pub const Task = struct {
+    allocator: std.mem.Allocator,
     id: TaskId,
     client_id: ClientId,
     state: TaskState,
@@ -75,6 +76,16 @@ pub const Task = struct {
     pr_title: ?[]const u8,
     pr_body: ?[]const u8,
 
+    pub fn deinit(self: *Task) void {
+        self.allocator.free(self.repo_url);
+        self.allocator.free(self.branch);
+        self.allocator.free(self.prompt);
+        if (self.error_message) |msg| self.allocator.free(msg);
+        if (self.pr_url) |url| self.allocator.free(url);
+        if (self.pr_title) |title| self.allocator.free(title);
+        if (self.pr_body) |body| self.allocator.free(body);
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         client_id: ClientId,
@@ -86,6 +97,7 @@ pub const Task = struct {
         std.crypto.random.bytes(&id);
 
         return .{
+            .allocator = allocator,
             .id = id,
             .client_id = client_id,
             .state = .queued,
