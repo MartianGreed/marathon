@@ -51,10 +51,23 @@ pub const Scheduler = struct {
         return task.id;
     }
 
-    pub fn getTask(self: *Scheduler, task_id: types.TaskId) ?*TaskContext {
+    pub fn getTask(self: *Scheduler, task_id: types.TaskId) ?TaskSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.tasks.get(task_id);
+
+        const ctx = self.tasks.get(task_id) orelse return null;
+        return TaskSnapshot{
+            .task = ctx.*.task,
+            .subscriber_count = ctx.*.subscribers.items.len,
+        };
+    }
+
+    pub fn getTaskState(self: *Scheduler, task_id: types.TaskId) ?types.TaskState {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const ctx = self.tasks.get(task_id) orelse return null;
+        return ctx.*.task.state;
     }
 
     pub fn scheduleNext(self: *Scheduler) ?ScheduleResult {
@@ -131,6 +144,46 @@ pub const Scheduler = struct {
         log.info("task cancelled: task_id={s}", .{&types.formatId(task_id)});
         return true;
     }
+
+    pub fn listTasks(
+        self: *Scheduler,
+        allocator: std.mem.Allocator,
+        client_id: types.ClientId,
+        state_filter: ?types.TaskState,
+        limit: u32,
+        offset: u32,
+    ) !ListTasksResult {
+        const capped_limit = @min(limit, 1000);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var matching: std.ArrayListUnmanaged(types.Task) = .empty;
+        defer matching.deinit(allocator);
+
+        var it = self.tasks.valueIterator();
+        while (it.next()) |ctx_ptr| {
+            const ctx = ctx_ptr.*;
+            if (!std.mem.eql(u8, &ctx.task.client_id, &client_id)) continue;
+            if (state_filter) |filter| {
+                if (ctx.task.state != filter) continue;
+            }
+            try matching.append(allocator, ctx.task);
+        }
+
+        const total_count: u32 = @intCast(matching.items.len);
+        const start = @min(offset, total_count);
+        const end = @min(start + capped_limit, total_count);
+        const page = matching.items[start..end];
+
+        const tasks = try allocator.alloc(types.Task, page.len);
+        @memcpy(tasks, page);
+
+        return .{
+            .tasks = tasks,
+            .total_count = total_count,
+        };
+    }
 };
 
 pub const TaskContext = struct {
@@ -175,11 +228,21 @@ pub const ScheduleResult = struct {
     node_id: types.NodeId,
 };
 
+pub const TaskSnapshot = struct {
+    task: types.Task,
+    subscriber_count: usize,
+};
+
 pub const TaskResult = struct {
     state: types.TaskState,
     usage: types.UsageMetrics,
     error_message: ?[]const u8,
     pr_url: ?[]const u8,
+};
+
+pub const ListTasksResult = struct {
+    tasks: []types.Task,
+    total_count: u32,
 };
 
 const TaskQueue = struct {

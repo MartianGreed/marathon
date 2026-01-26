@@ -15,6 +15,7 @@ pub const DbError = error{
     PoolClosed,
     InvalidState,
     InvalidParameter,
+    InvalidConfig,
     MigrationFailed,
     SchemaVersionMismatch,
     OutOfMemory,

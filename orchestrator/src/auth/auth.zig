@@ -20,6 +20,12 @@ pub const Authenticator = struct {
     }
 
     pub fn deinit(self: *Authenticator) void {
+        var it = self.api_keys.keyIterator();
+        while (it.next()) |key| {
+            const key_ptr: [*]u8 = @constCast(key.*.ptr);
+            @memset(key_ptr[0..key.*.len], 0);
+            self.allocator.free(key.*);
+        }
         self.api_keys.deinit();
     }
 

@@ -12,6 +12,29 @@ const metering = @import("../metering/metering.zig");
 const auth = @import("../auth/auth.zig");
 const db = @import("../db/root.zig");
 
+fn validateRepoUrl(url: []const u8) bool {
+    if (url.len < 10 or url.len > 2048) return false;
+
+    const valid_prefixes = [_][]const u8{
+        "https://github.com/",
+        "https://gitlab.com/",
+        "https://bitbucket.org/",
+        "git@github.com:",
+        "git@gitlab.com:",
+        "git@bitbucket.org:",
+    };
+
+    for (valid_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, url, prefix)) return true;
+    }
+
+    if (std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "git@")) {
+        return true;
+    }
+
+    return false;
+}
+
 fn generateClientId(address: std.net.Address) types.ClientId {
     var hasher = std.crypto.hash.Blake3.init(.{});
 
@@ -120,36 +143,77 @@ pub const Server = struct {
         };
         defer conn.close();
 
-        log.info("client connected from {any}", .{stream.address});
+        const client_id = generateClientId(stream.address);
+        log.info("client connected from {any} client_id={s}", .{ stream.address, &types.formatId(&client_id) });
+
+        var handler = RequestHandler{
+            .allocator = self.allocator,
+            .scheduler = self.scheduler,
+            .registry = self.registry,
+            .metering = self.metering,
+            .auth = self.auth,
+            .task_repo = self.task_repo,
+        };
 
         while (true) {
-            const msg = conn.readMessage(protocol.SubmitTaskRequest) catch |err| {
+            const header = conn.readHeader() catch |err| {
                 if (err == error.ConnectionClosed or err == error.ConnectionResetByPeer) {
-                    log.info("client disconnected", .{});
+                    log.info("client disconnected: client_id={s}", .{&types.formatId(&client_id)});
                     return;
                 }
-                log.err("failed to read message: {}", .{err});
+                log.err("failed to read header: {}", .{err});
                 return;
             };
 
-            if (msg.header.msg_type == .submit_task) {
-                var handler = RequestHandler{
-                    .allocator = self.allocator,
-                    .scheduler = self.scheduler,
-                    .registry = self.registry,
-                    .metering = self.metering,
-                    .auth = self.auth,
-                    .task_repo = self.task_repo,
+            self.dispatchMessage(&conn, &handler, header, client_id) catch |err| {
+                log.err("failed to handle message type={s}: {}", .{ @tagName(header.msg_type), err });
+                conn.writeMessage(.error_response, header.request_id, protocol.ErrorResponse{
+                    .code = "INTERNAL_ERROR",
+                    .message = "Failed to process request",
+                }) catch |write_err| {
+                    log.err("failed to send error response: {}", .{write_err});
+                    return;
                 };
+            };
+        }
+    }
 
-                const client_id = generateClientId(stream.address);
-                log.info("generated client_id={s} for address={any}", .{ &types.formatId(&client_id), stream.address });
-                handler.handleSubmitTask(&conn, msg.payload, client_id) catch |err| {
-                    log.err("failed to handle submit task: {}", .{err});
-                };
-            } else {
-                log.warn("unsupported message type: {}", .{msg.header.msg_type});
-            }
+    fn dispatchMessage(
+        self: *Server,
+        conn: *grpc.Connection,
+        handler: *RequestHandler,
+        header: protocol.Header,
+        client_id: types.ClientId,
+    ) !void {
+        _ = self;
+        switch (header.msg_type) {
+            .submit_task => {
+                const request = try conn.readPayload(protocol.SubmitTaskRequest, header);
+                try handler.handleSubmitTask(conn, request, client_id, header.request_id);
+            },
+            .get_task => {
+                const request = try conn.readPayload(protocol.GetTaskRequest, header);
+                try handler.handleGetTask(conn, request.task_id, header.request_id);
+            },
+            .cancel_task => {
+                const request = try conn.readPayload(protocol.CancelTaskRequest, header);
+                try handler.handleCancelTask(conn, request.task_id, header.request_id);
+            },
+            .get_usage => {
+                const request = try conn.readPayload(protocol.GetUsageRequest, header);
+                try handler.handleGetUsage(conn, request, client_id, header.request_id);
+            },
+            .list_tasks => {
+                const request = try conn.readPayload(protocol.ListTasksRequest, header);
+                try handler.handleListTasks(conn, request, client_id, header.request_id);
+            },
+            else => {
+                log.warn("unsupported message type: {}", .{header.msg_type});
+                try conn.writeMessage(.error_response, header.request_id, protocol.ErrorResponse{
+                    .code = "UNSUPPORTED_MESSAGE",
+                    .message = "Message type not supported",
+                });
+            },
         }
     }
 };
@@ -167,10 +231,20 @@ pub const RequestHandler = struct {
         conn: *grpc.Connection,
         request: protocol.SubmitTaskRequest,
         client_id: types.ClientId,
+        request_id: u32,
     ) !void {
+        if (!validateRepoUrl(request.repo_url)) {
+            log.warn("submit rejected: invalid repo url for client_id={s}", .{&types.formatId(&client_id)});
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "INVALID_REPO_URL",
+                .message = "Invalid repository URL format",
+            });
+            return;
+        }
+
         if (!auth.Authenticator.validateGitHubToken(request.github_token)) {
-            log.warn("submit rejected: invalid github token", .{});
-            try conn.writeMessage(.error_response, 0, ErrorResponse{
+            log.warn("submit rejected: invalid github token for client_id={s}", .{&types.formatId(&client_id)});
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
                 .code = "INVALID_GITHUB_TOKEN",
                 .message = "Invalid GitHub token format",
             });
@@ -191,7 +265,7 @@ pub const RequestHandler = struct {
         if (self.task_repo) |repo| {
             repo.create(&task) catch |err| {
                 log.err("failed to persist task: {}", .{err});
-                try conn.writeMessage(.error_response, 0, ErrorResponse{
+                try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
                     .code = "DB_ERROR",
                     .message = "Failed to persist task",
                 });
@@ -201,7 +275,11 @@ pub const RequestHandler = struct {
 
         const task_id = try self.scheduler.submitTask(task);
 
-        log.info("task submit request: task_id={s} repo={s}", .{ &types.formatId(task_id), request.repo_url });
+        log.info("task submitted: task_id={s} client_id={s} repo={s}", .{
+            &types.formatId(task_id),
+            &types.formatId(&client_id),
+            request.repo_url,
+        });
 
         const event = protocol.TaskEvent{
             .task_id = task_id,
@@ -211,27 +289,26 @@ pub const RequestHandler = struct {
             .data = &[_]u8{},
         };
 
-        try conn.writeMessage(.task_event, 0, event);
+        try conn.writeMessage(.task_event, request_id, event);
 
-        self.streamTaskEvents(conn, task_id) catch |err| {
-            std.log.err("Error streaming task events: {}", .{err});
+        self.streamTaskEvents(conn, task_id, request_id) catch |err| {
+            log.err("error streaming task events: task_id={s} err={}", .{ &types.formatId(task_id), err });
         };
     }
 
-    fn streamTaskEvents(self: *RequestHandler, conn: *grpc.Connection, task_id: types.TaskId) !void {
+    fn streamTaskEvents(self: *RequestHandler, conn: *grpc.Connection, task_id: types.TaskId, request_id: u32) !void {
         while (true) {
-            const ctx = self.scheduler.getTask(task_id) orelse break;
-            const task = ctx.task;
+            const state = self.scheduler.getTaskState(task_id) orelse break;
 
-            if (task.state.isTerminal()) {
+            if (state.isTerminal()) {
                 const complete_event = protocol.TaskEvent{
                     .task_id = task_id,
-                    .state = task.state,
+                    .state = state,
                     .timestamp = std.time.milliTimestamp(),
                     .event_type = .complete,
                     .data = &[_]u8{},
                 };
-                try conn.writeMessage(.task_event, 0, complete_event);
+                try conn.writeMessage(.task_event, request_id, complete_event);
                 break;
             }
 
@@ -239,40 +316,138 @@ pub const RequestHandler = struct {
         }
     }
 
-    pub fn handleGetTask(self: *RequestHandler, task_id: types.TaskId) ?types.Task {
-        const ctx = self.scheduler.getTask(task_id) orelse return null;
-        return ctx.task;
+    pub fn handleGetTask(
+        self: *RequestHandler,
+        conn: *grpc.Connection,
+        task_id: types.TaskId,
+        request_id: u32,
+    ) !void {
+        const snapshot = self.scheduler.getTask(task_id) orelse {
+            log.warn("get_task: task not found task_id={s}", .{&types.formatId(task_id)});
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "NOT_FOUND",
+                .message = "Task not found",
+            });
+            return;
+        };
+
+        const task = snapshot.task;
+        log.info("get_task: task_id={s} state={s}", .{ &types.formatId(task_id), @tagName(task.state) });
+
+        const response = protocol.TaskResponse{
+            .task_id = task.id,
+            .client_id = task.client_id,
+            .state = task.state,
+            .repo_url = task.repo_url,
+            .branch = task.branch,
+            .prompt = task.prompt,
+            .node_id = task.node_id,
+            .created_at = task.created_at,
+            .started_at = task.started_at,
+            .completed_at = task.completed_at,
+            .error_message = task.error_message,
+            .pr_url = task.pr_url,
+            .usage = task.usage,
+        };
+
+        try conn.writeMessage(.task_response, request_id, response);
     }
 
-    pub fn handleCancelTask(self: *RequestHandler, task_id: types.TaskId) CancelResponse {
+    pub fn handleCancelTask(
+        self: *RequestHandler,
+        conn: *grpc.Connection,
+        task_id: types.TaskId,
+        request_id: u32,
+    ) !void {
         const success = self.scheduler.cancelTask(task_id);
 
-        log.info("cancel request: task_id={s} success={}", .{ &types.formatId(task_id), success });
+        log.info("cancel_task: task_id={s} success={}", .{ &types.formatId(task_id), success });
 
-        return .{
+        const response = protocol.CancelResponse{
             .success = success,
-            .message = if (success) "Task cancelled" else "Failed to cancel task",
+            .message = if (success) "Task cancelled successfully" else "Failed to cancel task",
         };
+
+        try conn.writeMessage(.task_response, request_id, response);
     }
 
     pub fn handleGetUsage(
         self: *RequestHandler,
+        conn: *grpc.Connection,
+        request: protocol.GetUsageRequest,
         client_id: types.ClientId,
-        start_time: i64,
-        end_time: i64,
-    ) !metering.UsageReport {
-        return self.metering.getUsageReport(client_id, start_time, end_time);
+        request_id: u32,
+    ) !void {
+        _ = request.client_id; // Use the client_id derived from connection for security
+        const report = try self.metering.getUsageReport(client_id, request.start_time, request.end_time);
+        defer self.allocator.free(report.tasks);
+
+        log.info("get_usage: client_id={s} tasks={d} input_tokens={d} output_tokens={d}", .{
+            &types.formatId(&client_id),
+            report.tasks.len,
+            report.total.input_tokens,
+            report.total.output_tokens,
+        });
+
+        const response = protocol.UsageResponse{
+            .client_id = client_id,
+            .start_time = request.start_time,
+            .end_time = request.end_time,
+            .total_input_tokens = report.total.input_tokens,
+            .total_output_tokens = report.total.output_tokens,
+            .total_cache_read_tokens = report.total.cache_read_tokens,
+            .total_cache_write_tokens = report.total.cache_write_tokens,
+            .total_compute_time_ms = report.total.compute_time_ms,
+            .total_tool_calls = report.total.tool_calls,
+            .task_count = @intCast(report.tasks.len),
+        };
+
+        try conn.writeMessage(.usage_response, request_id, response);
     }
-};
 
-const ErrorResponse = struct {
-    code: []const u8,
-    message: []const u8,
-};
+    pub fn handleListTasks(
+        self: *RequestHandler,
+        conn: *grpc.Connection,
+        request: protocol.ListTasksRequest,
+        client_id: types.ClientId,
+        request_id: u32,
+    ) !void {
+        _ = request.client_id; // Use the client_id derived from connection for security
+        const result = try self.scheduler.listTasks(
+            self.allocator,
+            client_id,
+            request.state_filter,
+            request.limit,
+            request.offset,
+        );
+        defer self.allocator.free(result.tasks);
 
-const CancelResponse = struct {
-    success: bool,
-    message: []const u8,
+        log.info("list_tasks: client_id={s} returned={d} total={d}", .{
+            &types.formatId(&client_id),
+            result.tasks.len,
+            result.total_count,
+        });
+
+        var summaries = try self.allocator.alloc(protocol.TaskSummary, result.tasks.len);
+        defer self.allocator.free(summaries);
+
+        for (result.tasks, 0..) |task, i| {
+            summaries[i] = .{
+                .task_id = task.id,
+                .state = task.state,
+                .repo_url = task.repo_url,
+                .created_at = task.created_at,
+                .completed_at = task.completed_at,
+            };
+        }
+
+        const response = protocol.ListTasksResponse{
+            .tasks = summaries,
+            .total_count = result.total_count,
+        };
+
+        try conn.writeMessage(.task_response, request_id, response);
+    }
 };
 
 test "request handler" {
@@ -354,4 +529,28 @@ test "generateClientId - consistent across multiple calls" {
 
     try std.testing.expectEqualSlices(u8, &id1, &id2);
     try std.testing.expectEqualSlices(u8, &id2, &id3);
+}
+
+test "validateRepoUrl - accepts valid GitHub URLs" {
+    try std.testing.expect(validateRepoUrl("https://github.com/user/repo"));
+    try std.testing.expect(validateRepoUrl("https://github.com/org/project.git"));
+    try std.testing.expect(validateRepoUrl("git@github.com:user/repo.git"));
+}
+
+test "validateRepoUrl - accepts valid GitLab URLs" {
+    try std.testing.expect(validateRepoUrl("https://gitlab.com/user/repo"));
+    try std.testing.expect(validateRepoUrl("git@gitlab.com:user/repo.git"));
+}
+
+test "validateRepoUrl - accepts valid Bitbucket URLs" {
+    try std.testing.expect(validateRepoUrl("https://bitbucket.org/user/repo"));
+    try std.testing.expect(validateRepoUrl("git@bitbucket.org:user/repo.git"));
+}
+
+test "validateRepoUrl - rejects invalid URLs" {
+    try std.testing.expect(!validateRepoUrl(""));
+    try std.testing.expect(!validateRepoUrl("short"));
+    try std.testing.expect(!validateRepoUrl("http://github.com/user/repo"));
+    try std.testing.expect(!validateRepoUrl("ftp://github.com/user/repo"));
+    try std.testing.expect(!validateRepoUrl("file:///etc/passwd"));
 }

@@ -82,7 +82,7 @@ pub const NodeRepository = struct {
         defer result.deinit();
 
         if (result.first()) |row| {
-            return self.rowToNodeStatus(row);
+            return try self.rowToNodeStatus(row);
         }
         return null;
     }
@@ -192,8 +192,7 @@ pub const NodeRepository = struct {
         );
     }
 
-    fn rowToNodeStatus(self: *NodeRepository, row: db_types.Row) types.NodeStatus {
-        _ = self;
+    fn rowToNodeStatus(self: *NodeRepository, row: db_types.Row) !types.NodeStatus {
         var status = types.NodeStatus{
             .node_id = undefined,
             .hostname = "",
@@ -214,7 +213,7 @@ pub const NodeRepository = struct {
             if (id.len == 16) @memcpy(&status.node_id, id);
         }
         if (row.getText(1)) |hostname| {
-            status.hostname = hostname;
+            status.hostname = try self.allocator.dupe(u8, hostname);
         }
 
         return status;
@@ -222,10 +221,15 @@ pub const NodeRepository = struct {
 
     fn rowsToNodeStatuses(self: *NodeRepository, rows: []db_types.Row) ![]types.NodeStatus {
         var statuses = try self.allocator.alloc(types.NodeStatus, rows.len);
-        errdefer self.allocator.free(statuses);
+        errdefer {
+            for (statuses) |*s| {
+                if (s.hostname.len > 0) self.allocator.free(s.hostname);
+            }
+            self.allocator.free(statuses);
+        }
 
         for (rows, 0..) |row, i| {
-            statuses[i] = self.rowToNodeStatus(row);
+            statuses[i] = try self.rowToNodeStatus(row);
         }
 
         return statuses;

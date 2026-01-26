@@ -337,6 +337,79 @@ pub const VsockErrorPayload = struct {
     message: []const u8,
 };
 
+pub const GetTaskRequest = struct {
+    task_id: types.TaskId,
+};
+
+pub const TaskResponse = struct {
+    task_id: types.TaskId,
+    client_id: types.ClientId,
+    state: types.TaskState,
+    repo_url: []const u8,
+    branch: []const u8,
+    prompt: []const u8,
+    node_id: ?types.NodeId,
+    created_at: i64,
+    started_at: ?i64,
+    completed_at: ?i64,
+    error_message: ?[]const u8,
+    pr_url: ?[]const u8,
+    usage: types.UsageMetrics,
+};
+
+pub const CancelTaskRequest = struct {
+    task_id: types.TaskId,
+};
+
+pub const CancelResponse = struct {
+    success: bool,
+    message: []const u8,
+};
+
+pub const GetUsageRequest = struct {
+    client_id: types.ClientId,
+    start_time: i64,
+    end_time: i64,
+};
+
+pub const UsageResponse = struct {
+    client_id: types.ClientId,
+    start_time: i64,
+    end_time: i64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cache_read_tokens: i64,
+    total_cache_write_tokens: i64,
+    total_compute_time_ms: i64,
+    total_tool_calls: i64,
+    task_count: u32,
+};
+
+pub const ListTasksRequest = struct {
+    client_id: types.ClientId,
+    state_filter: ?types.TaskState,
+    limit: u32,
+    offset: u32,
+};
+
+pub const ListTasksResponse = struct {
+    tasks: []TaskSummary,
+    total_count: u32,
+};
+
+pub const TaskSummary = struct {
+    task_id: types.TaskId,
+    state: types.TaskState,
+    repo_url: []const u8,
+    created_at: i64,
+    completed_at: ?i64,
+};
+
+pub const ErrorResponse = struct {
+    code: []const u8,
+    message: []const u8,
+};
+
 test "roundtrip encoding" {
     const allocator = std.testing.allocator;
 

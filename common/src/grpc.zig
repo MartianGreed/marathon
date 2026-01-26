@@ -68,6 +68,34 @@ pub const Connection = struct {
         self.stream.close();
     }
 
+    pub fn readHeader(self: *Connection) !protocol.Header {
+        var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+        try self.readExact(&header_buf);
+
+        const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
+        if (!std.mem.eql(u8, &header.magic, &.{ 'M', 'R', 'T', 'N' })) {
+            return error.InvalidMagic;
+        }
+
+        return header.*;
+    }
+
+    pub fn readPayload(self: *Connection, comptime T: type, header: protocol.Header) !T {
+        const payload_buf = try self.allocator.alloc(u8, header.payload_len);
+        defer self.allocator.free(payload_buf);
+
+        try self.readExact(payload_buf);
+
+        var full_buf = try self.allocator.alloc(u8, @sizeOf(protocol.Header) + header.payload_len);
+        defer self.allocator.free(full_buf);
+
+        @memcpy(full_buf[0..@sizeOf(protocol.Header)], std.mem.asBytes(&header));
+        @memcpy(full_buf[@sizeOf(protocol.Header)..], payload_buf);
+
+        const msg = try protocol.Message(T).decode(self.allocator, full_buf);
+        return msg.payload;
+    }
+
     pub fn readMessage(self: *Connection, comptime T: type) !protocol.Message(T) {
         var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
         try self.readExact(&header_buf);

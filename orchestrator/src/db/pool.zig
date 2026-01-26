@@ -37,6 +37,14 @@ pub const Pool = struct {
     total_released: u64,
 
     pub fn init(allocator: std.mem.Allocator, conn_config: ConnConfig, pool_config: PoolConfig) !*Pool {
+        if (pool_config.min_connections > pool_config.max_connections) {
+            log.err("invalid pool config: min_connections ({d}) > max_connections ({d})", .{
+                pool_config.min_connections,
+                pool_config.max_connections,
+            });
+            return DbError.InvalidConfig;
+        }
+
         const pool = try allocator.create(Pool);
         errdefer allocator.destroy(pool);
 
@@ -53,10 +61,21 @@ pub const Pool = struct {
             .total_released = 0,
         };
 
+        var created: u32 = 0;
+        var last_err: ?anyerror = null;
         for (0..pool_config.min_connections) |_| {
             pool.createConnection() catch |err| {
                 log.warn("failed to create initial connection: {}", .{err});
+                last_err = err;
+                continue;
             };
+            created += 1;
+        }
+
+        if (created == 0 and pool_config.min_connections > 0) {
+            log.err("pool init failed: could not create any connections", .{});
+            allocator.destroy(pool);
+            return last_err orelse DbError.ConnectionFailed;
         }
 
         log.info("pool initialized: min={d} max={d} created={d}", .{

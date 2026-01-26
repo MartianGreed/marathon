@@ -268,14 +268,16 @@ pub const TaskRepository = struct {
         }
         if (row.getOptionalBytea(6) orelse null) |id| {
             if (id.len == 16) {
-                task.node_id = undefined;
-                @memcpy(&task.node_id.?, id);
+                var node_id: types.NodeId = undefined;
+                @memcpy(&node_id, id);
+                task.node_id = node_id;
             }
         }
         if (row.getOptionalBytea(7) orelse null) |id| {
             if (id.len == 16) {
-                task.vm_id = undefined;
-                @memcpy(&task.vm_id.?, id);
+                var vm_id: types.VmId = undefined;
+                @memcpy(&vm_id, id);
+                task.vm_id = vm_id;
             }
         }
         if (row.getOptionalText(11) orelse null) |msg| {
