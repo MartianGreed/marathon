@@ -1,0 +1,23 @@
+FROM alpine:3.19 AS builder
+
+RUN apk add --no-cache curl xz tar
+
+RUN curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C /opt && \
+    ln -s /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig
+
+WORKDIR /build
+COPY . .
+
+RUN zig build -Doptimize=ReleaseFast
+
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates
+
+COPY --from=builder /build/zig-out/bin/marathon-orchestrator /usr/local/bin/
+
+EXPOSE 8080 9090
+
+USER nobody
+
+ENTRYPOINT ["/usr/local/bin/marathon-orchestrator"]

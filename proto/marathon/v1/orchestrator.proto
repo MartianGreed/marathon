@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package marathon.v1;
+
+option go_package = "github.com/marathon/proto/marathon/v1;marathonv1";
+
+// Task state machine: QUEUED → STARTING → RUNNING → COMPLETED/FAILED/CANCELLED
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED = 1;
+  TASK_STATE_STARTING = 2;
+  TASK_STATE_RUNNING = 3;
+  TASK_STATE_COMPLETED = 4;
+  TASK_STATE_FAILED = 5;
+  TASK_STATE_CANCELLED = 6;
+}
+
+message Task {
+  string id = 1;
+  string client_id = 2;
+  TaskState state = 3;
+
+  // Task definition
+  string repo_url = 4;
+  string branch = 5;
+  string prompt = 6;
+
+  // Execution info
+  string node_id = 7;
+  string vm_id = 8;
+
+  // Timestamps (unix millis)
+  int64 created_at = 9;
+  int64 started_at = 10;
+  int64 completed_at = 11;
+
+  // Results
+  string error_message = 12;
+  string pr_url = 13;
+
+  // Metering
+  UsageMetrics usage = 14;
+}
+
+message UsageMetrics {
+  int64 compute_time_ms = 1;
+  int64 input_tokens = 2;
+  int64 output_tokens = 3;
+  int64 cache_read_tokens = 4;
+  int64 cache_write_tokens = 5;
+  int64 tool_calls = 6;
+}
+
+// Client → Orchestrator API
+service MarathonService {
+  // Submit a new task, returns streaming events
+  rpc SubmitTask(SubmitTaskRequest) returns (stream TaskEvent);
+
+  // Get task status
+  rpc GetTask(GetTaskRequest) returns (Task);
+
+  // Cancel a running task
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+
+  // Get usage/billing report
+  rpc GetUsage(GetUsageRequest) returns (UsageReport);
+
+  // List tasks for a client
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+}
+
+message SubmitTaskRequest {
+  string repo_url = 1;
+  string branch = 2;
+  string prompt = 3;
+
+  // Client provides their own GitHub token
+  string github_token = 4;
+
+  // Optional: create PR on completion
+  bool create_pr = 5;
+  string pr_title = 6;
+  string pr_body = 7;
+}
+
+message TaskEvent {
+  string task_id = 1;
+  TaskState state = 2;
+  int64 timestamp = 3;
+
+  oneof event {
+    TaskStateChange state_change = 4;
+    TaskOutput output = 5;
+    TaskError error = 6;
+    TaskComplete complete = 7;
+  }
+}
+
+message TaskStateChange {
+  TaskState from_state = 1;
+  TaskState to_state = 2;
+}
+
+message TaskOutput {
+  enum OutputType {
+    OUTPUT_TYPE_UNSPECIFIED = 0;
+    OUTPUT_TYPE_STDOUT = 1;
+    OUTPUT_TYPE_STDERR = 2;
+    OUTPUT_TYPE_CLAUDE = 3;  // Claude Code structured output
+  }
+  OutputType type = 1;
+  bytes data = 2;
+}
+
+message TaskError {
+  string code = 1;
+  string message = 2;
+}
+
+message TaskComplete {
+  UsageMetrics usage = 1;
+  string pr_url = 2;  // If PR was created
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message CancelTaskRequest {
+  string task_id = 1;
+}
+
+message CancelTaskResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetUsageRequest {
+  // Time range (unix millis)
+  int64 start_time = 1;
+  int64 end_time = 2;
+}
+
+message UsageReport {
+  string client_id = 1;
+  int64 start_time = 2;
+  int64 end_time = 3;
+
+  // Aggregated metrics
+  UsageMetrics total = 4;
+
+  // Per-task breakdown
+  repeated TaskUsage tasks = 5;
+}
+
+message TaskUsage {
+  string task_id = 1;
+  int64 timestamp = 2;
+  UsageMetrics usage = 3;
+}
+
+message ListTasksRequest {
+  // Filter by state (empty = all)
+  repeated TaskState states = 1;
+
+  // Pagination
+  int32 limit = 2;
+  string cursor = 3;
+}
+
+message ListTasksResponse {
+  repeated Task tasks = 1;
+  string next_cursor = 2;
+}

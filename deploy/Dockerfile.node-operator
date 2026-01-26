@@ -1,0 +1,32 @@
+FROM alpine:3.19 AS builder
+
+RUN apk add --no-cache curl xz tar
+
+RUN curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C /opt && \
+    ln -s /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig
+
+WORKDIR /build
+COPY . .
+
+RUN zig build -Doptimize=ReleaseFast
+
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates
+
+ENV FIRECRACKER_VERSION=1.8.0
+RUN curl -L "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz" | \
+    tar -xz -C /usr/bin --strip-components=1 release-v${FIRECRACKER_VERSION}-x86_64/firecracker-v${FIRECRACKER_VERSION}-x86_64 && \
+    mv /usr/bin/firecracker-v${FIRECRACKER_VERSION}-x86_64 /usr/bin/firecracker
+
+RUN curl -L "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz" | \
+    tar -xz -C /usr/bin --strip-components=1 release-v${FIRECRACKER_VERSION}-x86_64/jailer-v${FIRECRACKER_VERSION}-x86_64 && \
+    mv /usr/bin/jailer-v${FIRECRACKER_VERSION}-x86_64 /usr/bin/jailer
+
+COPY --from=builder /build/zig-out/bin/marathon-node-operator /usr/local/bin/
+
+RUN mkdir -p /var/lib/marathon/{snapshots,rootfs,kernel} /run/firecracker
+
+EXPOSE 8081 9091
+
+ENTRYPOINT ["/usr/local/bin/marathon-node-operator"]

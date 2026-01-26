@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+package marathon.v1;
+
+option go_package = "github.com/marathon/proto/marathon/v1;marathonv1";
+
+import "marathon/v1/orchestrator.proto";
+
+// Orchestrator → Node Operator internal API
+service NodeOperatorService {
+  // Execute a task on this node
+  rpc ExecuteTask(ExecuteTaskRequest) returns (stream TaskEvent);
+
+  // Bidirectional heartbeat stream
+  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+
+  // Get node status
+  rpc GetStatus(GetStatusRequest) returns (NodeStatus);
+
+  // Prepare warm VMs (admin)
+  rpc WarmPool(WarmPoolRequest) returns (WarmPoolResponse);
+}
+
+message ExecuteTaskRequest {
+  string task_id = 1;
+  string repo_url = 2;
+  string branch = 3;
+  string prompt = 4;
+
+  // Secrets injected by orchestrator
+  string github_token = 5;
+  string anthropic_api_key = 6;
+
+  // PR creation
+  bool create_pr = 7;
+  string pr_title = 8;
+  string pr_body = 9;
+
+  // Resource limits
+  int64 timeout_ms = 10;
+  int64 max_tokens = 11;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  int64 timestamp = 2;
+  NodeStatus status = 3;
+}
+
+message HeartbeatResponse {
+  int64 timestamp = 1;
+  // Commands from orchestrator
+  repeated NodeCommand commands = 2;
+}
+
+message NodeCommand {
+  enum CommandType {
+    COMMAND_TYPE_UNSPECIFIED = 0;
+    COMMAND_TYPE_DRAIN = 1;       // Stop accepting new tasks
+    COMMAND_TYPE_WARM_POOL = 2;   // Adjust warm pool size
+    COMMAND_TYPE_CANCEL_TASK = 3; // Cancel specific task
+  }
+  CommandType type = 1;
+  string task_id = 2;  // For CANCEL_TASK
+  int32 pool_size = 3; // For WARM_POOL
+}
+
+message GetStatusRequest {}
+
+message NodeStatus {
+  string node_id = 1;
+  string hostname = 2;
+
+  // Capacity
+  int32 total_vm_slots = 3;
+  int32 active_vms = 4;
+  int32 warm_vms = 5;
+
+  // Resource usage
+  double cpu_usage = 6;
+  double memory_usage = 7;
+  int64 disk_available_bytes = 8;
+
+  // Health
+  bool healthy = 9;
+  bool draining = 10;
+  int64 uptime_seconds = 11;
+  int64 last_task_at = 12;
+
+  // Running tasks
+  repeated string active_task_ids = 13;
+}
+
+message WarmPoolRequest {
+  int32 target_size = 1;
+}
+
+message WarmPoolResponse {
+  int32 current_size = 1;
+  string message = 2;
+}
+
+// VM Agent → Node Operator (vsock)
+message VsockMessage {
+  enum MessageType {
+    MESSAGE_TYPE_UNSPECIFIED = 0;
+    MESSAGE_TYPE_READY = 1;        // Agent ready
+    MESSAGE_TYPE_OUTPUT = 2;       // Stdout/stderr
+    MESSAGE_TYPE_METRICS = 3;      // Token usage update
+    MESSAGE_TYPE_COMPLETE = 4;     // Task done
+    MESSAGE_TYPE_ERROR = 5;        // Error occurred
+  }
+  MessageType type = 1;
+  bytes payload = 2;
+}
+
+message VsockReady {
+  string vm_id = 1;
+}
+
+message VsockOutput {
+  TaskOutput.OutputType type = 1;
+  bytes data = 2;
+}
+
+message VsockMetrics {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 cache_read_tokens = 3;
+  int64 cache_write_tokens = 4;
+  int64 tool_calls = 5;
+}
+
+message VsockComplete {
+  int32 exit_code = 1;
+  string pr_url = 2;
+  VsockMetrics final_metrics = 3;
+}
+
+message VsockError {
+  string code = 1;
+  string message = 2;
+}
+
+// Node Operator → VM Agent (vsock)
+message VsockCommand {
+  enum CommandType {
+    COMMAND_TYPE_UNSPECIFIED = 0;
+    COMMAND_TYPE_START = 1;   // Start task
+    COMMAND_TYPE_CANCEL = 2;  // Cancel task
+  }
+  CommandType type = 1;
+
+  // For START
+  string task_id = 2;
+  string repo_url = 3;
+  string branch = 4;
+  string prompt = 5;
+  string github_token = 6;
+  string anthropic_api_key = 7;
+  bool create_pr = 8;
+  string pr_title = 9;
+  string pr_body = 10;
+}
