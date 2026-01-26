@@ -78,12 +78,14 @@ pub const OrchestratorConfig = struct {
 
     etcd_endpoints: []const []const u8 = &[_][]const u8{"localhost:2379"},
     redis_url: []const u8 = "redis://localhost:6379",
-    postgres_url: []const u8 = "postgresql://localhost/marathon",
+    postgres_url: []const u8 = "postgresql://marathon:marathon@localhost:5432/marathon",
 
     anthropic_api_key: []const u8 = "",
 
     tls_cert_path: ?[]const u8 = null,
     tls_key_path: ?[]const u8 = null,
+
+    node_auth_key: ?[]const u8 = null,
 
     pub fn fromEnv(allocator: std.mem.Allocator) !OrchestratorConfig {
         var config = OrchestratorConfig{};
@@ -108,6 +110,10 @@ pub const OrchestratorConfig = struct {
             config.postgres_url = try allocator.dupe(u8, v);
         }
 
+        if (std.posix.getenv("MARATHON_NODE_AUTH_KEY")) |v| {
+            config.node_auth_key = try allocator.dupe(u8, v);
+        }
+
         return config;
     }
 };
@@ -119,7 +125,7 @@ pub const NodeOperatorConfig = struct {
     listen_address: []const u8 = "0.0.0.0",
     listen_port: u16 = 8081,
 
-    orchestrator_address: []const u8 = "localhost",
+    orchestrator_address: []const u8 = "127.0.0.1",
     orchestrator_port: u16 = 8080,
 
     heartbeat_interval_ms: u64 = 5_000,
@@ -130,14 +136,16 @@ pub const NodeOperatorConfig = struct {
     firecracker_bin: []const u8 = "/usr/bin/firecracker",
     jailer_bin: []const u8 = "/usr/bin/jailer",
 
-    snapshot_path: []const u8 = "/var/lib/marathon/snapshots",
-    rootfs_path: []const u8 = "/var/lib/marathon/rootfs",
-    kernel_path: []const u8 = "/var/lib/marathon/kernel/vmlinux",
+    snapshot_path: []const u8 = "/tmp/marathon/snapshots",
+    rootfs_path: []const u8 = "/tmp/marathon/rootfs",
+    kernel_path: []const u8 = "/tmp/marathon/kernel/vmlinux",
 
     vsock_port: u32 = 9999,
 
     task_timeout_ms: u64 = 600_000,
     max_tokens_per_task: u64 = 100_000,
+
+    auth_key: ?[]const u8 = null,
 
     pub fn fromEnv(allocator: std.mem.Allocator) !NodeOperatorConfig {
         var config = NodeOperatorConfig{};
@@ -174,6 +182,10 @@ pub const NodeOperatorConfig = struct {
             config.firecracker_bin = try allocator.dupe(u8, v);
         }
 
+        if (std.posix.getenv("MARATHON_NODE_AUTH_KEY")) |v| {
+            config.auth_key = try allocator.dupe(u8, v);
+        }
+
         return config;
     }
 };
@@ -182,6 +194,8 @@ pub const VmAgentConfig = struct {
     vsock_port: u32 = 9999,
     claude_code_path: []const u8 = "/usr/local/bin/claude",
     work_dir: []const u8 = "/workspace",
+    prompt_template: []const u8 = "{prompt}",
+    cleanup_strategy: []const u8 = "full",
 
     pub fn fromEnv(allocator: std.mem.Allocator) !VmAgentConfig {
         var config = VmAgentConfig{};
@@ -198,13 +212,21 @@ pub const VmAgentConfig = struct {
             config.work_dir = try allocator.dupe(u8, v);
         }
 
+        if (std.posix.getenv("MARATHON_PROMPT_TEMPLATE")) |v| {
+            config.prompt_template = try allocator.dupe(u8, v);
+        }
+
+        if (std.posix.getenv("MARATHON_CLEANUP_STRATEGY")) |v| {
+            config.cleanup_strategy = try allocator.dupe(u8, v);
+        }
+
         return config;
     }
 };
 
 pub const ClientConfig = struct {
     allocator: ?std.mem.Allocator = null,
-    orchestrator_address: []const u8 = "localhost",
+    orchestrator_address: []const u8 = "127.0.0.1",
     orchestrator_port: u16 = 8080,
 
     github_token: ?[]const u8 = null,

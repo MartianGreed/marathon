@@ -14,12 +14,14 @@ pub const HeartbeatClient = struct {
     interval_ms: u64,
     running: std.atomic.Value(bool),
     client: grpc.Client,
+    auth_key: ?[]const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
         orchestrator_address: []const u8,
         orchestrator_port: u16,
         vm_pool: *vm.VmPool,
+        auth_key: ?[]const u8,
     ) HeartbeatClient {
         var node_id: types.NodeId = undefined;
         std.crypto.random.bytes(&node_id);
@@ -33,6 +35,7 @@ pub const HeartbeatClient = struct {
             .interval_ms = 5000,
             .running = std.atomic.Value(bool).init(false),
             .client = grpc.Client.init(allocator),
+            .auth_key = auth_key,
         };
     }
 
@@ -52,7 +55,7 @@ pub const HeartbeatClient = struct {
                 };
             };
 
-            std.time.sleep(self.interval_ms * std.time.ns_per_ms);
+            common.compat.sleep(self.interval_ms * std.time.ns_per_ms);
         }
     }
 
@@ -66,9 +69,22 @@ pub const HeartbeatClient = struct {
         }
 
         const status = self.collectStatus();
+        const timestamp = std.time.milliTimestamp();
+
+        const auth_token: [32]u8 = if (self.auth_key) |key| blk: {
+            var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(key);
+            hmac.update(&self.node_id);
+            hmac.update(std.mem.asBytes(&timestamp));
+            var out: [32]u8 = undefined;
+            hmac.final(&out);
+            break :blk out;
+        } else [_]u8{0} ** 32;
+
         const payload = protocol.HeartbeatPayload{
             .node_id = self.node_id,
-            .timestamp = std.time.milliTimestamp(),
+            .timestamp = timestamp,
+            .auth_token = auth_token,
+            .hostname = status.hostname,
             .total_vm_slots = status.total_vm_slots,
             .active_vms = status.active_vms,
             .warm_vms = status.warm_vms,
@@ -79,12 +95,12 @@ pub const HeartbeatClient = struct {
             .draining = status.draining,
         };
 
-        _ = try self.client.call(.heartbeat_request, payload, HeartbeatResponse);
+        _ = try self.client.call(.heartbeat_request, payload, protocol.HeartbeatResponse);
     }
 
     fn reconnect(self: *HeartbeatClient) !void {
         self.client.close();
-        std.time.sleep(1000 * std.time.ns_per_ms);
+        common.compat.sleep(1000 * std.time.ns_per_ms);
         try self.client.connect(self.orchestrator_address, self.orchestrator_port);
     }
 
@@ -107,10 +123,6 @@ pub const HeartbeatClient = struct {
             .active_task_ids = &[_]types.TaskId{},
         };
     }
-};
-
-const HeartbeatResponse = struct {
-    timestamp: i64,
 };
 
 const SystemInfo = struct {
@@ -144,8 +156,43 @@ test "heartbeat client init" {
     var pool = vm.VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
-    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool);
+    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, null);
     defer client.deinit();
 
     try std.testing.expectEqual(@as(u64, 5000), client.interval_ms);
+}
+
+test "stop flag transitions correctly" {
+    const allocator = std.testing.allocator;
+
+    var snapshot_mgr = try @import("../snapshot/manager.zig").SnapshotManager.init(allocator, "/tmp");
+    defer snapshot_mgr.deinit();
+
+    var pool = vm.VmPool.init(allocator, &snapshot_mgr, .{});
+    defer pool.deinit();
+
+    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, null);
+    defer client.deinit();
+
+    try std.testing.expect(!client.running.load(.acquire));
+
+    client.running.store(true, .release);
+    try std.testing.expect(client.running.load(.acquire));
+
+    client.stop();
+    try std.testing.expect(!client.running.load(.acquire));
+}
+
+test "getHostname returns non-empty string" {
+    const hostname = getHostname() catch "unknown";
+    try std.testing.expect(hostname.len > 0);
+}
+
+test "getSystemInfo returns valid defaults" {
+    const info = getSystemInfo();
+
+    try std.testing.expectEqual(@as(f64, 0.0), info.cpu_usage);
+    try std.testing.expectEqual(@as(f64, 0.0), info.memory_usage);
+    try std.testing.expectEqual(@as(i64, 0), info.disk_available);
+    try std.testing.expectEqual(@as(i64, 0), info.uptime);
 }

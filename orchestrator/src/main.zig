@@ -48,6 +48,7 @@ pub fn main() !void {
         &node_registry,
         &meter,
         &authenticator,
+        config.node_auth_key,
     );
     defer server.deinit();
 
@@ -97,6 +98,7 @@ fn runWithoutDb(allocator: std.mem.Allocator, config: common.config.Orchestrator
         &node_registry,
         &meter,
         &authenticator,
+        config.node_auth_key,
     );
     defer server.deinit();
 

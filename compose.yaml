@@ -4,9 +4,9 @@ services:
     ports:
       - "5432:5432"
     environment:
-      POSTGRES_USER: marathon
-      POSTGRES_PASSWORD: marathon
-      POSTGRES_DB: marathon
+      POSTGRES_USER: ${POSTGRES_USER:-marathon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-marathon}
+      POSTGRES_DB: ${POSTGRES_DB:-marathon}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

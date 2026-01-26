@@ -1,8 +1,33 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("common");
 const types = common.types;
 const protocol = common.protocol;
-const vsock = common.vsock;
+
+const vsock = if (builtin.os.tag == .linux) common.vsock else struct {
+    pub const Connection = struct {
+        fd: i32,
+        allocator: std.mem.Allocator,
+
+        pub fn connect(allocator: std.mem.Allocator, cid: u32, port: u32) !Connection {
+            _ = cid;
+            _ = port;
+            return .{ .fd = -1, .allocator = allocator };
+        }
+
+        pub fn close(self: *Connection) void {
+            _ = self;
+        }
+
+        pub fn send(self: *Connection, msg_type: protocol.MessageType, request_id: u32, payload: anytype) !void {
+            _ = self;
+            _ = msg_type;
+            _ = request_id;
+            _ = payload;
+            return error.NotSupported;
+        }
+    };
+};
 
 pub const VsockHandler = struct {
     allocator: std.mem.Allocator,
@@ -111,7 +136,7 @@ pub const VsockHandler = struct {
     }
 };
 
-fn decodeOutput(allocator: std.mem.Allocator, data: []const u8) !protocol.VsockOutputPayload {
+pub fn decodeOutput(allocator: std.mem.Allocator, data: []const u8) !protocol.VsockOutputPayload {
     if (data.len < 5) return error.InvalidPayload;
 
     const output_type: types.OutputType = @enumFromInt(data[0]);
@@ -125,7 +150,7 @@ fn decodeOutput(allocator: std.mem.Allocator, data: []const u8) !protocol.VsockO
     };
 }
 
-fn decodeMetrics(data: []const u8) !protocol.VsockMetricsPayload {
+pub fn decodeMetrics(data: []const u8) !protocol.VsockMetricsPayload {
     if (data.len < 40) return error.InvalidPayload;
 
     return .{
@@ -137,7 +162,7 @@ fn decodeMetrics(data: []const u8) !protocol.VsockMetricsPayload {
     };
 }
 
-fn decodeComplete(allocator: std.mem.Allocator, data: []const u8) !protocol.VsockCompletePayload {
+pub fn decodeComplete(allocator: std.mem.Allocator, data: []const u8) !protocol.VsockCompletePayload {
     if (data.len < 44) return error.InvalidPayload;
 
     const exit_code = std.mem.readInt(i32, data[0..4], .big);
@@ -154,15 +179,29 @@ fn decodeComplete(allocator: std.mem.Allocator, data: []const u8) !protocol.Vsoc
     }
 
     const metrics = try decodeMetrics(data[offset..]);
+    offset += 40; // metrics is 5 * i64 = 40 bytes
+
+    const iteration = if (data.len > offset + 4)
+        std.mem.readInt(u32, data[offset..][0..4], .big)
+    else
+        1;
+    offset += 4;
+
+    const promise_found = if (data.len > offset)
+        data[offset] != 0
+    else
+        false;
 
     return .{
         .exit_code = exit_code,
         .pr_url = pr_url,
         .metrics = metrics,
+        .iteration = iteration,
+        .promise_found = promise_found,
     };
 }
 
-fn decodeError(allocator: std.mem.Allocator, data: []const u8) !protocol.VsockErrorPayload {
+pub fn decodeError(allocator: std.mem.Allocator, data: []const u8) !protocol.VsockErrorPayload {
     if (data.len < 8) return error.InvalidPayload;
 
     const code_len = std.mem.readInt(u32, data[0..4], .big);
@@ -280,4 +319,153 @@ test "vsock handler init" {
     const allocator = std.testing.allocator;
     var handler = VsockHandler.init(allocator, 3, 9999);
     defer handler.deinit();
+}
+
+test "decodeMetrics valid payload" {
+    var data: [40]u8 = undefined;
+    std.mem.writeInt(i64, data[0..8], 100, .big); // input_tokens
+    std.mem.writeInt(i64, data[8..16], 200, .big); // output_tokens
+    std.mem.writeInt(i64, data[16..24], 50, .big); // cache_read_tokens
+    std.mem.writeInt(i64, data[24..32], 25, .big); // cache_write_tokens
+    std.mem.writeInt(i64, data[32..40], 10, .big); // tool_calls
+
+    const result = try decodeMetrics(&data);
+
+    try std.testing.expectEqual(@as(i64, 100), result.input_tokens);
+    try std.testing.expectEqual(@as(i64, 200), result.output_tokens);
+    try std.testing.expectEqual(@as(i64, 50), result.cache_read_tokens);
+    try std.testing.expectEqual(@as(i64, 25), result.cache_write_tokens);
+    try std.testing.expectEqual(@as(i64, 10), result.tool_calls);
+}
+
+test "decodeMetrics invalid payload - too short" {
+    const data = [_]u8{0} ** 39;
+    try std.testing.expectError(error.InvalidPayload, decodeMetrics(&data));
+}
+
+test "decodeOutput valid payload" {
+    const allocator = std.testing.allocator;
+
+    const content = "Hello, world!";
+    var data: [5 + content.len]u8 = undefined;
+    data[0] = @intFromEnum(types.OutputType.stdout);
+    std.mem.writeInt(u32, data[1..5], @intCast(content.len), .big);
+    @memcpy(data[5..], content);
+
+    const result = try decodeOutput(allocator, &data);
+    defer allocator.free(result.data);
+
+    try std.testing.expectEqual(types.OutputType.stdout, result.output_type);
+    try std.testing.expectEqualStrings(content, result.data);
+}
+
+test "decodeOutput invalid payload - too short" {
+    const allocator = std.testing.allocator;
+    const data = [_]u8{0} ** 4;
+    try std.testing.expectError(error.InvalidPayload, decodeOutput(allocator, &data));
+}
+
+test "decodeError valid payload" {
+    const allocator = std.testing.allocator;
+
+    const code = "ERR001";
+    const message = "Something went wrong";
+    const total_len = 4 + code.len + 4 + message.len;
+    var data: [total_len]u8 = undefined;
+
+    std.mem.writeInt(u32, data[0..4], @intCast(code.len), .big);
+    @memcpy(data[4..][0..code.len], code);
+    const msg_offset = 4 + code.len;
+    std.mem.writeInt(u32, data[msg_offset..][0..4], @intCast(message.len), .big);
+    @memcpy(data[msg_offset + 4 ..][0..message.len], message);
+
+    const result = try decodeError(allocator, &data);
+    defer {
+        allocator.free(result.code);
+        allocator.free(result.message);
+    }
+
+    try std.testing.expectEqualStrings(code, result.code);
+    try std.testing.expectEqualStrings(message, result.message);
+}
+
+test "decodeComplete valid payload without pr_url" {
+    const allocator = std.testing.allocator;
+
+    var data: [5 + 40 + 5]u8 = undefined; // +5 for iteration(4) + promise_found(1)
+    std.mem.writeInt(i32, data[0..4], 0, .big); // exit_code
+    data[4] = 0; // pr_url not present
+
+    // metrics at offset 5
+    std.mem.writeInt(i64, data[5..13], 100, .big);
+    std.mem.writeInt(i64, data[13..21], 200, .big);
+    std.mem.writeInt(i64, data[21..29], 50, .big);
+    std.mem.writeInt(i64, data[29..37], 25, .big);
+    std.mem.writeInt(i64, data[37..45], 10, .big);
+
+    // iteration and promise_found
+    std.mem.writeInt(u32, data[45..49], 3, .big);
+    data[49] = 1; // promise_found = true
+
+    const result = try decodeComplete(allocator, &data);
+
+    try std.testing.expectEqual(@as(i32, 0), result.exit_code);
+    try std.testing.expect(result.pr_url == null);
+    try std.testing.expectEqual(@as(i64, 100), result.metrics.input_tokens);
+    try std.testing.expectEqual(@as(u32, 3), result.iteration);
+    try std.testing.expect(result.promise_found);
+}
+
+test "decodeComplete valid payload with pr_url" {
+    const allocator = std.testing.allocator;
+
+    const pr_url = "https://github.com/test/repo/pull/123";
+    const url_len = pr_url.len;
+    const total_len = 5 + 4 + url_len + 40 + 5; // exit_code(4) + present(1) + url_len(4) + url + metrics(40) + iteration(4) + promise_found(1)
+
+    var data: [total_len]u8 = undefined;
+    std.mem.writeInt(i32, data[0..4], 1, .big); // exit_code = 1
+    data[4] = 1; // pr_url present
+
+    // url length and data at offset 5
+    std.mem.writeInt(u32, data[5..9], @intCast(url_len), .big);
+    @memcpy(data[9..][0..url_len], pr_url);
+
+    // metrics after url
+    const metrics_offset = 9 + url_len;
+    std.mem.writeInt(i64, data[metrics_offset..][0..8], 500, .big);
+    std.mem.writeInt(i64, data[metrics_offset + 8 ..][0..8], 1000, .big);
+    std.mem.writeInt(i64, data[metrics_offset + 16 ..][0..8], 100, .big);
+    std.mem.writeInt(i64, data[metrics_offset + 24 ..][0..8], 50, .big);
+    std.mem.writeInt(i64, data[metrics_offset + 32 ..][0..8], 25, .big);
+
+    // iteration and promise_found after metrics
+    const iter_offset = metrics_offset + 40;
+    std.mem.writeInt(u32, data[iter_offset..][0..4], 5, .big);
+    data[iter_offset + 4] = 0; // promise_found = false
+
+    const result = try decodeComplete(allocator, &data);
+    defer if (result.pr_url) |url| allocator.free(url);
+
+    try std.testing.expectEqual(@as(i32, 1), result.exit_code);
+    try std.testing.expect(result.pr_url != null);
+    try std.testing.expectEqualStrings(pr_url, result.pr_url.?);
+    try std.testing.expectEqual(@as(i64, 500), result.metrics.input_tokens);
+    try std.testing.expectEqual(@as(u32, 5), result.iteration);
+    try std.testing.expect(!result.promise_found);
+}
+
+test "vsock stub connection close" {
+    const allocator = std.testing.allocator;
+
+    // Test the stub Connection.close directly
+    var conn = vsock.Connection{ .fd = -1, .allocator = allocator };
+    conn.close();
+
+    // Test VsockHandler with connection set and disconnect
+    var handler = VsockHandler.init(allocator, 3, 9999);
+    handler.connection = vsock.Connection{ .fd = -1, .allocator = allocator };
+    handler.disconnect();
+
+    try std.testing.expect(handler.connection == null);
 }

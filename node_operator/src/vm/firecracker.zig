@@ -94,9 +94,9 @@ pub const Vm = struct {
 
 pub const VmConfig = struct {
     firecracker_bin: []const u8 = "/usr/bin/firecracker",
-    kernel_path: []const u8 = "/var/lib/marathon/kernel/vmlinux",
-    rootfs_path: []const u8 = "/var/lib/marathon/rootfs/rootfs.ext4",
-    snapshot_path: []const u8 = "/var/lib/marathon/snapshots/base",
+    kernel_path: []const u8 = "/tmp/marathon/kernel/vmlinux",
+    rootfs_path: []const u8 = "/tmp/marathon/rootfs/rootfs.ext4",
+    snapshot_path: []const u8 = "/tmp/marathon/snapshots/base",
     vcpu_count: u32 = 2,
     mem_size_mib: u32 = 512,
     vsock_port: u32 = 9999,
@@ -170,13 +170,9 @@ pub const VmPool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.warm_vms.items.len > 0) {
-            const vm = self.warm_vms.pop();
-            self.active_vms.put(vm.id, vm) catch return null;
-            return vm;
-        }
-
-        return null;
+        const vm = self.warm_vms.pop() orelse return null;
+        self.active_vms.put(vm.id, vm) catch return null;
+        return vm;
     }
 
     pub fn release(self: *VmPool, vm_id: types.VmId) void {
@@ -222,4 +218,164 @@ test "cid generation" {
     const cid = generateCid();
     try std.testing.expect(cid >= 3);
     try std.testing.expect(cid < 0xFFFF_FFFF);
+}
+
+test "vm init creates valid state" {
+    const allocator = std.testing.allocator;
+    const vm = try Vm.init(allocator);
+    defer vm.deinit();
+
+    try std.testing.expectEqual(VmState.creating, vm.state);
+    try std.testing.expect(vm.task_id == null);
+    try std.testing.expect(vm.process == null);
+    try std.testing.expect(vm.start_time == null);
+    try std.testing.expect(vm.vsock_cid >= 3);
+}
+
+test "vm start transitions to ready" {
+    const allocator = std.testing.allocator;
+    const vm = try Vm.init(allocator);
+    defer vm.deinit();
+
+    try std.testing.expectEqual(VmState.creating, vm.state);
+
+    try vm.start(.{});
+
+    try std.testing.expectEqual(VmState.ready, vm.state);
+    try std.testing.expect(vm.start_time != null);
+}
+
+test "vm stop transitions to stopped" {
+    const allocator = std.testing.allocator;
+    const vm = try Vm.init(allocator);
+    defer vm.deinit();
+
+    try vm.start(.{});
+    try std.testing.expectEqual(VmState.ready, vm.state);
+
+    try vm.stop();
+
+    try std.testing.expectEqual(VmState.stopped, vm.state);
+}
+
+test "vm assign and release task" {
+    const allocator = std.testing.allocator;
+    const vm = try Vm.init(allocator);
+    defer vm.deinit();
+
+    try vm.start(.{});
+    try std.testing.expectEqual(VmState.ready, vm.state);
+    try std.testing.expect(vm.task_id == null);
+
+    var task_id: types.TaskId = undefined;
+    @memset(&task_id, 0xAB);
+
+    vm.assignTask(task_id);
+    try std.testing.expectEqual(VmState.running, vm.state);
+    try std.testing.expect(vm.task_id != null);
+    try std.testing.expectEqualSlices(u8, &task_id, &vm.task_id.?);
+
+    vm.releaseTask();
+    try std.testing.expectEqual(VmState.ready, vm.state);
+    try std.testing.expect(vm.task_id == null);
+}
+
+test "vm uptime tracking" {
+    const allocator = std.testing.allocator;
+    const vm = try Vm.init(allocator);
+    defer vm.deinit();
+
+    try std.testing.expect(vm.getUptimeMs() == null);
+
+    try vm.start(.{});
+
+    const uptime = vm.getUptimeMs();
+    try std.testing.expect(uptime != null);
+    try std.testing.expect(uptime.? >= 0);
+}
+
+test "pool warmPool adds vms" {
+    const allocator = std.testing.allocator;
+
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    defer snapshot_mgr.deinit();
+
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
+
+    try pool.warmPool(2);
+
+    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+}
+
+test "pool acquire and release cycle" {
+    const allocator = std.testing.allocator;
+
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    defer snapshot_mgr.deinit();
+
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    defer pool.deinit();
+
+    try pool.warmPool(1);
+    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
+
+    const vm = pool.acquire();
+    try std.testing.expect(vm != null);
+    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
+
+    pool.release(vm.?.id);
+    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
+}
+
+test "pool counts are accurate" {
+    const allocator = std.testing.allocator;
+
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    defer snapshot_mgr.deinit();
+
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), pool.totalCount());
+
+    try pool.warmPool(3);
+    try std.testing.expectEqual(@as(usize, 3), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
+    try std.testing.expectEqual(@as(usize, 3), pool.totalCount());
+
+    const vm1 = pool.acquire();
+    const vm2 = pool.acquire();
+    try std.testing.expect(vm1 != null);
+    try std.testing.expect(vm2 != null);
+
+    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 2), pool.activeCount());
+    try std.testing.expectEqual(@as(usize, 3), pool.totalCount());
+}
+
+test "vm stop with running process" {
+    const allocator = std.testing.allocator;
+    const vm = try Vm.init(allocator);
+    defer vm.deinit();
+
+    // Spawn a simple sleep process
+    const argv: []const []const u8 = &.{ "sleep", "10" };
+    var child = std.process.Child.init(argv, allocator);
+    try child.spawn();
+
+    // Assign the process to VM
+    vm.process = child;
+    vm.state = .running;
+
+    // Stop should kill and wait for the process
+    try vm.stop();
+
+    try std.testing.expectEqual(VmState.stopped, vm.state);
+    try std.testing.expect(vm.process == null);
 }

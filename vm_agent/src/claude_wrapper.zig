@@ -53,8 +53,6 @@ pub const ClaudeWrapper = struct {
     }
 
     pub fn run(self: *ClaudeWrapper, task: TaskInfo) !RunResult {
-        try self.setupWorkspace(task);
-
         const env_map = try self.buildEnvMap(task);
         defer {
             var it = env_map.iterator();
@@ -64,52 +62,44 @@ pub const ClaudeWrapper = struct {
             }
         }
 
-        var argv = std.ArrayList([]const u8).init(self.allocator);
-        defer argv.deinit();
+        var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer argv.deinit(self.allocator);
 
-        try argv.append(self.claude_code_path);
-        try argv.append("--print");
-        try argv.append("--dangerously-skip-permissions");
-
-        if (task.create_pr) {
-            const full_prompt = try std.fmt.allocPrint(
-                self.allocator,
-                "{s}\n\nAfter completing the task, create a pull request with title: {s}",
-                .{ task.prompt, task.pr_title orelse "Automated changes" },
-            );
-            defer self.allocator.free(full_prompt);
-            try argv.append(full_prompt);
-        } else {
-            try argv.append(task.prompt);
-        }
+        try argv.append(self.allocator, self.claude_code_path);
+        try argv.append(self.allocator, "--print");
+        try argv.append(self.allocator, "--dangerously-skip-permissions");
+        try argv.append(self.allocator, "--output-format");
+        try argv.append(self.allocator, "json");
+        try argv.append(self.allocator, task.prompt);
 
         var child = std.process.Child.init(argv.items, self.allocator);
         child.cwd = self.work_dir;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
-        var env_array = std.ArrayList(?[*:0]const u8).init(self.allocator);
-        defer env_array.deinit();
+        var env_array: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
+        defer env_array.deinit(self.allocator);
 
         var env_it = env_map.iterator();
         while (env_it.next()) |entry| {
-            const env_str = try std.fmt.allocPrintZ(
+            const env_str = try std.fmt.allocPrintSentinel(
                 self.allocator,
                 "{s}={s}",
                 .{ entry.key_ptr.*, entry.value_ptr.* },
+                0,
             );
-            try env_array.append(env_str.ptr);
+            try env_array.append(self.allocator, env_str.ptr);
         }
-        try env_array.append(null);
+        try env_array.append(self.allocator, null);
 
         try child.spawn();
         self.process = child;
 
-        var total_stdout = std.ArrayList(u8).init(self.allocator);
-        defer total_stdout.deinit();
+        var total_stdout: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer total_stdout.deinit(self.allocator);
 
-        var total_stderr = std.ArrayList(u8).init(self.allocator);
-        defer total_stderr.deinit();
+        var total_stderr: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer total_stderr.deinit(self.allocator);
 
         const stdout_thread = try std.Thread.spawn(.{}, readOutput, .{
             self,
@@ -132,25 +122,65 @@ pub const ClaudeWrapper = struct {
         self.process = null;
 
         const exit_code: i32 = switch (term) {
-            .exited => |code| @intCast(code),
-            .signal => |sig| -@as(i32, @intCast(sig)),
+            .Exited => |code| @intCast(code),
+            .Signal => |sig| -@as(i32, @intCast(sig)),
             else => -1,
         };
 
         const pr_url = self.extractPrUrl(total_stdout.items);
+        const metrics = self.parseJsonMetrics(total_stdout.items);
+        const promise_found = self.checkCompletionPromise(total_stdout.items, task.completion_promise);
+
+        const stdout_copy = try self.allocator.dupe(u8, total_stdout.items);
+        errdefer self.allocator.free(stdout_copy);
+        const stderr_copy = try self.allocator.dupe(u8, total_stderr.items);
 
         return .{
             .exit_code = exit_code,
             .pr_url = pr_url,
-            .metrics = self.interceptor.getMetrics(),
+            .metrics = metrics,
+            .output_contains_promise = promise_found,
+            .stdout = stdout_copy,
+            .stderr = stderr_copy,
         };
+    }
+
+    pub fn parseJsonMetrics(self: *ClaudeWrapper, output: []const u8) types.UsageMetrics {
+        _ = self;
+        var metrics = types.UsageMetrics{};
+
+        const parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, output, .{}) catch return metrics;
+        defer parsed.deinit();
+
+        if (parsed.value.object.get("usage")) |usage| {
+            if (usage.object.get("input_tokens")) |v| {
+                metrics.input_tokens = v.integer;
+            }
+            if (usage.object.get("output_tokens")) |v| {
+                metrics.output_tokens = v.integer;
+            }
+            if (usage.object.get("cache_creation_input_tokens")) |v| {
+                metrics.cache_write_tokens = v.integer;
+            }
+            if (usage.object.get("cache_read_input_tokens")) |v| {
+                metrics.cache_read_tokens = v.integer;
+            }
+        }
+
+        return metrics;
+    }
+
+    pub fn checkCompletionPromise(self: *ClaudeWrapper, output: []const u8, promise: ?[]const u8) bool {
+        _ = self;
+        const completion_marker = promise orelse return false;
+        return std.mem.indexOf(u8, output, completion_marker) != null;
     }
 
     fn readOutput(
         self: *ClaudeWrapper,
         reader: std.fs.File,
         output_type: types.OutputType,
-        buffer: *std.ArrayList(u8),
+        buffer: *std.ArrayListUnmanaged(u8),
     ) void {
         var buf: [4096]u8 = undefined;
 
@@ -158,7 +188,7 @@ pub const ClaudeWrapper = struct {
             const n = reader.read(&buf) catch break;
             if (n == 0) break;
 
-            buffer.appendSlice(buf[0..n]) catch {};
+            buffer.appendSlice(self.allocator, buf[0..n]) catch {};
 
             if (self.output_callback) |cb| {
                 if (self.output_context) |ctx| {
@@ -168,63 +198,7 @@ pub const ClaudeWrapper = struct {
         }
     }
 
-    fn setupWorkspace(self: *ClaudeWrapper, task: TaskInfo) !void {
-        std.fs.makeDirAbsolute(self.work_dir) catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-
-        const git_args = [_][]const u8{
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            task.branch,
-            task.repo_url,
-            self.work_dir,
-        };
-
-        var clone = std.process.Child.init(&git_args, self.allocator);
-        clone.cwd = "/tmp";
-        try clone.spawn();
-        const term = try clone.wait();
-
-        if (term != .exited or term.exited != 0) {
-            return error.GitCloneFailed;
-        }
-
-        try self.configureGit(task);
-    }
-
-    fn configureGit(self: *ClaudeWrapper, task: TaskInfo) !void {
-        _ = task;
-
-        const config_args = [_][]const u8{
-            "git",
-            "config",
-            "user.email",
-            "marathon@local",
-        };
-
-        var config = std.process.Child.init(&config_args, self.allocator);
-        config.cwd = self.work_dir;
-        try config.spawn();
-        _ = try config.wait();
-
-        const config_name_args = [_][]const u8{
-            "git",
-            "config",
-            "user.name",
-            "Marathon Agent",
-        };
-
-        var config_name = std.process.Child.init(&config_name_args, self.allocator);
-        config_name.cwd = self.work_dir;
-        try config_name.spawn();
-        _ = try config_name.wait();
-    }
-
-    fn buildEnvMap(self: *ClaudeWrapper, task: TaskInfo) !std.StringHashMap([]const u8) {
+    pub fn buildEnvMap(self: *ClaudeWrapper, task: TaskInfo) !std.StringHashMap([]const u8) {
         var env = std.StringHashMap([]const u8).init(self.allocator);
 
         try env.put(
@@ -247,7 +221,7 @@ pub const ClaudeWrapper = struct {
         return env;
     }
 
-    fn extractPrUrl(self: *ClaudeWrapper, output: []const u8) ?[]const u8 {
+    pub fn extractPrUrl(self: *ClaudeWrapper, output: []const u8) ?[]const u8 {
         _ = self;
 
         const pr_pattern = "https://github.com/";
@@ -289,12 +263,17 @@ pub const TaskInfo = struct {
     create_pr: bool,
     pr_title: ?[]const u8,
     pr_body: ?[]const u8,
+    max_iterations: ?u32,
+    completion_promise: ?[]const u8,
 };
 
 pub const RunResult = struct {
     exit_code: i32,
     pr_url: ?[]const u8,
     metrics: types.UsageMetrics,
+    output_contains_promise: bool,
+    stdout: []const u8,
+    stderr: []const u8,
 };
 
 test "claude wrapper init" {
@@ -304,4 +283,235 @@ test "claude wrapper init" {
 
     var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
     defer wrapper.deinit();
+}
+
+test "parseJsonMetrics extracts all token fields" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output =
+        \\{"usage": {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 10, "cache_creation_input_tokens": 5}}
+    ;
+
+    const metrics = wrapper.parseJsonMetrics(output);
+    try std.testing.expectEqual(@as(i64, 100), metrics.input_tokens);
+    try std.testing.expectEqual(@as(i64, 50), metrics.output_tokens);
+    try std.testing.expectEqual(@as(i64, 10), metrics.cache_read_tokens);
+    try std.testing.expectEqual(@as(i64, 5), metrics.cache_write_tokens);
+}
+
+test "parseJsonMetrics handles missing usage" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output =
+        \\{"result": "success", "model": "claude-3"}
+    ;
+
+    const metrics = wrapper.parseJsonMetrics(output);
+    try std.testing.expectEqual(@as(i64, 0), metrics.input_tokens);
+    try std.testing.expectEqual(@as(i64, 0), metrics.output_tokens);
+    try std.testing.expectEqual(@as(i64, 0), metrics.cache_read_tokens);
+    try std.testing.expectEqual(@as(i64, 0), metrics.cache_write_tokens);
+}
+
+test "parseJsonMetrics handles invalid JSON" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const metrics = wrapper.parseJsonMetrics("not valid json {{{");
+    try std.testing.expectEqual(@as(i64, 0), metrics.input_tokens);
+    try std.testing.expectEqual(@as(i64, 0), metrics.output_tokens);
+}
+
+test "parseJsonMetrics handles partial usage fields" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output =
+        \\{"usage": {"input_tokens": 100}}
+    ;
+
+    const metrics = wrapper.parseJsonMetrics(output);
+    try std.testing.expectEqual(@as(i64, 100), metrics.input_tokens);
+    try std.testing.expectEqual(@as(i64, 0), metrics.output_tokens);
+    try std.testing.expectEqual(@as(i64, 0), metrics.cache_read_tokens);
+}
+
+test "checkCompletionPromise returns true when found" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "Task completed successfully. TASK_COMPLETE: All done!";
+    const found = wrapper.checkCompletionPromise(output, "TASK_COMPLETE");
+    try std.testing.expect(found);
+}
+
+test "checkCompletionPromise returns false when missing" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "Task is still running, not complete yet.";
+    const found = wrapper.checkCompletionPromise(output, "TASK_COMPLETE");
+    try std.testing.expect(!found);
+}
+
+test "checkCompletionPromise returns false when null promise" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "TASK_COMPLETE: All done!";
+    const found = wrapper.checkCompletionPromise(output, null);
+    try std.testing.expect(!found);
+}
+
+test "checkCompletionPromise finds promise at start" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "DONE: Task finished";
+    const found = wrapper.checkCompletionPromise(output, "DONE:");
+    try std.testing.expect(found);
+}
+
+test "extractPrUrl finds github PR URL" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "Created PR: https://github.com/owner/repo/pull/123\nDone.";
+    const url = wrapper.extractPrUrl(output);
+
+    try std.testing.expect(url != null);
+    try std.testing.expectEqualStrings("https://github.com/owner/repo/pull/123", url.?);
+}
+
+test "extractPrUrl returns null for non-PR github URLs" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "See issue: https://github.com/owner/repo/issues/456";
+    const url = wrapper.extractPrUrl(output);
+
+    try std.testing.expect(url == null);
+}
+
+test "extractPrUrl returns null when no URL" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "No URLs in this output at all.";
+    const url = wrapper.extractPrUrl(output);
+
+    try std.testing.expect(url == null);
+}
+
+test "extractPrUrl handles URL at end of output" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "Done! https://github.com/foo/bar/pull/42";
+    const url = wrapper.extractPrUrl(output);
+
+    try std.testing.expect(url != null);
+    try std.testing.expectEqualStrings("https://github.com/foo/bar/pull/42", url.?);
+}
+
+test "extractPrUrl ignores gitlab URLs" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const output = "Check: https://gitlab.com/owner/repo/pull/789";
+    const url = wrapper.extractPrUrl(output);
+
+    try std.testing.expect(url == null);
+}
+
+test "buildEnvMap includes required env vars" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const task = TaskInfo{
+        .task_id = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .repo_url = "https://github.com/test/repo",
+        .branch = "main",
+        .prompt = "Fix the bug",
+        .github_token = "ghp_testtoken123",
+        .anthropic_api_key = "sk-ant-api03-test",
+        .create_pr = false,
+        .pr_title = null,
+        .pr_body = null,
+        .max_iterations = null,
+        .completion_promise = null,
+    };
+
+    var env = try wrapper.buildEnvMap(task);
+    defer {
+        var it = env.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        env.deinit();
+    }
+
+    try std.testing.expectEqualStrings("sk-ant-api03-test", env.get("ANTHROPIC_API_KEY").?);
+    try std.testing.expectEqualStrings("ghp_testtoken123", env.get("GITHUB_TOKEN").?);
+    try std.testing.expectEqualStrings("/root", env.get("HOME").?);
+    try std.testing.expect(env.get("PATH") != null);
 }

@@ -26,6 +26,7 @@ pub const MessageType = enum(u8) {
     vsock_error = 0x34,
     vsock_start = 0x35,
     vsock_cancel = 0x36,
+    vsock_progress = 0x37,
 };
 
 pub const Header = extern struct {
@@ -291,6 +292,8 @@ pub const TaskEvent = struct {
 pub const HeartbeatPayload = struct {
     node_id: types.NodeId,
     timestamp: i64,
+    auth_token: [32]u8,
+    hostname: []const u8,
     total_vm_slots: u32,
     active_vms: u32,
     warm_vms: u32,
@@ -299,6 +302,11 @@ pub const HeartbeatPayload = struct {
     disk_available_bytes: i64,
     healthy: bool,
     draining: bool,
+};
+
+pub const HeartbeatResponse = struct {
+    timestamp: i64,
+    acknowledged: bool,
 };
 
 pub const VsockStartPayload = struct {
@@ -311,6 +319,8 @@ pub const VsockStartPayload = struct {
     create_pr: bool,
     pr_title: ?[]const u8,
     pr_body: ?[]const u8,
+    max_iterations: ?u32,
+    completion_promise: ?[]const u8,
 };
 
 pub const VsockOutputPayload = struct {
@@ -330,11 +340,19 @@ pub const VsockCompletePayload = struct {
     exit_code: i32,
     pr_url: ?[]const u8,
     metrics: VsockMetricsPayload,
+    iteration: u32,
+    promise_found: bool,
 };
 
 pub const VsockErrorPayload = struct {
     code: []const u8,
     message: []const u8,
+};
+
+pub const VsockProgressPayload = struct {
+    iteration: u32,
+    max_iterations: u32,
+    status: []const u8,
 };
 
 pub const GetTaskRequest = struct {
@@ -439,4 +457,206 @@ test "roundtrip encoding" {
     try std.testing.expectEqualStrings(original.repo_url, decoded.repo_url);
     try std.testing.expectEqualStrings(original.branch, decoded.branch);
     try std.testing.expectEqual(original.create_pr, decoded.create_pr);
+}
+
+test "VsockStartPayload encodes/decodes max_iterations and completion_promise" {
+    const allocator = std.testing.allocator;
+
+    const original = VsockStartPayload{
+        .task_id = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32 },
+        .repo_url = "https://github.com/test/repo",
+        .branch = "feature-branch",
+        .prompt = "Implement feature X",
+        .github_token = "ghp_xxx",
+        .anthropic_api_key = "sk-ant-xxx",
+        .create_pr = true,
+        .pr_title = "Add feature X",
+        .pr_body = "This PR adds feature X",
+        .max_iterations = 5,
+        .completion_promise = "TASK_COMPLETE",
+    };
+
+    const encoded = try encodePayload(VsockStartPayload, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(VsockStartPayload, allocator, encoded);
+    defer {
+        allocator.free(decoded.repo_url);
+        allocator.free(decoded.branch);
+        allocator.free(decoded.prompt);
+        allocator.free(decoded.github_token);
+        allocator.free(decoded.anthropic_api_key);
+        if (decoded.pr_title) |t| allocator.free(t);
+        if (decoded.pr_body) |b| allocator.free(b);
+        if (decoded.completion_promise) |p| allocator.free(p);
+    }
+
+    try std.testing.expectEqual(original.task_id, decoded.task_id);
+    try std.testing.expectEqualStrings(original.repo_url, decoded.repo_url);
+    try std.testing.expectEqualStrings(original.branch, decoded.branch);
+    try std.testing.expectEqualStrings(original.prompt, decoded.prompt);
+    try std.testing.expectEqual(original.create_pr, decoded.create_pr);
+    try std.testing.expectEqual(original.max_iterations, decoded.max_iterations);
+    try std.testing.expectEqualStrings(original.completion_promise.?, decoded.completion_promise.?);
+}
+
+test "VsockStartPayload handles null max_iterations and completion_promise" {
+    const allocator = std.testing.allocator;
+
+    const original = VsockStartPayload{
+        .task_id = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .repo_url = "https://github.com/test/repo",
+        .branch = "main",
+        .prompt = "Simple task",
+        .github_token = "ghp_xxx",
+        .anthropic_api_key = "sk-ant-xxx",
+        .create_pr = false,
+        .pr_title = null,
+        .pr_body = null,
+        .max_iterations = null,
+        .completion_promise = null,
+    };
+
+    const encoded = try encodePayload(VsockStartPayload, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(VsockStartPayload, allocator, encoded);
+    defer {
+        allocator.free(decoded.repo_url);
+        allocator.free(decoded.branch);
+        allocator.free(decoded.prompt);
+        allocator.free(decoded.github_token);
+        allocator.free(decoded.anthropic_api_key);
+    }
+
+    try std.testing.expectEqual(@as(?u32, null), decoded.max_iterations);
+    try std.testing.expectEqual(@as(?[]const u8, null), decoded.completion_promise);
+}
+
+test "VsockCompletePayload encodes/decodes iteration and promise_found" {
+    const allocator = std.testing.allocator;
+
+    const original = VsockCompletePayload{
+        .exit_code = 0,
+        .pr_url = "https://github.com/owner/repo/pull/42",
+        .metrics = .{
+            .input_tokens = 1000,
+            .output_tokens = 500,
+            .cache_read_tokens = 100,
+            .cache_write_tokens = 50,
+            .tool_calls = 10,
+        },
+        .iteration = 3,
+        .promise_found = true,
+    };
+
+    const encoded = try encodePayload(VsockCompletePayload, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(VsockCompletePayload, allocator, encoded);
+    defer {
+        if (decoded.pr_url) |url| allocator.free(url);
+    }
+
+    try std.testing.expectEqual(original.exit_code, decoded.exit_code);
+    try std.testing.expectEqualStrings(original.pr_url.?, decoded.pr_url.?);
+    try std.testing.expectEqual(original.metrics.input_tokens, decoded.metrics.input_tokens);
+    try std.testing.expectEqual(original.metrics.output_tokens, decoded.metrics.output_tokens);
+    try std.testing.expectEqual(original.metrics.cache_read_tokens, decoded.metrics.cache_read_tokens);
+    try std.testing.expectEqual(original.metrics.cache_write_tokens, decoded.metrics.cache_write_tokens);
+    try std.testing.expectEqual(original.metrics.tool_calls, decoded.metrics.tool_calls);
+    try std.testing.expectEqual(original.iteration, decoded.iteration);
+    try std.testing.expectEqual(original.promise_found, decoded.promise_found);
+}
+
+test "VsockCompletePayload handles null pr_url and false promise_found" {
+    const allocator = std.testing.allocator;
+
+    const original = VsockCompletePayload{
+        .exit_code = 1,
+        .pr_url = null,
+        .metrics = .{
+            .input_tokens = 500,
+            .output_tokens = 250,
+            .cache_read_tokens = 0,
+            .cache_write_tokens = 0,
+            .tool_calls = 5,
+        },
+        .iteration = 1,
+        .promise_found = false,
+    };
+
+    const encoded = try encodePayload(VsockCompletePayload, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(VsockCompletePayload, allocator, encoded);
+
+    try std.testing.expectEqual(original.exit_code, decoded.exit_code);
+    try std.testing.expectEqual(@as(?[]const u8, null), decoded.pr_url);
+    try std.testing.expectEqual(original.iteration, decoded.iteration);
+    try std.testing.expectEqual(original.promise_found, decoded.promise_found);
+}
+
+test "VsockProgressPayload roundtrip encoding" {
+    const allocator = std.testing.allocator;
+
+    const original = VsockProgressPayload{
+        .iteration = 2,
+        .max_iterations = 5,
+        .status = "Running iteration 2 of 5",
+    };
+
+    const encoded = try encodePayload(VsockProgressPayload, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(VsockProgressPayload, allocator, encoded);
+    defer allocator.free(decoded.status);
+
+    try std.testing.expectEqual(original.iteration, decoded.iteration);
+    try std.testing.expectEqual(original.max_iterations, decoded.max_iterations);
+    try std.testing.expectEqualStrings(original.status, decoded.status);
+}
+
+test "VsockMetricsPayload roundtrip encoding" {
+    const allocator = std.testing.allocator;
+
+    const original = VsockMetricsPayload{
+        .input_tokens = 12345,
+        .output_tokens = 6789,
+        .cache_read_tokens = 1000,
+        .cache_write_tokens = 500,
+        .tool_calls = 42,
+    };
+
+    const encoded = try encodePayload(VsockMetricsPayload, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(VsockMetricsPayload, allocator, encoded);
+
+    try std.testing.expectEqual(original.input_tokens, decoded.input_tokens);
+    try std.testing.expectEqual(original.output_tokens, decoded.output_tokens);
+    try std.testing.expectEqual(original.cache_read_tokens, decoded.cache_read_tokens);
+    try std.testing.expectEqual(original.cache_write_tokens, decoded.cache_write_tokens);
+    try std.testing.expectEqual(original.tool_calls, decoded.tool_calls);
+}
+
+test "VsockErrorPayload roundtrip encoding" {
+    const allocator = std.testing.allocator;
+
+    const original = VsockErrorPayload{
+        .code = "ERR_TIMEOUT",
+        .message = "Task execution timed out after 30 minutes",
+    };
+
+    const encoded = try encodePayload(VsockErrorPayload, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(VsockErrorPayload, allocator, encoded);
+    defer {
+        allocator.free(decoded.code);
+        allocator.free(decoded.message);
+    }
+
+    try std.testing.expectEqualStrings(original.code, decoded.code);
+    try std.testing.expectEqualStrings(original.message, decoded.message);
 }

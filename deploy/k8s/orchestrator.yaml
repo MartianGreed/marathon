@@ -12,7 +12,6 @@ data:
   MARATHON_LISTEN_ADDRESS: "0.0.0.0"
   MARATHON_LISTEN_PORT: "8080"
   MARATHON_REDIS_URL: "redis://redis:6379"
-  MARATHON_POSTGRES_URL: "postgresql://marathon:marathon@postgres:5432/marathon"
 ---
 apiVersion: v1
 kind: Secret
@@ -22,6 +21,7 @@ metadata:
 type: Opaque
 stringData:
   MARATHON_ANTHROPIC_API_KEY: ""
+  MARATHON_POSTGRES_URL: ""
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -70,6 +70,7 @@ pub const Server = struct {
     task_repo: ?*db.TaskRepository,
     node_repo: ?*db.NodeRepository,
     usage_repo: ?*db.UsageRepository,
+    node_auth_key: ?[]const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -77,6 +78,7 @@ pub const Server = struct {
         reg: *registry.NodeRegistry,
         meter: *metering.Metering,
         authenticator: *auth.Authenticator,
+        node_auth_key: ?[]const u8,
     ) Server {
         return .{
             .allocator = allocator,
@@ -89,6 +91,7 @@ pub const Server = struct {
             .task_repo = null,
             .node_repo = null,
             .usage_repo = null,
+            .node_auth_key = node_auth_key,
         };
     }
 
@@ -185,8 +188,11 @@ pub const Server = struct {
         header: protocol.Header,
         client_id: types.ClientId,
     ) !void {
-        _ = self;
         switch (header.msg_type) {
+            .heartbeat_request => {
+                const payload = try conn.readPayload(protocol.HeartbeatPayload, header);
+                try self.handleHeartbeat(conn, payload, header.request_id);
+            },
             .submit_task => {
                 const request = try conn.readPayload(protocol.SubmitTaskRequest, header);
                 try handler.handleSubmitTask(conn, request, client_id, header.request_id);
@@ -215,6 +221,73 @@ pub const Server = struct {
                 });
             },
         }
+    }
+
+    fn handleHeartbeat(
+        self: *Server,
+        conn: *grpc.Connection,
+        payload: protocol.HeartbeatPayload,
+        request_id: u32,
+    ) !void {
+        if (!self.validateNodeAuth(payload)) {
+            log.warn("node auth failed: node_id={s}", .{&types.formatId(payload.node_id)});
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "AUTH_FAILED",
+                .message = "Node authentication failed",
+            });
+            return;
+        }
+
+        const status = types.NodeStatus{
+            .node_id = payload.node_id,
+            .hostname = payload.hostname,
+            .total_vm_slots = payload.total_vm_slots,
+            .active_vms = payload.active_vms,
+            .warm_vms = payload.warm_vms,
+            .cpu_usage = payload.cpu_usage,
+            .memory_usage = payload.memory_usage,
+            .disk_available_bytes = payload.disk_available_bytes,
+            .healthy = payload.healthy,
+            .draining = payload.draining,
+            .uptime_seconds = 0,
+            .last_task_at = null,
+            .active_task_ids = &[_]types.TaskId{},
+        };
+
+        if (self.registry.getNode(payload.node_id)) |_| {
+            try self.registry.updateHeartbeat(payload.node_id, status);
+        } else {
+            try self.registry.register(status);
+            log.info("node registered: node_id={s} hostname={s}", .{
+                &types.formatId(payload.node_id),
+                payload.hostname,
+            });
+        }
+
+        const response = protocol.HeartbeatResponse{
+            .timestamp = std.time.milliTimestamp(),
+            .acknowledged = true,
+        };
+        try conn.writeMessage(.heartbeat_response, request_id, response);
+    }
+
+    fn validateNodeAuth(self: *Server, payload: protocol.HeartbeatPayload) bool {
+        const key = self.node_auth_key orelse return true;
+
+        const now = std.time.milliTimestamp();
+        const timestamp_diff = if (now > payload.timestamp) now - payload.timestamp else payload.timestamp - now;
+        if (timestamp_diff > 5 * 60 * 1000) {
+            log.warn("heartbeat timestamp too old: diff_ms={d}", .{timestamp_diff});
+            return false;
+        }
+
+        var hmac = std.crypto.auth.hmac.sha2.HmacSha256.init(key);
+        hmac.update(&payload.node_id);
+        hmac.update(std.mem.asBytes(&payload.timestamp));
+        var expected: [32]u8 = undefined;
+        hmac.final(&expected);
+
+        return std.crypto.timing_safe.eql([32]u8, expected, payload.auth_token);
     }
 };
 

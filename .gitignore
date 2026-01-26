@@ -8,3 +8,16 @@ zig-cache/
 .claude-modified-files
 .env
 **/.env
+coverage/
+
+# Jujutsu VCS
+.jj/
+
+# Editor temp files
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc

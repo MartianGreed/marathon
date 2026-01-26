@@ -1,4 +1,4 @@
-.PHONY: all build test clean install run-orchestrator run-node-operator run-client snapshot rootfs kernel infra-up infra-down
+.PHONY: all build test clean install run-orchestrator run-node-operator run-client snapshot rootfs kernel infra-up infra-down coverage coverage-node-operator coverage-html
 
 ZIG ?= zig
 INSTALL_DIR ?= /usr/local/bin
@@ -75,6 +75,26 @@ lint:
 format:
 	$(ZIG) fmt .
 
+COVERAGE_DIR ?= coverage
+
+coverage-node-operator:
+	@echo "Running node_operator tests with coverage..."
+	@mkdir -p $(COVERAGE_DIR)/node_operator
+	@./scripts/coverage.sh node_operator $(COVERAGE_DIR)/node_operator
+
+coverage:
+	@echo "Running all tests with coverage..."
+	@mkdir -p $(COVERAGE_DIR)
+	@./scripts/coverage.sh all $(COVERAGE_DIR)
+
+coverage-html:
+	@echo "Opening coverage report..."
+	@if [ -f $(COVERAGE_DIR)/node_operator/index.html ]; then \
+		open $(COVERAGE_DIR)/node_operator/index.html 2>/dev/null || xdg-open $(COVERAGE_DIR)/node_operator/index.html 2>/dev/null || echo "Open $(COVERAGE_DIR)/node_operator/index.html in your browser"; \
+	else \
+		echo "No coverage report found. Run 'make coverage-node-operator' first."; \
+	fi
+
 help:
 	@echo "Marathon Build System"
 	@echo ""
@@ -95,6 +115,9 @@ help:
 	@echo "  format          Format code"
 	@echo "  infra-up        Start Docker infrastructure (postgres, redis, etcd)"
 	@echo "  infra-down      Stop Docker infrastructure"
+	@echo "  coverage-node-operator  Run node_operator tests with coverage"
+	@echo "  coverage        Run all tests with coverage"
+	@echo "  coverage-html   Open coverage report in browser"
 	@echo ""
 	@echo "Environment:"
 	@echo "  ZIG             Zig compiler (default: zig)"
@@ -102,3 +125,4 @@ help:
 	@echo "  SNAPSHOT_DIR    Snapshot directory (default: /var/lib/marathon/snapshots)"
 	@echo "  KERNEL_DIR      Kernel directory (default: /var/lib/marathon/kernel)"
 	@echo "  ROOTFS_DIR      Rootfs directory (default: /var/lib/marathon/rootfs)"
+	@echo "  COVERAGE_DIR    Coverage output directory (default: coverage)"
