@@ -1,4 +1,9 @@
-FROM alpine:3.19 AS builder
+ARG ALPINE_VERSION=3.19
+ARG ZIG_VERSION=0.15.2
+
+FROM alpine:${ALPINE_VERSION} AS builder
+
+ARG ZIG_VERSION
 
 RUN apk add --no-cache \
     curl \
@@ -6,8 +11,8 @@ RUN apk add --no-cache \
     tar \
     git
 
-RUN curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -xJ -C /opt && \
-    ln -s /opt/zig-linux-x86_64-0.13.0/zig /usr/local/bin/zig
+RUN curl -L https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz | tar -xJ -C /opt && \
+    ln -s /opt/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
 
 WORKDIR /workspace
 

@@ -18,7 +18,7 @@ Client CLI → Orchestrator → Node Operator → Firecracker VM → VM Agent (r
 
 ## Requirements
 
-- [Zig](https://ziglang.org/) 0.13.0+
+- [Zig](https://ziglang.org/) 0.15.2+
 - Docker (for containerized builds)
 - Firecracker (for VM isolation)
 - PostgreSQL 16+
