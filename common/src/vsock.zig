@@ -41,7 +41,9 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
-        posix.close(self.fd);
+        if (self.fd >= 0) {
+            posix.close(self.fd);
+        }
     }
 
     pub fn send(self: *Connection, msg_type: protocol.MessageType, request_id: u32, payload: anytype) !void {
