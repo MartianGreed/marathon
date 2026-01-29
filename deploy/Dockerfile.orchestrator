@@ -15,6 +15,9 @@ WORKDIR /build
 COPY build.zig ./
 COPY common/ common/
 COPY orchestrator/ orchestrator/
+COPY node_operator/ node_operator/
+COPY vm_agent/ vm_agent/
+COPY client/ client/
 COPY proto/ proto/
 
 RUN zig build -Doptimize=ReleaseFast
