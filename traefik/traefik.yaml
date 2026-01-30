@@ -1,0 +1,17 @@
+entryPoints:
+  websecure:
+    address: ":443"
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: "${MARATHON_ACME_EMAIL}"
+      storage: /letsencrypt/acme.json
+      tlsChallenge: {}
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yaml
+
+log:
+  level: INFO

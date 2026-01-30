@@ -15,6 +15,8 @@ pub const HeartbeatClient = struct {
     running: std.atomic.Value(bool),
     client: grpc.Client,
     auth_key: ?[]const u8,
+    tls_enabled: bool,
+    tls_ca_path: ?[]const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -22,6 +24,8 @@ pub const HeartbeatClient = struct {
         orchestrator_port: u16,
         vm_pool: *vm.VmPool,
         auth_key: ?[]const u8,
+        tls_enabled: bool,
+        tls_ca_path: ?[]const u8,
     ) HeartbeatClient {
         var node_id: types.NodeId = undefined;
         std.crypto.random.bytes(&node_id);
@@ -36,6 +40,8 @@ pub const HeartbeatClient = struct {
             .running = std.atomic.Value(bool).init(false),
             .client = grpc.Client.init(allocator),
             .auth_key = auth_key,
+            .tls_enabled = tls_enabled,
+            .tls_ca_path = tls_ca_path,
         };
     }
 
@@ -65,7 +71,7 @@ pub const HeartbeatClient = struct {
 
     fn sendHeartbeat(self: *HeartbeatClient) !void {
         if (self.client.stream == null) {
-            try self.client.connect(self.orchestrator_address, self.orchestrator_port);
+            try self.client.connect(self.orchestrator_address, self.orchestrator_port, self.tls_enabled, self.tls_ca_path);
         }
 
         const status = self.collectStatus();
@@ -101,7 +107,7 @@ pub const HeartbeatClient = struct {
     fn reconnect(self: *HeartbeatClient) !void {
         self.client.close();
         common.compat.sleep(1000 * std.time.ns_per_ms);
-        try self.client.connect(self.orchestrator_address, self.orchestrator_port);
+        try self.client.connect(self.orchestrator_address, self.orchestrator_port, self.tls_enabled, self.tls_ca_path);
     }
 
     fn collectStatus(self: *HeartbeatClient) types.NodeStatus {
@@ -156,7 +162,7 @@ test "heartbeat client init" {
     var pool = vm.VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
-    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, null);
+    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, null, false, null);
     defer client.deinit();
 
     try std.testing.expectEqual(@as(u64, 5000), client.interval_ms);
@@ -171,7 +177,7 @@ test "stop flag transitions correctly" {
     var pool = vm.VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
-    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, null);
+    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, null, false, null);
     defer client.deinit();
 
     try std.testing.expect(!client.running.load(.acquire));

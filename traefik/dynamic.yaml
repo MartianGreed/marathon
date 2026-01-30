@@ -1,0 +1,14 @@
+tcp:
+  routers:
+    marathon:
+      rule: "HostSNI(`{{ env \"MARATHON_DOMAIN\" }}`)"
+      service: marathon-svc
+      tls:
+        certResolver: letsencrypt
+      entryPoints:
+        - websecure
+  services:
+    marathon-svc:
+      loadBalancer:
+        servers:
+          - address: "orchestrator:8080"
