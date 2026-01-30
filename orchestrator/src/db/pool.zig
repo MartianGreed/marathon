@@ -61,21 +61,33 @@ pub const Pool = struct {
             .total_released = 0,
         };
 
-        var created: u32 = 0;
-        var last_err: ?anyerror = null;
-        for (0..pool_config.min_connections) |_| {
-            pool.createConnection() catch |err| {
-                log.warn("failed to create initial connection: {}", .{err});
-                last_err = err;
-                continue;
-            };
-            created += 1;
-        }
+        const max_retries: u32 = 10;
+        const initial_delay_ms: u64 = 1_000;
+        var retry: u32 = 0;
 
-        if (created == 0 and pool_config.min_connections > 0) {
-            log.err("pool init failed: could not create any connections", .{});
-            allocator.destroy(pool);
-            return last_err orelse DbError.ConnectionFailed;
+        while (retry < max_retries) : (retry += 1) {
+            var created: u32 = 0;
+            var last_err: ?anyerror = null;
+            for (0..pool_config.min_connections) |_| {
+                pool.createConnection() catch |err| {
+                    log.warn("failed to create initial connection: {}", .{err});
+                    last_err = err;
+                    continue;
+                };
+                created += 1;
+            }
+
+            if (created > 0 or pool_config.min_connections == 0) break;
+
+            if (retry + 1 < max_retries) {
+                const delay = initial_delay_ms * (@as(u64, 1) << @intCast(@min(retry, 4)));
+                log.warn("pool init: no connections created, retrying in {d}ms (attempt {d}/{d})", .{ delay, retry + 1, max_retries });
+                std.Thread.sleep(delay * std.time.ns_per_ms);
+            } else {
+                log.err("pool init failed: could not create any connections after {d} attempts", .{max_retries});
+                allocator.destroy(pool);
+                return last_err orelse DbError.ConnectionFailed;
+            }
         }
 
         log.info("pool initialized: min={d} max={d} created={d}", .{
