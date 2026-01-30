@@ -21,3 +21,4 @@ coverage/
 # Python
 __pycache__/
 *.pyc
+.claude-modified-files
