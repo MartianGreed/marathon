@@ -1,5 +1,10 @@
 services:
   orchestrator:
+    links:
+      - postgres
+      - redis
+      - etcd
+    container_name: marathon-orchestrator
     build:
       context: ..
       dockerfile: deploy/Dockerfile.orchestrator
@@ -27,7 +32,8 @@ services:
         condition: service_healthy
 
   postgres:
-    image: postgres:16-alpine
+    container_name: postgres
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -41,6 +47,7 @@ services:
       retries: 5
 
   redis:
+    container_name: redis
     image: redis:7-alpine
     volumes:
       - redis_data:/data
@@ -51,6 +58,7 @@ services:
       retries: 5
 
   etcd:
+    container_name: etcd
     image: quay.io/coreos/etcd:v3.5.17
     environment:
       ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
