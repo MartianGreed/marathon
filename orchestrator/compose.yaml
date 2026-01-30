@@ -1,0 +1,76 @@
+services:
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.orchestrator
+    environment:
+      MARATHON_ANTHROPIC_API_KEY: ${MARATHON_ANTHROPIC_API_KEY}
+      MARATHON_POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      MARATHON_REDIS_URL: redis://redis:6379
+      MARATHON_NODE_AUTH_KEY: ${MARATHON_NODE_AUTH_KEY:-}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.marathon.rule=HostSNI(`${MARATHON_DOMAIN}`)"
+      - "traefik.tcp.routers.marathon.entrypoints=websecure"
+      - "traefik.tcp.routers.marathon.tls=true"
+      - "traefik.tcp.routers.marathon.tls.certresolver=letsencrypt"
+      - "traefik.tcp.services.marathon.loadbalancer.server.port=8080"
+    networks:
+      - default
+      - dokploy-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      etcd:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    environment:
+      ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
+      ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+    volumes:
+      - etcd_data:/etcd-data
+    command:
+      - etcd
+      - --data-dir=/etcd-data
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
+  etcd_data:
+
+networks:
+  dokploy-network:
+    external: true
