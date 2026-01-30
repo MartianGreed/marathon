@@ -1,5 +1,7 @@
 const std = @import("std");
 const net = std.net;
+const tls = std.crypto.tls;
+const Certificate = std.crypto.Certificate;
 const protocol = @import("protocol.zig");
 
 pub const Server = struct {
@@ -150,6 +152,12 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     stream: ?net.Stream,
     next_request_id: u32,
+    tls_client: ?tls.Client = null,
+    stream_reader: ?net.Stream.Reader = null,
+    stream_writer: ?net.Stream.Writer = null,
+    read_buf: []u8 = &.{},
+    write_buf: []u8 = &.{},
+    ca_bundle: ?Certificate.Bundle = null,
 
     pub fn init(allocator: std.mem.Allocator) Client {
         return .{
@@ -159,28 +167,103 @@ pub const Client = struct {
         };
     }
 
-    pub fn connect(self: *Client, host: []const u8, port: u16) !void {
-        // Try parsing as IP first, fall back to DNS resolution
+    pub fn connect(self: *Client, host: []const u8, port: u16, tls_enabled: bool, ca_path: ?[]const u8) !void {
         const address = net.Address.parseIp(host, port) catch {
-            // Resolve hostname via DNS
             const list = try net.getAddressList(self.allocator, host, port);
             defer list.deinit();
             if (list.addrs.len == 0) return error.UnknownHostName;
             self.stream = try net.tcpConnectToAddress(list.addrs[0]);
+            if (tls_enabled) try self.initTls(host, ca_path);
             return;
         };
         self.stream = try net.tcpConnectToAddress(address);
+        if (tls_enabled) try self.initTls(host, ca_path);
+    }
+
+    fn initTls(self: *Client, host: []const u8, ca_path: ?[]const u8) !void {
+        const s = self.stream orelse return error.NotConnected;
+
+        var ca_bundle: Certificate.Bundle = .{};
+        if (ca_path) |path| {
+            try ca_bundle.addCertsFromFilePathAbsolute(self.allocator, path);
+        } else {
+            try ca_bundle.rescan(self.allocator);
+        }
+        self.ca_bundle = ca_bundle;
+
+        const read_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
+        errdefer self.allocator.free(read_buf);
+        const write_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
+        errdefer self.allocator.free(write_buf);
+        self.read_buf = read_buf;
+        self.write_buf = write_buf;
+
+        self.stream_reader = s.reader(read_buf);
+        self.stream_writer = s.writer(write_buf);
+
+        self.tls_client = try tls.Client.init(self.stream_reader.?.interface(), &self.stream_writer.?.interface, .{
+            .host = .{ .explicit = host },
+            .ca = .{ .bundle = ca_bundle },
+            .read_buffer = read_buf,
+            .write_buffer = write_buf,
+        });
     }
 
     pub fn close(self: *Client) void {
+        if (self.tls_client) |*tc| {
+            tc.end() catch {};
+            self.tls_client = null;
+        }
+        if (self.read_buf.len > 0) {
+            self.allocator.free(self.read_buf);
+            self.read_buf = &.{};
+        }
+        if (self.write_buf.len > 0) {
+            self.allocator.free(self.write_buf);
+            self.write_buf = &.{};
+        }
+        if (self.ca_bundle) |*cb| {
+            cb.deinit(self.allocator);
+            self.ca_bundle = null;
+        }
+        self.stream_reader = null;
+        self.stream_writer = null;
         if (self.stream) |s| {
             s.close();
             self.stream = null;
         }
     }
 
+    fn writeAllBytes(self: *Client, data: []const u8) !void {
+        if (self.tls_client) |*tc| {
+            var w = tc.writer;
+            try w.writeAll(data);
+            try w.flush();
+        } else {
+            const stream = self.stream orelse return error.NotConnected;
+            try stream.writeAll(data);
+        }
+    }
+
+    fn readExactBytes(self: *Client, buf: []u8) !void {
+        if (self.tls_client) |*tc| {
+            tc.reader.readSliceAll(buf) catch |err| switch (err) {
+                error.EndOfStream => return error.ConnectionClosed,
+                error.ReadFailed => return error.ConnectionClosed,
+            };
+        } else {
+            const stream = self.stream orelse return error.NotConnected;
+            var total: usize = 0;
+            while (total < buf.len) {
+                const n = try stream.read(buf[total..]);
+                if (n == 0) return error.ConnectionClosed;
+                total += n;
+            }
+        }
+    }
+
     pub fn call(self: *Client, msg_type: protocol.MessageType, request: anytype, comptime ResponseType: type) !protocol.Message(ResponseType) {
-        const stream = self.stream orelse return error.NotConnected;
+        if (self.stream == null) return error.NotConnected;
 
         const request_id = self.next_request_id;
         self.next_request_id +%= 1;
@@ -198,15 +281,10 @@ pub const Client = struct {
         const data = try msg.encode(self.allocator);
         defer self.allocator.free(data);
 
-        try stream.writeAll(data);
+        try self.writeAllBytes(data);
 
         var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
-        var total: usize = 0;
-        while (total < header_buf.len) {
-            const n = try stream.read(header_buf[total..]);
-            if (n == 0) return error.ConnectionClosed;
-            total += n;
-        }
+        try self.readExactBytes(&header_buf);
 
         const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
         if (!std.mem.eql(u8, &header.magic, &.{ 'M', 'R', 'T', 'N' })) {
@@ -216,12 +294,7 @@ pub const Client = struct {
         const payload_buf = try self.allocator.alloc(u8, header.payload_len);
         defer self.allocator.free(payload_buf);
 
-        total = 0;
-        while (total < payload_buf.len) {
-            const n = try stream.read(payload_buf[total..]);
-            if (n == 0) return error.ConnectionClosed;
-            total += n;
-        }
+        try self.readExactBytes(payload_buf);
 
         var full_buf = try self.allocator.alloc(u8, @sizeOf(protocol.Header) + header.payload_len);
         defer self.allocator.free(full_buf);
@@ -239,7 +312,7 @@ pub const Client = struct {
         comptime EventType: type,
         callback: *const fn (protocol.Message(EventType)) bool,
     ) !void {
-        const stream = self.stream orelse return error.NotConnected;
+        if (self.stream == null) return error.NotConnected;
 
         const request_id = self.next_request_id;
         self.next_request_id +%= 1;
@@ -257,19 +330,14 @@ pub const Client = struct {
         const data = try msg.encode(self.allocator);
         defer self.allocator.free(data);
 
-        try stream.writeAll(data);
+        try self.writeAllBytes(data);
 
         while (true) {
             var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
-            var total: usize = 0;
-            while (total < header_buf.len) {
-                const n = stream.read(header_buf[total..]) catch |err| {
-                    if (err == error.ConnectionResetByPeer) return;
-                    return err;
-                };
-                if (n == 0) return;
-                total += n;
-            }
+            self.readExactBytes(&header_buf) catch |err| {
+                if (err == error.ConnectionClosed) return;
+                return err;
+            };
 
             const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
             if (!std.mem.eql(u8, &header.magic, &.{ 'M', 'R', 'T', 'N' })) {
@@ -279,12 +347,10 @@ pub const Client = struct {
             const payload_buf = try self.allocator.alloc(u8, header.payload_len);
             defer self.allocator.free(payload_buf);
 
-            total = 0;
-            while (total < payload_buf.len) {
-                const n = try stream.read(payload_buf[total..]);
-                if (n == 0) return;
-                total += n;
-            }
+            self.readExactBytes(payload_buf) catch |err| {
+                if (err == error.ConnectionClosed) return;
+                return err;
+            };
 
             var full_buf = try self.allocator.alloc(u8, @sizeOf(protocol.Header) + header.payload_len);
             defer self.allocator.free(full_buf);

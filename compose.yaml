@@ -1,4 +1,32 @@
 services:
+  traefik:
+    image: traefik:v3
+    ports:
+      - "443:443"
+    volumes:
+      - ./traefik/:/etc/traefik/:ro
+      - letsencrypt_data:/letsencrypt
+    environment:
+      MARATHON_DOMAIN: ${MARATHON_DOMAIN}
+      MARATHON_ACME_EMAIL: ${MARATHON_ACME_EMAIL}
+    depends_on:
+      orchestrator:
+        condition: service_started
+
+  orchestrator:
+    image: marathon/orchestrator:latest
+    environment:
+      MARATHON_ANTHROPIC_API_KEY: ${MARATHON_ANTHROPIC_API_KEY}
+      MARATHON_POSTGRES_URL: postgresql://${POSTGRES_USER:-marathon}:${POSTGRES_PASSWORD:-marathon}@postgres:5432/${POSTGRES_DB:-marathon}
+      MARATHON_REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      etcd:
+        condition: service_healthy
+
   postgres:
     image: postgres:16-alpine
     ports:
@@ -50,3 +78,4 @@ volumes:
   postgres_data:
   redis_data:
   etcd_data:
+  letsencrypt_data:

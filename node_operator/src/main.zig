@@ -30,6 +30,8 @@ pub fn main() !void {
         config.orchestrator_port,
         &vm_pool,
         config.auth_key,
+        config.tls_enabled,
+        config.tls_ca_path,
     );
     defer heartbeat_client.deinit();
 

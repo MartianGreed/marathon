@@ -147,6 +147,9 @@ pub const NodeOperatorConfig = struct {
 
     auth_key: ?[]const u8 = null,
 
+    tls_enabled: bool = false,
+    tls_ca_path: ?[]const u8 = null,
+
     pub fn fromEnv(allocator: std.mem.Allocator) !NodeOperatorConfig {
         var config = NodeOperatorConfig{};
 
@@ -184,6 +187,14 @@ pub const NodeOperatorConfig = struct {
 
         if (std.posix.getenv("MARATHON_NODE_AUTH_KEY")) |v| {
             config.auth_key = try allocator.dupe(u8, v);
+        }
+
+        if (std.posix.getenv("MARATHON_TLS_ENABLED")) |v| {
+            config.tls_enabled = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        }
+
+        if (std.posix.getenv("MARATHON_TLS_CA_PATH")) |v| {
+            config.tls_ca_path = try allocator.dupe(u8, v);
         }
 
         return config;
@@ -273,6 +284,22 @@ pub const ClientConfig = struct {
         } else if (dotenv) |*env| {
             if (env.get("MARATHON_ORCHESTRATOR_PORT")) |v| {
                 config.orchestrator_port = try std.fmt.parseInt(u16, v, 10);
+            }
+        }
+
+        if (std.posix.getenv("MARATHON_TLS_ENABLED")) |v| {
+            config.tls_enabled = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+        } else if (dotenv) |*env| {
+            if (env.get("MARATHON_TLS_ENABLED")) |v| {
+                config.tls_enabled = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
+            }
+        }
+
+        if (std.posix.getenv("MARATHON_TLS_CA_PATH")) |v| {
+            config.tls_ca_path = v;
+        } else if (dotenv) |*env| {
+            if (env.get("MARATHON_TLS_CA_PATH")) |v| {
+                config.tls_ca_path = try allocator.dupe(u8, v);
             }
         }
 

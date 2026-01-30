@@ -170,7 +170,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     var client = grpc.Client.init(allocator);
     defer client.close();
 
-    client.connect(config.orchestrator_address, config.orchestrator_port) catch |err| {
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
         std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
         return;
     };
