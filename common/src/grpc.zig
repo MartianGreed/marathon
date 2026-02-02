@@ -256,9 +256,8 @@ pub const Client = struct {
 
     fn writeAllBytes(self: *Client, data: []const u8) !void {
         if (self.tls_client) |tc| {
-            var w = tc.writer;
-            try w.writeAll(data);
-            try w.flush();
+            try tc.writer.writeAll(data);
+            try tc.writer.flush();
         } else {
             const stream = self.stream orelse return error.NotConnected;
             try stream.writeAll(data);
