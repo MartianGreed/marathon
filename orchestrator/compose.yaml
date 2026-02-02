@@ -1,5 +1,9 @@
 services:
   orchestrator:
+    links:
+      - postgres
+      - redis
+      - etcd
     container_name: marathon-orchestrator
     build:
       context: ..
