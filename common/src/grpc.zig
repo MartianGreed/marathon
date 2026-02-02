@@ -157,6 +157,8 @@ pub const Client = struct {
     stream_writer: ?net.Stream.Writer = null,
     read_buf: []u8 = &.{},
     write_buf: []u8 = &.{},
+    tls_read_buf: []u8 = &.{},
+    tls_write_buf: []u8 = &.{},
     ca_bundle: ?Certificate.Bundle = null,
 
     pub fn init(allocator: std.mem.Allocator) Client {
@@ -195,8 +197,14 @@ pub const Client = struct {
         errdefer self.allocator.free(read_buf);
         const write_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
         errdefer self.allocator.free(write_buf);
+        const tls_read_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
+        errdefer self.allocator.free(tls_read_buf);
+        const tls_write_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
+        errdefer self.allocator.free(tls_write_buf);
         self.read_buf = read_buf;
         self.write_buf = write_buf;
+        self.tls_read_buf = tls_read_buf;
+        self.tls_write_buf = tls_write_buf;
 
         self.stream_reader = s.reader(read_buf);
         self.stream_writer = s.writer(write_buf);
@@ -204,8 +212,8 @@ pub const Client = struct {
         self.tls_client = try tls.Client.init(self.stream_reader.?.interface(), &self.stream_writer.?.interface, .{
             .host = .{ .explicit = host },
             .ca = .{ .bundle = ca_bundle },
-            .read_buffer = read_buf,
-            .write_buffer = write_buf,
+            .read_buffer = tls_read_buf,
+            .write_buffer = tls_write_buf,
         });
     }
 
@@ -221,6 +229,14 @@ pub const Client = struct {
         if (self.write_buf.len > 0) {
             self.allocator.free(self.write_buf);
             self.write_buf = &.{};
+        }
+        if (self.tls_read_buf.len > 0) {
+            self.allocator.free(self.tls_read_buf);
+            self.tls_read_buf = &.{};
+        }
+        if (self.tls_write_buf.len > 0) {
+            self.allocator.free(self.tls_write_buf);
+            self.tls_write_buf = &.{};
         }
         if (self.ca_bundle) |*cb| {
             cb.deinit(self.allocator);
