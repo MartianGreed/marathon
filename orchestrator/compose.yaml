@@ -1,17 +1,14 @@
 services:
   orchestrator:
-    links:
-      - postgres
-      - redis
-      - etcd
     container_name: marathon-orchestrator
     build:
       context: ..
       dockerfile: deploy/Dockerfile.orchestrator
+    dns: 127.0.0.11
     environment:
       MARATHON_ANTHROPIC_API_KEY: ${MARATHON_ANTHROPIC_API_KEY}
-      MARATHON_POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      MARATHON_REDIS_URL: redis://redis:6379
+      MARATHON_POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@marathon-postgres:5432/${POSTGRES_DB}
+      MARATHON_REDIS_URL: redis://marathon-redis:6379
       MARATHON_NODE_AUTH_KEY: ${MARATHON_NODE_AUTH_KEY:-}
     labels:
       - "traefik.enable=true"
@@ -21,7 +18,7 @@ services:
       - "traefik.tcp.routers.marathon.tls.certresolver=letsencrypt"
       - "traefik.tcp.services.marathon.loadbalancer.server.port=8080"
     networks:
-      - default
+      - marathon-internal
       - dokploy-network
     depends_on:
       postgres:
@@ -32,7 +29,7 @@ services:
         condition: service_healthy
 
   postgres:
-    container_name: postgres
+    container_name: marathon-postgres
     image: postgres:18-alpine
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
@@ -40,6 +37,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - marathon-internal
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 5s
@@ -47,10 +46,12 @@ services:
       retries: 5
 
   redis:
-    container_name: redis
+    container_name: marathon-redis
     image: redis:7-alpine
     volumes:
       - redis_data:/data
+    networks:
+      - marathon-internal
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -58,7 +59,7 @@ services:
       retries: 5
 
   etcd:
-    container_name: etcd
+    container_name: marathon-etcd
     image: quay.io/coreos/etcd:v3.5.17
     environment:
       ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
@@ -68,6 +69,8 @@ services:
     command:
       - etcd
       - --data-dir=/etcd-data
+    networks:
+      - marathon-internal
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
       interval: 5s
@@ -80,5 +83,7 @@ volumes:
   etcd_data:
 
 networks:
+  marathon-internal:
+    driver: bridge
   dokploy-network:
     external: true

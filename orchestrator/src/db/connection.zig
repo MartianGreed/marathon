@@ -108,9 +108,15 @@ pub const Connection = struct {
         errdefer conn.writer.deinit();
 
         const address = std.net.Address.parseIp4(config.host, config.port) catch blk: {
-            const list = try std.net.getAddressList(allocator, config.host, config.port);
+            const list = std.net.getAddressList(allocator, config.host, config.port) catch |err| {
+                log.err("DNS resolution failed for host={s} port={d}: {}", .{ config.host, config.port, err });
+                return DbError.ConnectionFailed;
+            };
             defer list.deinit();
-            if (list.addrs.len == 0) return DbError.ConnectionFailed;
+            if (list.addrs.len == 0) {
+                log.err("DNS resolved zero addresses for host={s} port={d}", .{ config.host, config.port });
+                return DbError.ConnectionFailed;
+            }
             break :blk list.addrs[0];
         };
 
