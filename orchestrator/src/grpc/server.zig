@@ -394,29 +394,31 @@ pub const RequestHandler = struct {
 
     fn streamTaskEvents(self: *RequestHandler, conn: *grpc.Connection, task_id: types.TaskId, request_id: u32) !void {
         log.info("streamTaskEvents: starting for task_id={s}", .{&types.formatId(task_id)});
+        var last_state: ?types.TaskState = null;
+
         while (true) {
             const state = self.scheduler.getTaskState(task_id) orelse {
-                log.info("streamTaskEvents: task_id={s} no longer found in scheduler, ending stream", .{&types.formatId(task_id)});
+                log.info("streamTaskEvents: task not found, ending stream task_id={s}", .{&types.formatId(task_id)});
                 break;
             };
 
-            log.info("streamTaskEvents: task_id={s} state={s}", .{ &types.formatId(task_id), @tagName(state) });
+            if (last_state == null or last_state.? != state) {
+                log.info("streamTaskEvents: task_id={s} state={s}", .{ &types.formatId(task_id), @tagName(state) });
+                last_state = state;
 
-            if (state.isTerminal()) {
-                const complete_event = protocol.TaskEvent{
+                const event = protocol.TaskEvent{
                     .task_id = task_id,
                     .state = state,
                     .timestamp = std.time.milliTimestamp(),
-                    .event_type = .complete,
+                    .event_type = if (state.isTerminal()) .complete else .state_change,
                     .data = &[_]u8{},
                 };
-                log.info("streamTaskEvents: sending terminal event for task_id={s} state={s}", .{ &types.formatId(task_id), @tagName(state) });
-                try conn.writeMessage(.task_event, request_id, complete_event);
-                log.info("streamTaskEvents: terminal event sent, ending stream", .{});
-                break;
+                try conn.writeMessage(.task_event, request_id, event);
+
+                if (state.isTerminal()) break;
             }
 
-            common.compat.sleep(100 * std.time.ns_per_ms);
+            common.compat.sleep(1 * std.time.ns_per_s);
         }
     }
 
