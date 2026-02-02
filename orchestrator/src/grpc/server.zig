@@ -159,17 +159,25 @@ pub const Server = struct {
         };
 
         while (true) {
+            log.info("waiting for next message from client_id={s}", .{&types.formatId(&client_id)});
             const header = conn.readHeader() catch |err| {
                 if (err == error.ConnectionClosed or err == error.ConnectionResetByPeer) {
                     log.info("client disconnected: client_id={s}", .{&types.formatId(&client_id)});
                     return;
                 }
-                log.err("failed to read header: {}", .{err});
+                log.err("failed to read header: client_id={s} err={}", .{ &types.formatId(&client_id), err });
                 return;
             };
 
+            log.info("received message: client_id={s} msg_type={s} request_id={d} payload_len={d}", .{
+                &types.formatId(&client_id),
+                @tagName(header.msg_type),
+                header.request_id,
+                header.payload_len,
+            });
+
             self.dispatchMessage(&conn, &handler, header, client_id) catch |err| {
-                log.err("failed to handle message type={s}: {}", .{ @tagName(header.msg_type), err });
+                log.err("failed to handle message type={s} request_id={d}: {}", .{ @tagName(header.msg_type), header.request_id, err });
                 conn.writeMessage(.error_response, header.request_id, protocol.ErrorResponse{
                     .code = "INTERNAL_ERROR",
                     .message = "Failed to process request",
@@ -188,13 +196,16 @@ pub const Server = struct {
         header: protocol.Header,
         client_id: types.ClientId,
     ) !void {
+        log.info("dispatching msg_type={s} request_id={d}", .{ @tagName(header.msg_type), header.request_id });
         switch (header.msg_type) {
             .heartbeat_request => {
                 const payload = try conn.readPayload(protocol.HeartbeatPayload, header);
                 try self.handleHeartbeat(conn, payload, header.request_id);
             },
             .submit_task => {
+                log.info("reading submit_task payload ({d} bytes)", .{header.payload_len});
                 const request = try conn.readPayload(protocol.SubmitTaskRequest, header);
+                log.info("submit_task payload decoded: repo={s} branch={s} prompt_len={d}", .{ request.repo_url, request.branch, request.prompt.len });
                 try handler.handleSubmitTask(conn, request, client_id, header.request_id);
             },
             .get_task => {
@@ -306,6 +317,8 @@ pub const RequestHandler = struct {
         client_id: types.ClientId,
         request_id: u32,
     ) !void {
+        log.info("handleSubmitTask: client_id={s} request_id={d} repo={s}", .{ &types.formatId(&client_id), request_id, request.repo_url });
+
         if (!validateRepoUrl(request.repo_url)) {
             log.warn("submit rejected: invalid repo url for client_id={s}", .{&types.formatId(&client_id)});
             try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
@@ -314,6 +327,7 @@ pub const RequestHandler = struct {
             });
             return;
         }
+        log.info("handleSubmitTask: repo url validated", .{});
 
         if (!auth.Authenticator.validateGitHubToken(request.github_token)) {
             log.warn("submit rejected: invalid github token for client_id={s}", .{&types.formatId(&client_id)});
@@ -323,6 +337,7 @@ pub const RequestHandler = struct {
             });
             return;
         }
+        log.info("handleSubmitTask: github token validated", .{});
 
         var task = try types.Task.init(
             self.allocator,
@@ -336,6 +351,7 @@ pub const RequestHandler = struct {
         task.pr_body = request.pr_body;
 
         if (self.task_repo) |repo| {
+            log.info("handleSubmitTask: persisting task to DB", .{});
             repo.create(&task) catch |err| {
                 log.err("failed to persist task: {}", .{err});
                 try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
@@ -344,8 +360,12 @@ pub const RequestHandler = struct {
                 });
                 return;
             };
+            log.info("handleSubmitTask: task persisted to DB", .{});
+        } else {
+            log.info("handleSubmitTask: no task_repo configured, skipping DB persist", .{});
         }
 
+        log.info("handleSubmitTask: submitting task to scheduler", .{});
         const task_id = try self.scheduler.submitTask(task);
 
         log.info("task submitted: task_id={s} client_id={s} repo={s}", .{
@@ -362,16 +382,25 @@ pub const RequestHandler = struct {
             .data = &[_]u8{},
         };
 
+        log.info("handleSubmitTask: sending initial task_event (queued) for task_id={s}", .{&types.formatId(task_id)});
         try conn.writeMessage(.task_event, request_id, event);
+        log.info("handleSubmitTask: initial event sent, starting event stream", .{});
 
         self.streamTaskEvents(conn, task_id, request_id) catch |err| {
             log.err("error streaming task events: task_id={s} err={}", .{ &types.formatId(task_id), err });
         };
+        log.info("handleSubmitTask: stream ended for task_id={s}", .{&types.formatId(task_id)});
     }
 
     fn streamTaskEvents(self: *RequestHandler, conn: *grpc.Connection, task_id: types.TaskId, request_id: u32) !void {
+        log.info("streamTaskEvents: starting for task_id={s}", .{&types.formatId(task_id)});
         while (true) {
-            const state = self.scheduler.getTaskState(task_id) orelse break;
+            const state = self.scheduler.getTaskState(task_id) orelse {
+                log.info("streamTaskEvents: task_id={s} no longer found in scheduler, ending stream", .{&types.formatId(task_id)});
+                break;
+            };
+
+            log.info("streamTaskEvents: task_id={s} state={s}", .{ &types.formatId(task_id), @tagName(state) });
 
             if (state.isTerminal()) {
                 const complete_event = protocol.TaskEvent{
@@ -381,7 +410,9 @@ pub const RequestHandler = struct {
                     .event_type = .complete,
                     .data = &[_]u8{},
                 };
+                log.info("streamTaskEvents: sending terminal event for task_id={s} state={s}", .{ &types.formatId(task_id), @tagName(state) });
                 try conn.writeMessage(.task_event, request_id, complete_event);
+                log.info("streamTaskEvents: terminal event sent, ending stream", .{});
                 break;
             }
 
