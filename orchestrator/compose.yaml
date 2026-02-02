@@ -5,21 +5,16 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile.orchestrator
     dns: 127.0.0.11
+    ports:
+      - "8443:8080"
+    restart: unless-stopped
     environment:
       MARATHON_ANTHROPIC_API_KEY: ${MARATHON_ANTHROPIC_API_KEY}
       MARATHON_POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@marathon-postgres:5432/${POSTGRES_DB}
       MARATHON_REDIS_URL: redis://marathon-redis:6379
       MARATHON_NODE_AUTH_KEY: ${MARATHON_NODE_AUTH_KEY:-}
-    labels:
-      - "traefik.enable=true"
-      - "traefik.tcp.routers.marathon.rule=HostSNI(`${MARATHON_DOMAIN}`)"
-      - "traefik.tcp.routers.marathon.entrypoints=websecure"
-      - "traefik.tcp.routers.marathon.tls=true"
-      - "traefik.tcp.routers.marathon.tls.certresolver=letsencrypt"
-      - "traefik.tcp.services.marathon.loadbalancer.server.port=8080"
     networks:
       - marathon-internal
-      - dokploy-network
     depends_on:
       postgres:
         condition: service_healthy
@@ -29,6 +24,7 @@ services:
         condition: service_healthy
 
   postgres:
+    restart: unless-stopped
     container_name: marathon-postgres
     image: postgres:18-alpine
     environment:
@@ -46,6 +42,7 @@ services:
       retries: 5
 
   redis:
+    restart: unless-stopped
     container_name: marathon-redis
     image: redis:7-alpine
     volumes:
@@ -59,6 +56,7 @@ services:
       retries: 5
 
   etcd:
+    restart: unless-stopped
     container_name: marathon-etcd
     image: quay.io/coreos/etcd:v3.5.17
     environment:
@@ -85,5 +83,3 @@ volumes:
 networks:
   marathon-internal:
     driver: bridge
-  dokploy-network:
-    external: true
