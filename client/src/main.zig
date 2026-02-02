@@ -175,6 +175,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         return;
     };
 
+    std.debug.print("[client] Connected, TLS enabled: {}\n", .{config.tls_enabled});
     std.debug.print("Submitting task...\n", .{});
 
     const request = protocol.SubmitTaskRequest{
@@ -187,10 +188,12 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         .pr_body = pr_body,
     };
 
+    std.debug.print("[client] Request: repo={s} branch={s} prompt_len={d} create_pr={}\n", .{ repo.?, branch, prompt.?.len, create_pr });
+
     const CallbackContext = struct {
         fn handleEvent(event: protocol.Message(protocol.TaskEvent)) bool {
             const task_id_str = types.formatId(event.payload.task_id);
-            std.debug.print("[{s}] State: {s}\n", .{ &task_id_str, @tagName(event.payload.state) });
+            std.debug.print("[client] Event: type={s} task_id={s} state={s}\n", .{ @tagName(event.payload.event_type), &task_id_str, @tagName(event.payload.state) });
 
             if (event.payload.event_type == .complete or event.payload.state.isTerminal()) {
                 std.debug.print("Task completed.\n", .{});
@@ -204,6 +207,8 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         std.debug.print("Error: Failed to submit task: {}\n", .{err});
         return;
     };
+
+    std.debug.print("[client] Stream ended\n", .{});
 }
 
 fn handleStatus(args: []const []const u8) !void {
