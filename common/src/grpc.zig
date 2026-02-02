@@ -152,7 +152,7 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     stream: ?net.Stream,
     next_request_id: u32,
-    tls_client: ?tls.Client = null,
+    tls_client: ?*tls.Client = null,
     stream_reader: ?net.Stream.Reader = null,
     stream_writer: ?net.Stream.Writer = null,
     read_buf: []u8 = &.{},
@@ -209,17 +209,21 @@ pub const Client = struct {
         self.stream_reader = s.reader(read_buf);
         self.stream_writer = s.writer(write_buf);
 
-        self.tls_client = try tls.Client.init(self.stream_reader.?.interface(), &self.stream_writer.?.interface, .{
+        const tc = try self.allocator.create(tls.Client);
+        errdefer self.allocator.destroy(tc);
+        tc.* = try tls.Client.init(self.stream_reader.?.interface(), &self.stream_writer.?.interface, .{
             .host = .{ .explicit = host },
             .ca = .{ .bundle = ca_bundle },
             .read_buffer = tls_read_buf,
             .write_buffer = tls_write_buf,
         });
+        self.tls_client = tc;
     }
 
     pub fn close(self: *Client) void {
-        if (self.tls_client) |*tc| {
+        if (self.tls_client) |tc| {
             tc.end() catch {};
+            self.allocator.destroy(tc);
             self.tls_client = null;
         }
         if (self.read_buf.len > 0) {
@@ -251,7 +255,7 @@ pub const Client = struct {
     }
 
     fn writeAllBytes(self: *Client, data: []const u8) !void {
-        if (self.tls_client) |*tc| {
+        if (self.tls_client) |tc| {
             var w = tc.writer;
             try w.writeAll(data);
             try w.flush();
@@ -262,7 +266,7 @@ pub const Client = struct {
     }
 
     fn readExactBytes(self: *Client, buf: []u8) !void {
-        if (self.tls_client) |*tc| {
+        if (self.tls_client) |tc| {
             tc.reader.readSliceAll(buf) catch |err| switch (err) {
                 error.EndOfStream => return error.ConnectionClosed,
                 error.ReadFailed => return error.ConnectionClosed,
