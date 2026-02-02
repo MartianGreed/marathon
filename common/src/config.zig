@@ -295,6 +295,11 @@ pub const ClientConfig = struct {
             }
         }
 
+        if (!config.tls_enabled and config.orchestrator_port == 443) {
+            const explicit = if (std.posix.getenv("MARATHON_TLS_ENABLED")) |_| true else if (dotenv) |*env| env.get("MARATHON_TLS_ENABLED") != null else false;
+            if (!explicit) config.tls_enabled = true;
+        }
+
         if (std.posix.getenv("MARATHON_TLS_CA_PATH")) |v| {
             config.tls_ca_path = v;
         } else if (dotenv) |*env| {
