@@ -35,8 +35,8 @@ pub fn main() !void {
 
     switch (command) {
         .submit => try handleSubmit(config, args[2..]),
-        .status => try handleStatus(args[2..]),
-        .cancel => try handleCancel(args[2..]),
+        .status => try handleStatus(config, allocator, args[2..]),
+        .cancel => try handleCancel(config, allocator, args[2..]),
         .usage => try handleUsage(),
         .help => printUsage(),
     }
@@ -188,45 +188,81 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         .pr_body = pr_body,
     };
 
-    std.debug.print("[client] Request: repo={s} branch={s} prompt_len={d} create_pr={}\n", .{ repo.?, branch, prompt.?.len, create_pr });
-
-    const CallbackContext = struct {
-        fn handleEvent(event: protocol.Message(protocol.TaskEvent)) bool {
-            const task_id_str = types.formatId(event.payload.task_id);
-            std.debug.print("[client] Event: type={s} task_id={s} state={s}\n", .{ @tagName(event.payload.event_type), &task_id_str, @tagName(event.payload.state) });
-
-            if (event.payload.event_type == .complete or event.payload.state.isTerminal()) {
-                std.debug.print("Task completed.\n", .{});
-                return false;
-            }
-            return true;
-        }
-    };
-
-    client.streamCall(.submit_task, request, protocol.TaskEvent, CallbackContext.handleEvent) catch |err| {
+    const response = client.call(.submit_task, request, protocol.TaskEvent) catch |err| {
         std.debug.print("Error: Failed to submit task: {}\n", .{err});
         return;
     };
 
-    std.debug.print("[client] Stream ended\n", .{});
+    const task_id_str = types.formatId(response.payload.task_id);
+    std.debug.print("{s}\n", .{&task_id_str});
 }
 
-fn handleStatus(args: []const []const u8) !void {
+fn handleStatus(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         std.debug.print("Error: task ID required\n", .{});
         return;
     }
 
-    std.debug.print("Checking status for task: {s}\n", .{args[0]});
+    const task_id = types.parseId(types.TaskId, args[0]) catch {
+        std.debug.print("Error: invalid task ID: {s}\n", .{args[0]});
+        return;
+    };
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const response = client.call(.get_task, protocol.GetTaskRequest{ .task_id = task_id }, protocol.TaskResponse) catch |err| {
+        std.debug.print("Error: Failed to get task status: {}\n", .{err});
+        return;
+    };
+
+    const r = response.payload;
+    const id_str = types.formatId(r.task_id);
+    std.debug.print("Task:      {s}\n", .{&id_str});
+    std.debug.print("State:     {s}\n", .{@tagName(r.state)});
+    std.debug.print("Repo:      {s}\n", .{r.repo_url});
+    std.debug.print("Branch:    {s}\n", .{r.branch});
+    std.debug.print("Created:   {d}\n", .{r.created_at});
+    if (r.started_at) |t| std.debug.print("Started:   {d}\n", .{t});
+    if (r.completed_at) |t| std.debug.print("Completed: {d}\n", .{t});
+    if (r.error_message) |msg| std.debug.print("Error:     {s}\n", .{msg});
+    if (r.pr_url) |url| std.debug.print("PR:        {s}\n", .{url});
 }
 
-fn handleCancel(args: []const []const u8) !void {
+fn handleCancel(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
     if (args.len < 1) {
         std.debug.print("Error: task ID required\n", .{});
         return;
     }
 
-    std.debug.print("Cancelling task: {s}\n", .{args[0]});
+    const task_id = types.parseId(types.TaskId, args[0]) catch {
+        std.debug.print("Error: invalid task ID: {s}\n", .{args[0]});
+        return;
+    };
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const response = client.call(.cancel_task, protocol.CancelTaskRequest{ .task_id = task_id }, protocol.CancelResponse) catch |err| {
+        std.debug.print("Error: Failed to cancel task: {}\n", .{err});
+        return;
+    };
+
+    if (response.payload.success) {
+        std.debug.print("Task cancelled.\n", .{});
+    } else {
+        std.debug.print("Cancel failed: {s}\n", .{response.payload.message});
+    }
 }
 
 fn handleUsage() !void {

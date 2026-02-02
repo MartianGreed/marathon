@@ -180,7 +180,7 @@ pub fn parseId(comptime T: type, hex: []const u8) !T {
     for (0..result.len) |i| {
         const high = try hexDigit(hex[i * 2]);
         const low = try hexDigit(hex[i * 2 + 1]);
-        result[i] = (high << 4) | low;
+        result[i] = (@as(u8, high) << 4) | low;
     }
     return result;
 }

@@ -384,12 +384,7 @@ pub const RequestHandler = struct {
 
         log.info("handleSubmitTask: sending initial task_event (queued) for task_id={s}", .{&types.formatId(task_id)});
         try conn.writeMessage(.task_event, request_id, event);
-        log.info("handleSubmitTask: initial event sent, starting event stream", .{});
-
-        self.streamTaskEvents(conn, task_id, request_id) catch |err| {
-            log.err("error streaming task events: task_id={s} err={}", .{ &types.formatId(task_id), err });
-        };
-        log.info("handleSubmitTask: stream ended for task_id={s}", .{&types.formatId(task_id)});
+        log.info("handleSubmitTask: queued event sent for task_id={s}", .{&types.formatId(task_id)});
     }
 
     fn streamTaskEvents(self: *RequestHandler, conn: *grpc.Connection, task_id: types.TaskId, request_id: u32) !void {
