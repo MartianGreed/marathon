@@ -147,7 +147,7 @@ pub const HeartbeatClient = struct {
 
         return .{
             .node_id = self.node_id,
-            .hostname = getHostname() catch "unknown",
+            .hostname = getHostname(),
             .total_vm_slots = 10,
             .active_vms = @intCast(self.vm_pool.activeCount()),
             .warm_vms = @intCast(self.vm_pool.warmCount()),
@@ -179,10 +179,20 @@ fn getSystemInfo() SystemInfo {
     };
 }
 
-fn getHostname() ![]const u8 {
-    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    const hostname = try std.posix.gethostname(&buf);
-    return hostname;
+fn getHostname() []const u8 {
+    const S = struct {
+        var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        var len: usize = 0;
+        var initialized: bool = false;
+    };
+
+    if (!S.initialized) {
+        const hostname = std.posix.gethostname(&S.buf) catch return "unknown";
+        S.len = hostname.len;
+        S.initialized = true;
+    }
+
+    return S.buf[0..S.len];
 }
 
 test "heartbeat client init" {
@@ -222,7 +232,7 @@ test "stop flag transitions correctly" {
 }
 
 test "getHostname returns non-empty string" {
-    const hostname = getHostname() catch "unknown";
+    const hostname = getHostname();
     try std.testing.expect(hostname.len > 0);
 }
 
