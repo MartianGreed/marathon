@@ -175,11 +175,19 @@ pub const Client = struct {
             defer list.deinit();
             if (list.addrs.len == 0) return error.UnknownHostName;
             self.stream = try net.tcpConnectToAddress(list.addrs[0]);
+            errdefer {
+                self.stream.?.close();
+                self.stream = null;
+            }
             std.debug.print("[grpc] TCP connected to {s}:{d} (resolved)\n", .{ host, port });
             if (tls_enabled) try self.initTls(host, ca_path);
             return;
         };
         self.stream = try net.tcpConnectToAddress(address);
+        errdefer {
+            self.stream.?.close();
+            self.stream = null;
+        }
         std.debug.print("[grpc] TCP connected to {s}:{d}\n", .{ host, port });
         if (tls_enabled) try self.initTls(host, ca_path);
     }

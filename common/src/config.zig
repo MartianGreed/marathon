@@ -191,7 +191,7 @@ pub const NodeOperatorConfig = struct {
 
         if (std.posix.getenv("MARATHON_TLS_ENABLED")) |v| {
             config.tls_enabled = std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "1");
-        } else if (config.orchestrator_port == 443 or config.orchestrator_port == 8443) {
+        } else if (config.orchestrator_port == 443) {
             config.tls_enabled = true;
         }
 
