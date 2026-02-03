@@ -62,11 +62,13 @@ pub const HeartbeatClient = struct {
                     error.UnexpectedResponse => {
                         std.log.warn("Unexpected response from orchestrator", .{});
                     },
+                    error.InvalidMagic => {
+                        std.log.err("Protocol mismatch - check TLS settings match orchestrator", .{});
+                        self.safeReconnect();
+                    },
                     else => {
                         std.log.warn("Heartbeat failed: {}, reconnecting...", .{err});
-                        self.reconnect() catch |reconn_err| {
-                            std.log.err("Reconnect failed: {}", .{reconn_err});
-                        };
+                        self.safeReconnect();
                     },
                 }
             };
@@ -131,10 +133,13 @@ pub const HeartbeatClient = struct {
         _ = try raw.decodeAs(protocol.HeartbeatResponse);
     }
 
-    fn reconnect(self: *HeartbeatClient) !void {
+    fn safeReconnect(self: *HeartbeatClient) void {
+        // Close connection safely, ignoring any errors
         self.client.close();
         common.compat.sleep(1000 * std.time.ns_per_ms);
-        try self.client.connect(self.orchestrator_address, self.orchestrator_port, self.tls_enabled, self.tls_ca_path);
+        self.client.connect(self.orchestrator_address, self.orchestrator_port, self.tls_enabled, self.tls_ca_path) catch |err| {
+            std.log.err("Reconnect failed: {}", .{err});
+        };
     }
 
     fn collectStatus(self: *HeartbeatClient) types.NodeStatus {
