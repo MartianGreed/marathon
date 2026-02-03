@@ -154,7 +154,7 @@ const LinuxVsockClient = struct {
         if (ready == 0) return false;
 
         if (fds[0].revents & std.posix.POLL.IN != 0) {
-            var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+            var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
             const n = try std.posix.recv(conn.fd, &header_buf, std.posix.MSG.PEEK);
             if (n < @sizeOf(protocol.Header)) return false;
 

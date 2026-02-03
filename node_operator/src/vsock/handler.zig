@@ -78,7 +78,7 @@ pub const VsockHandler = struct {
     pub fn receive(self: *VsockHandler) !VsockEvent {
         const conn = self.connection orelse return error.NotConnected;
 
-        var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+        var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
         var total: usize = 0;
         while (total < header_buf.len) {
             const n = try std.posix.recv(conn.fd, header_buf[total..], 0);
