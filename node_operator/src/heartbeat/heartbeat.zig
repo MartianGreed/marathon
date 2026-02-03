@@ -55,10 +55,20 @@ pub const HeartbeatClient = struct {
 
         while (self.running.load(.acquire)) {
             self.sendHeartbeat() catch |err| {
-                std.log.warn("Heartbeat failed: {}, reconnecting...", .{err});
-                self.reconnect() catch |reconn_err| {
-                    std.log.err("Reconnect failed: {}", .{reconn_err});
-                };
+                switch (err) {
+                    error.AuthFailed => {
+                        std.log.err("Authentication failed - check MARATHON_NODE_AUTH_KEY matches orchestrator", .{});
+                    },
+                    error.UnexpectedResponse => {
+                        std.log.warn("Unexpected response from orchestrator", .{});
+                    },
+                    else => {
+                        std.log.warn("Heartbeat failed: {}, reconnecting...", .{err});
+                        self.reconnect() catch |reconn_err| {
+                            std.log.err("Reconnect failed: {}", .{reconn_err});
+                        };
+                    },
+                }
             };
 
             common.compat.sleep(self.interval_ms * std.time.ns_per_ms);
@@ -101,7 +111,24 @@ pub const HeartbeatClient = struct {
             .draining = status.draining,
         };
 
-        _ = try self.client.call(.heartbeat_request, payload, protocol.HeartbeatResponse);
+        var raw = try self.client.callWithHeader(.heartbeat_request, payload);
+        defer raw.deinit();
+
+        if (raw.header.msg_type == .error_response) {
+            const err_resp = raw.decodeAs(protocol.ErrorResponse) catch {
+                std.log.err("heartbeat rejected with unparseable error", .{});
+                return error.AuthFailed;
+            };
+            std.log.err("heartbeat rejected: code={s} message={s}", .{ err_resp.code, err_resp.message });
+            return error.AuthFailed;
+        }
+
+        if (raw.header.msg_type != .heartbeat_response) {
+            std.log.warn("unexpected response type: {s}", .{@tagName(raw.header.msg_type)});
+            return error.UnexpectedResponse;
+        }
+
+        _ = try raw.decodeAs(protocol.HeartbeatResponse);
     }
 
     fn reconnect(self: *HeartbeatClient) !void {
