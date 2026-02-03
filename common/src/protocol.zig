@@ -304,9 +304,23 @@ pub const HeartbeatPayload = struct {
     draining: bool,
 };
 
+pub const CommandType = enum(u8) {
+    execute_task = 1,
+    cancel_task = 2,
+    drain = 3,
+    warm_pool = 4,
+};
+
+pub const NodeCommand = struct {
+    command_type: CommandType,
+    task_id: ?types.TaskId = null,
+    execute_request: ?ExecuteTaskRequest = null,
+};
+
 pub const HeartbeatResponse = struct {
     timestamp: i64,
     acknowledged: bool,
+    commands: []const NodeCommand = &[_]NodeCommand{},
 };
 
 pub const VsockStartPayload = struct {

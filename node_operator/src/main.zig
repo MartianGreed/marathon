@@ -5,6 +5,7 @@ const vm = @import("vm/firecracker.zig");
 const snapshot = @import("snapshot/manager.zig");
 const heartbeat = @import("heartbeat/heartbeat.zig");
 const vsock = @import("vsock/handler.zig");
+const task_executor = @import("task/executor.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -24,11 +25,14 @@ pub fn main() !void {
     var vm_pool = vm.VmPool.init(allocator, &snapshot_mgr, config);
     defer vm_pool.deinit();
 
+    var executor = task_executor.TaskExecutor.init(allocator, &vm_pool);
+
     var heartbeat_client = heartbeat.HeartbeatClient.init(
         allocator,
         config.orchestrator_address,
         config.orchestrator_port,
         &vm_pool,
+        &executor,
         config.auth_key,
         config.tls_enabled,
         config.tls_ca_path,
@@ -58,4 +62,5 @@ test {
     _ = snapshot;
     _ = heartbeat;
     _ = vsock;
+    _ = task_executor;
 }

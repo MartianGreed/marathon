@@ -49,6 +49,7 @@ pub fn main() !void {
         &meter,
         &authenticator,
         config.node_auth_key,
+        config.anthropic_api_key,
     );
     defer server.deinit();
 
@@ -99,6 +100,7 @@ fn runWithoutDb(allocator: std.mem.Allocator, config: common.config.Orchestrator
         &meter,
         &authenticator,
         config.node_auth_key,
+        config.anthropic_api_key,
     );
     defer server.deinit();
 
