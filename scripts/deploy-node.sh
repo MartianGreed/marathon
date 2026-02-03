@@ -148,14 +148,29 @@ download_kernel() {
 write_config() {
     log_info "Writing configuration..."
 
+    # Auto-enable TLS for port 443 or 8443 unless explicitly disabled
+    local port="${MARATHON_ORCHESTRATOR_PORT:-8080}"
+    local tls_enabled="${MARATHON_TLS_ENABLED:-}"
+    if [[ -z "$tls_enabled" ]] && [[ "$port" == "443" || "$port" == "8443" ]]; then
+        tls_enabled="true"
+    fi
+
     cat >"$CONFIG_DIR/node-operator.env" <<EOF
 MARATHON_ORCHESTRATOR_ADDRESS=${MARATHON_ORCHESTRATOR_ADDRESS}
-MARATHON_ORCHESTRATOR_PORT=${MARATHON_ORCHESTRATOR_PORT:-8080}
+MARATHON_ORCHESTRATOR_PORT=${port}
 MARATHON_TOTAL_VM_SLOTS=${MARATHON_TOTAL_VM_SLOTS:-10}
 MARATHON_WARM_POOL_TARGET=${MARATHON_WARM_POOL_TARGET:-5}
 MARATHON_SNAPSHOT_PATH=${MARATHON_DIR}/snapshots
 MARATHON_FIRECRACKER_BIN=/usr/bin/firecracker
 EOF
+
+    if [[ -n "$tls_enabled" ]]; then
+        echo "MARATHON_TLS_ENABLED=${tls_enabled}" >>"$CONFIG_DIR/node-operator.env"
+    fi
+
+    if [[ -n "${MARATHON_TLS_CA_PATH:-}" ]]; then
+        echo "MARATHON_TLS_CA_PATH=${MARATHON_TLS_CA_PATH}" >>"$CONFIG_DIR/node-operator.env"
+    fi
 
     if [[ -n "${MARATHON_NODE_AUTH_KEY:-}" ]]; then
         echo "MARATHON_NODE_AUTH_KEY=${MARATHON_NODE_AUTH_KEY}" >>"$CONFIG_DIR/node-operator.env"

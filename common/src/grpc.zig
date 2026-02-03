@@ -335,6 +335,68 @@ pub const Client = struct {
         return protocol.Message(ResponseType).decode(self.allocator, full_buf);
     }
 
+    pub const RawResponse = struct {
+        header: protocol.Header,
+        payload_data: []u8,
+        allocator: std.mem.Allocator,
+
+        pub fn deinit(self: *RawResponse) void {
+            self.allocator.free(self.payload_data);
+        }
+
+        pub fn decodeAs(self: *const RawResponse, comptime T: type) !T {
+            var full_buf = try self.allocator.alloc(u8, @sizeOf(protocol.Header) + self.payload_data.len);
+            defer self.allocator.free(full_buf);
+
+            @memcpy(full_buf[0..@sizeOf(protocol.Header)], std.mem.asBytes(&self.header));
+            @memcpy(full_buf[@sizeOf(protocol.Header)..], self.payload_data);
+
+            const msg = try protocol.Message(T).decode(self.allocator, full_buf);
+            return msg.payload;
+        }
+    };
+
+    pub fn callWithHeader(self: *Client, msg_type: protocol.MessageType, request: anytype) !RawResponse {
+        if (self.stream == null) return error.NotConnected;
+
+        const request_id = self.next_request_id;
+        self.next_request_id +%= 1;
+
+        const RequestType = @TypeOf(request);
+        const msg = protocol.Message(RequestType){
+            .header = .{
+                .msg_type = msg_type,
+                .payload_len = 0,
+                .request_id = request_id,
+            },
+            .payload = request,
+        };
+
+        const data = try msg.encode(self.allocator);
+        defer self.allocator.free(data);
+
+        try self.writeAllBytes(data);
+
+        var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+        try self.readExactBytes(&header_buf);
+
+        const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
+        if (!std.mem.eql(u8, &header.magic, &.{ 'M', 'R', 'T', 'N' })) {
+            return error.InvalidMagic;
+        }
+
+        const payload_data = try self.allocator.alloc(u8, header.payload_len);
+        errdefer self.allocator.free(payload_data);
+
+        try self.readExactBytes(payload_data);
+
+        return .{
+            .header = header.*,
+            .payload_data = payload_data,
+            .allocator = self.allocator,
+        };
+    }
+
     pub fn streamCall(
         self: *Client,
         msg_type: protocol.MessageType,
