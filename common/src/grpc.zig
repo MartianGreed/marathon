@@ -71,7 +71,7 @@ pub const Connection = struct {
     }
 
     pub fn readHeader(self: *Connection) !protocol.Header {
-        var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+        var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
         try self.readExact(&header_buf);
 
         const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
@@ -99,7 +99,7 @@ pub const Connection = struct {
     }
 
     pub fn readMessage(self: *Connection, comptime T: type) !protocol.Message(T) {
-        var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+        var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
         try self.readExact(&header_buf);
 
         const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
@@ -334,7 +334,7 @@ pub const Client = struct {
 
         try self.writeAllBytes(data);
 
-        var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+        var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
         try self.readExactBytes(&header_buf);
 
         const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
@@ -448,7 +448,7 @@ pub const Client = struct {
         std.debug.print("[grpc] streamCall: request sent, waiting for events...\n", .{});
 
         while (true) {
-            var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+            var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
             self.readExactBytes(&header_buf) catch |err| {
                 if (err == error.ConnectionClosed) {
                     std.debug.print("[grpc] streamCall: connection closed by server\n", .{});

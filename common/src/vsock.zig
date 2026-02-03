@@ -69,7 +69,7 @@ pub const Connection = struct {
     }
 
     pub fn receive(self: *Connection, comptime T: type) !protocol.Message(T) {
-        var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+        var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
         try self.readExact(&header_buf);
 
         const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
