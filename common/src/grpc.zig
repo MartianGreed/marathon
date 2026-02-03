@@ -197,7 +197,6 @@ pub const Client = struct {
             std.debug.print("[grpc] CA bundle loaded from system defaults\n", .{});
         }
         errdefer ca_bundle.deinit(self.allocator);
-        self.ca_bundle = ca_bundle;
 
         const read_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
         errdefer self.allocator.free(read_buf);
@@ -207,39 +206,32 @@ pub const Client = struct {
         errdefer self.allocator.free(tls_read_buf);
         const tls_write_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
         errdefer self.allocator.free(tls_write_buf);
-        self.read_buf = read_buf;
-        self.write_buf = write_buf;
-        self.tls_read_buf = tls_read_buf;
-        self.tls_write_buf = tls_write_buf;
 
-        self.stream_reader = s.reader(read_buf);
-        self.stream_writer = s.writer(write_buf);
+        var stream_reader = s.reader(read_buf);
+        var stream_writer = s.writer(write_buf);
 
         const tc = try self.allocator.create(tls.Client);
+        errdefer self.allocator.destroy(tc);
+
         std.debug.print("[grpc] TLS handshake starting...\n", .{});
-        tc.* = tls.Client.init(self.stream_reader.?.interface(), &self.stream_writer.?.interface, .{
+        tc.* = tls.Client.init(stream_reader.interface(), &stream_writer.interface, .{
             .host = .{ .explicit = host },
             .ca = .{ .bundle = ca_bundle },
             .read_buffer = tls_read_buf,
             .write_buffer = tls_write_buf,
         }) catch |err| {
             std.debug.print("[grpc] TLS handshake failed: {}\n", .{err});
-            // Clean up allocated resources on failure
-            self.allocator.free(read_buf);
-            self.allocator.free(write_buf);
-            self.allocator.free(tls_read_buf);
-            self.allocator.free(tls_write_buf);
-            self.read_buf = &.{};
-            self.write_buf = &.{};
-            self.tls_read_buf = &.{};
-            self.tls_write_buf = &.{};
-            self.stream_reader = null;
-            self.stream_writer = null;
-            ca_bundle.deinit(self.allocator);
-            self.ca_bundle = null;
-            self.allocator.destroy(tc);
             return err;
         };
+
+        // Success - assign to self (errdefers won't trigger after this point)
+        self.ca_bundle = ca_bundle;
+        self.read_buf = read_buf;
+        self.write_buf = write_buf;
+        self.tls_read_buf = tls_read_buf;
+        self.tls_write_buf = tls_write_buf;
+        self.stream_reader = stream_reader;
+        self.stream_writer = stream_writer;
         self.tls_client = tc;
         std.debug.print("[grpc] TLS handshake complete\n", .{});
     }
