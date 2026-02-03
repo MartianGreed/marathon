@@ -148,10 +148,10 @@ download_kernel() {
 write_config() {
     log_info "Writing configuration..."
 
-    # Auto-enable TLS for port 443 or 8443 unless explicitly disabled
+    # Auto-enable TLS for port 443 unless explicitly disabled
     local port="${MARATHON_ORCHESTRATOR_PORT:-8080}"
     local tls_enabled="${MARATHON_TLS_ENABLED:-}"
-    if [[ -z "$tls_enabled" ]] && [[ "$port" == "443" || "$port" == "8443" ]]; then
+    if [[ -z "$tls_enabled" ]] && [[ "$port" == "443" ]]; then
         tls_enabled="true"
     fi
 
@@ -219,6 +219,12 @@ EOF
 }
 
 install_binary() {
+    # Stop service if running to avoid "Text file busy" error
+    if systemctl is-active --quiet marathon-node-operator 2>/dev/null; then
+        log_info "Stopping marathon-node-operator service for upgrade..."
+        systemctl stop marathon-node-operator
+    fi
+
     if [[ -f "./zig-out/bin/marathon-node-operator" ]]; then
         log_info "Installing marathon-node-operator from local build..."
         cp "./zig-out/bin/marathon-node-operator" /usr/local/bin/
