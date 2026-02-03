@@ -398,7 +398,7 @@ pub const Client = struct {
 
         try self.writeAllBytes(data);
 
-        var header_buf: [@sizeOf(protocol.Header)]u8 = undefined;
+        var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
         try self.readExactBytes(&header_buf);
 
         const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
