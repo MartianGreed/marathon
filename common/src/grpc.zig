@@ -196,6 +196,7 @@ pub const Client = struct {
             try ca_bundle.rescan(self.allocator);
             std.debug.print("[grpc] CA bundle loaded from system defaults\n", .{});
         }
+        errdefer ca_bundle.deinit(self.allocator);
         self.ca_bundle = ca_bundle;
 
         const read_buf = try self.allocator.alloc(u8, tls.Client.min_buffer_len);
@@ -215,24 +216,48 @@ pub const Client = struct {
         self.stream_writer = s.writer(write_buf);
 
         const tc = try self.allocator.create(tls.Client);
-        errdefer self.allocator.destroy(tc);
         std.debug.print("[grpc] TLS handshake starting...\n", .{});
-        tc.* = try tls.Client.init(self.stream_reader.?.interface(), &self.stream_writer.?.interface, .{
+        tc.* = tls.Client.init(self.stream_reader.?.interface(), &self.stream_writer.?.interface, .{
             .host = .{ .explicit = host },
             .ca = .{ .bundle = ca_bundle },
             .read_buffer = tls_read_buf,
             .write_buffer = tls_write_buf,
-        });
+        }) catch |err| {
+            std.debug.print("[grpc] TLS handshake failed: {}\n", .{err});
+            // Clean up allocated resources on failure
+            self.allocator.free(read_buf);
+            self.allocator.free(write_buf);
+            self.allocator.free(tls_read_buf);
+            self.allocator.free(tls_write_buf);
+            self.read_buf = &.{};
+            self.write_buf = &.{};
+            self.tls_read_buf = &.{};
+            self.tls_write_buf = &.{};
+            self.stream_reader = null;
+            self.stream_writer = null;
+            ca_bundle.deinit(self.allocator);
+            self.ca_bundle = null;
+            self.allocator.destroy(tc);
+            return err;
+        };
         self.tls_client = tc;
         std.debug.print("[grpc] TLS handshake complete\n", .{});
     }
 
     pub fn close(self: *Client) void {
+        // Clean up TLS first if present
         if (self.tls_client) |tc| {
+            // Defensive: catch any errors during TLS cleanup
             tc.end() catch {};
             self.allocator.destroy(tc);
             self.tls_client = null;
         }
+        // Close underlying stream BEFORE freeing buffers
+        if (self.stream) |s| {
+            s.close();
+            self.stream = null;
+        }
+        // Now safe to free buffers
         if (self.read_buf.len > 0) {
             self.allocator.free(self.read_buf);
             self.read_buf = &.{};
@@ -255,10 +280,6 @@ pub const Client = struct {
         }
         self.stream_reader = null;
         self.stream_writer = null;
-        if (self.stream) |s| {
-            s.close();
-            self.stream = null;
-        }
     }
 
     fn writeAllBytes(self: *Client, data: []const u8) !void {
