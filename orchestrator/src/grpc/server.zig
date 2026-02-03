@@ -280,6 +280,21 @@ pub const Server = struct {
             .acknowledged = true,
         };
         try conn.writeMessage(.heartbeat_response, request_id, response);
+
+        if (status.availableSlots() > 0) {
+            self.tryScheduleTasks();
+        }
+    }
+
+    fn tryScheduleTasks(self: *Server) void {
+        while (true) {
+            const result = self.scheduler.scheduleNext() orelse break;
+
+            log.info("task scheduled to node: task_id={s} node_id={s}", .{
+                &types.formatId(result.task.id),
+                &types.formatId(result.node_id),
+            });
+        }
     }
 
     fn validateNodeAuth(self: *Server, payload: protocol.HeartbeatPayload) bool {
