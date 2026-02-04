@@ -340,17 +340,6 @@ pub const Server = struct {
         while (true) {
             const result = self.scheduler.scheduleNext() orelse break;
 
-            log.info("task scheduled to node: task_id={s} node_id={s}", .{
-                &types.formatId(result.task.id),
-                &types.formatId(result.node_id),
-            });
-        }
-    }
-
-    fn tryScheduleTasks(self: *Server) void {
-        while (true) {
-            const result = self.scheduler.scheduleNext() orelse break;
-
             const entry = self.pending_tasks.getOrPut(result.node_id) catch {
                 log.err("failed to store pending task: task_id={s}", .{&types.formatId(result.task.id)});
                 continue;
