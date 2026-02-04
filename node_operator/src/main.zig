@@ -25,6 +25,11 @@ pub fn main() !void {
     var vm_pool = vm.VmPool.init(allocator, &snapshot_mgr, config);
     defer vm_pool.deinit();
 
+    vm_pool.warmPool(config.warm_pool_target) catch |err| {
+        std.log.err("Failed to warm VM pool: {}", .{err});
+    };
+    std.log.info("Warm pool initialized: {d} VMs ready", .{vm_pool.warmCount()});
+
     var executor = task_executor.TaskExecutor.init(allocator, &vm_pool);
 
     var heartbeat_client = heartbeat.HeartbeatClient.init(

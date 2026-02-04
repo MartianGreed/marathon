@@ -157,7 +157,11 @@ pub const HeartbeatClient = struct {
                 std.log.info("drain command received (not yet implemented)", .{});
             },
             .warm_pool => {
-                std.log.info("warm_pool command received (not yet implemented)", .{});
+                const target = cmd.warm_pool_target orelse self.vm_pool.config.warm_pool_target;
+                std.log.info("warm_pool command received, target={d}", .{target});
+                self.vm_pool.warmPool(target) catch |err| {
+                    std.log.err("Failed to warm pool: {}", .{err});
+                };
             },
         }
     }
@@ -177,7 +181,7 @@ pub const HeartbeatClient = struct {
         return .{
             .node_id = self.node_id,
             .hostname = getHostname(),
-            .total_vm_slots = 10,
+            .total_vm_slots = self.vm_pool.config.total_vm_slots,
             .active_vms = @intCast(self.vm_pool.activeCount()),
             .warm_vms = @intCast(self.vm_pool.warmCount()),
             .cpu_usage = sys_info.cpu_usage,
