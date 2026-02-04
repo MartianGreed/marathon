@@ -4,12 +4,14 @@ const types = common.types;
 const protocol = common.protocol;
 const grpc = common.grpc;
 const vm = @import("../vm/firecracker.zig");
+const task_executor = @import("../task/executor.zig");
 
 pub const HeartbeatClient = struct {
     allocator: std.mem.Allocator,
     orchestrator_address: []const u8,
     orchestrator_port: u16,
     vm_pool: *vm.VmPool,
+    executor: *task_executor.TaskExecutor,
     node_id: types.NodeId,
     interval_ms: u64,
     running: std.atomic.Value(bool),
@@ -23,6 +25,7 @@ pub const HeartbeatClient = struct {
         orchestrator_address: []const u8,
         orchestrator_port: u16,
         vm_pool: *vm.VmPool,
+        executor: *task_executor.TaskExecutor,
         auth_key: ?[]const u8,
         tls_enabled: bool,
         tls_ca_path: ?[]const u8,
@@ -35,6 +38,7 @@ pub const HeartbeatClient = struct {
             .orchestrator_address = orchestrator_address,
             .orchestrator_port = orchestrator_port,
             .vm_pool = vm_pool,
+            .executor = executor,
             .node_id = node_id,
             .interval_ms = 5000,
             .running = std.atomic.Value(bool).init(false),
@@ -130,7 +134,32 @@ pub const HeartbeatClient = struct {
             return error.UnexpectedResponse;
         }
 
-        _ = try raw.decodeAs(protocol.HeartbeatResponse);
+        const response = try raw.decodeAs(protocol.HeartbeatResponse);
+
+        for (response.commands) |cmd| {
+            self.processCommand(cmd) catch |err| {
+                std.log.err("command processing failed: {}", .{err});
+            };
+        }
+    }
+
+    fn processCommand(self: *HeartbeatClient, cmd: protocol.NodeCommand) !void {
+        switch (cmd.command_type) {
+            .execute_task => {
+                const req = cmd.execute_request orelse return error.MissingExecuteRequest;
+                std.log.info("received task: task_id={s}", .{&types.formatId(req.task_id)});
+                try self.executor.executeTask(req);
+            },
+            .cancel_task => {
+                std.log.info("cancel_task command received (not yet implemented)", .{});
+            },
+            .drain => {
+                std.log.info("drain command received (not yet implemented)", .{});
+            },
+            .warm_pool => {
+                std.log.info("warm_pool command received (not yet implemented)", .{});
+            },
+        }
     }
 
     fn safeReconnect(self: *HeartbeatClient) void {
@@ -204,7 +233,9 @@ test "heartbeat client init" {
     var pool = vm.VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
-    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, null, false, null);
+    var executor = task_executor.TaskExecutor.init(allocator, &pool);
+
+    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, &executor, null, false, null);
     defer client.deinit();
 
     try std.testing.expectEqual(@as(u64, 5000), client.interval_ms);
@@ -219,7 +250,9 @@ test "stop flag transitions correctly" {
     var pool = vm.VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
-    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, null, false, null);
+    var executor = task_executor.TaskExecutor.init(allocator, &pool);
+
+    var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, &executor, null, false, null);
     defer client.deinit();
 
     try std.testing.expect(!client.running.load(.acquire));

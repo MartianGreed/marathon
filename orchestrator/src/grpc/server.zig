@@ -71,6 +71,8 @@ pub const Server = struct {
     node_repo: ?*db.NodeRepository,
     usage_repo: ?*db.UsageRepository,
     node_auth_key: ?[]const u8,
+    pending_tasks: std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)),
+    anthropic_api_key: []const u8,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -79,6 +81,7 @@ pub const Server = struct {
         meter: *metering.Metering,
         authenticator: *auth.Authenticator,
         node_auth_key: ?[]const u8,
+        anthropic_api_key: []const u8,
     ) Server {
         return .{
             .allocator = allocator,
@@ -92,6 +95,8 @@ pub const Server = struct {
             .node_repo = null,
             .usage_repo = null,
             .node_auth_key = node_auth_key,
+            .pending_tasks = std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)).init(allocator),
+            .anthropic_api_key = anthropic_api_key,
         };
     }
 
@@ -108,6 +113,12 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.stop();
+
+        var it = self.pending_tasks.valueIterator();
+        while (it.next()) |list| {
+            list.deinit(self.allocator);
+        }
+        self.pending_tasks.deinit();
     }
 
     pub fn listen(self: *Server, address: []const u8, port: u16) !void {
@@ -275,9 +286,48 @@ pub const Server = struct {
             });
         }
 
+        if (status.availableSlots() > 0) {
+            self.tryScheduleTasks();
+        }
+
+        var commands: std.ArrayListUnmanaged(protocol.NodeCommand) = .empty;
+        defer commands.deinit(self.allocator);
+
+        if (self.pending_tasks.getPtr(payload.node_id)) |queue| {
+            for (queue.items) |task| {
+                commands.append(self.allocator, .{
+                    .command_type = .execute_task,
+                    .task_id = task.id,
+                    .execute_request = .{
+                        .task_id = task.id,
+                        .repo_url = task.repo_url,
+                        .branch = task.branch,
+                        .prompt = task.prompt,
+                        .github_token = task.github_token orelse "",
+                        .anthropic_api_key = self.anthropic_api_key,
+                        .create_pr = task.create_pr,
+                        .pr_title = task.pr_title,
+                        .pr_body = task.pr_body,
+                        .timeout_ms = 600000,
+                        .max_tokens = 100000,
+                    },
+                }) catch {
+                    log.err("failed to build command for task_id={s}", .{&types.formatId(task.id)});
+                    continue;
+                };
+
+                log.info("delivering task to node: task_id={s} node_id={s}", .{
+                    &types.formatId(task.id),
+                    &types.formatId(payload.node_id),
+                });
+            }
+            queue.clearRetainingCapacity();
+        }
+
         const response = protocol.HeartbeatResponse{
             .timestamp = std.time.milliTimestamp(),
             .acknowledged = true,
+            .commands = commands.items,
         };
         try conn.writeMessage(.heartbeat_response, request_id, response);
 
@@ -291,6 +341,29 @@ pub const Server = struct {
             const result = self.scheduler.scheduleNext() orelse break;
 
             log.info("task scheduled to node: task_id={s} node_id={s}", .{
+                &types.formatId(result.task.id),
+                &types.formatId(result.node_id),
+            });
+        }
+    }
+
+    fn tryScheduleTasks(self: *Server) void {
+        while (true) {
+            const result = self.scheduler.scheduleNext() orelse break;
+
+            const entry = self.pending_tasks.getOrPut(result.node_id) catch {
+                log.err("failed to store pending task: task_id={s}", .{&types.formatId(result.task.id)});
+                continue;
+            };
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .empty;
+            }
+            entry.value_ptr.append(self.allocator, result.task) catch {
+                log.err("failed to append pending task: task_id={s}", .{&types.formatId(result.task.id)});
+                continue;
+            };
+
+            log.info("task queued for delivery: task_id={s} node_id={s}", .{
                 &types.formatId(result.task.id),
                 &types.formatId(result.node_id),
             });
@@ -364,6 +437,7 @@ pub const RequestHandler = struct {
         task.create_pr = request.create_pr;
         task.pr_title = request.pr_title;
         task.pr_body = request.pr_body;
+        task.github_token = if (request.github_token.len > 0) try self.allocator.dupe(u8, request.github_token) else null;
 
         if (self.task_repo) |repo| {
             log.info("handleSubmitTask: persisting task to DB", .{});

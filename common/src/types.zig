@@ -75,6 +75,7 @@ pub const Task = struct {
     create_pr: bool,
     pr_title: ?[]const u8,
     pr_body: ?[]const u8,
+    github_token: ?[]const u8,
 
     pub fn deinit(self: *Task) void {
         self.allocator.free(self.repo_url);
@@ -84,6 +85,7 @@ pub const Task = struct {
         if (self.pr_url) |url| self.allocator.free(url);
         if (self.pr_title) |title| self.allocator.free(title);
         if (self.pr_body) |body| self.allocator.free(body);
+        if (self.github_token) |token| self.allocator.free(token);
     }
 
     pub fn init(
@@ -115,6 +117,7 @@ pub const Task = struct {
             .create_pr = false,
             .pr_title = null,
             .pr_body = null,
+            .github_token = null,
         };
     }
 };
