@@ -78,7 +78,7 @@ pub const Vm = struct {
         var child = std.process.Child.init(argv, self.allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
         try child.spawn();
         self.process = child;
         errdefer {
@@ -91,6 +91,7 @@ pub const Vm = struct {
 
         waitForSocket(self.socket_path, 5000) catch |err| {
             std.log.err("Firecracker socket not ready: {}", .{err});
+            logFirecrackerError(self);
             return error.FirecrackerStartFailed;
         };
 
@@ -133,7 +134,7 @@ pub const Vm = struct {
         var child = std.process.Child.init(argv, self.allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
         try child.spawn();
         self.process = child;
         errdefer {
@@ -146,6 +147,7 @@ pub const Vm = struct {
 
         waitForSocket(self.socket_path, 5000) catch |err| {
             std.log.err("Firecracker socket not ready: {}", .{err});
+            logFirecrackerError(self);
             return error.FirecrackerStartFailed;
         };
 
@@ -318,6 +320,26 @@ fn generateCid() u32 {
     std.crypto.random.bytes(&bytes);
     const cid = std.mem.readInt(u32, &bytes, .little);
     return (cid % 0xFFFF_FFFC) + 3;
+}
+
+fn logFirecrackerError(vm: *Vm) void {
+    if (vm.process) |*proc| {
+        if (proc.stderr) |stderr| {
+            var stderr_buf: [4096]u8 = undefined;
+            const stderr_len = stderr.read(&stderr_buf) catch 0;
+            if (stderr_len > 0) {
+                std.log.err("Firecracker stderr: {s}", .{stderr_buf[0..stderr_len]});
+            }
+        }
+        const result = proc.wait() catch null;
+        if (result) |r| {
+            switch (r.Exited) {
+                0 => {},
+                else => |code| std.log.err("Firecracker exited with code: {d}", .{code}),
+            }
+        }
+        vm.process = null;
+    }
 }
 
 fn waitForSocket(path: []const u8, timeout_ms: u64) !void {
