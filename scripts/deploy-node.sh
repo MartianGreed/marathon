@@ -145,6 +145,29 @@ download_kernel() {
     log_info "Kernel downloaded to $KERNEL_PATH"
 }
 
+download_rootfs() {
+    ROOTFS_PATH="$MARATHON_DIR/rootfs/rootfs.ext4"
+
+    if [[ -f "$ROOTFS_PATH" ]]; then
+        log_info "Rootfs already exists at $ROOTFS_PATH"
+        return
+    fi
+
+    log_info "Downloading minimal Ubuntu rootfs for testing..."
+
+    ROOTFS_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/bionic.rootfs.ext4"
+
+    if ! wget -q -O "$ROOTFS_PATH" "$ROOTFS_URL"; then
+        log_warn "Failed to download rootfs - VM agent won't work without custom rootfs"
+        log_warn "Build and deploy custom rootfs: make rootfs && scp rootfs.ext4 server:$ROOTFS_PATH"
+        return 1
+    fi
+
+    chmod 644 "$ROOTFS_PATH"
+    log_info "Rootfs downloaded to $ROOTFS_PATH"
+    log_warn "Note: This is a minimal test rootfs. For production, build custom rootfs with 'make rootfs'"
+}
+
 write_config() {
     log_info "Writing configuration..."
 
@@ -161,6 +184,8 @@ MARATHON_ORCHESTRATOR_PORT=${port}
 MARATHON_TOTAL_VM_SLOTS=${MARATHON_TOTAL_VM_SLOTS:-10}
 MARATHON_WARM_POOL_TARGET=${MARATHON_WARM_POOL_TARGET:-5}
 MARATHON_SNAPSHOT_PATH=${MARATHON_DIR}/snapshots
+MARATHON_KERNEL_PATH=${MARATHON_DIR}/kernel/vmlinux
+MARATHON_ROOTFS_PATH=${MARATHON_DIR}/rootfs/rootfs.ext4
 MARATHON_FIRECRACKER_BIN=/usr/bin/firecracker
 EOF
 
@@ -296,6 +321,7 @@ main() {
     install_firecracker
     create_directories
     download_kernel
+    download_rootfs || true
     write_config
     create_systemd_service
     install_binary

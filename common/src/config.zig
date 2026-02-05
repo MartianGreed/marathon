@@ -181,6 +181,14 @@ pub const NodeOperatorConfig = struct {
             config.snapshot_path = try allocator.dupe(u8, v);
         }
 
+        if (std.posix.getenv("MARATHON_KERNEL_PATH")) |v| {
+            config.kernel_path = try allocator.dupe(u8, v);
+        }
+
+        if (std.posix.getenv("MARATHON_ROOTFS_PATH")) |v| {
+            config.rootfs_path = try allocator.dupe(u8, v);
+        }
+
         if (std.posix.getenv("MARATHON_FIRECRACKER_BIN")) |v| {
             config.firecracker_bin = try allocator.dupe(u8, v);
         }
