@@ -130,7 +130,7 @@ download_kernel() {
 
     log_info "Downloading kernel $KERNEL_VERSION..."
 
-    KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux-${KERNEL_VERSION}.bin"
+    KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux-${KERNEL_VERSION}"
 
     if ! wget -q -O "$KERNEL_PATH" "$KERNEL_URL"; then
         log_warn "Failed to download kernel from primary source, trying alternative..."

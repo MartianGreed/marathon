@@ -109,6 +109,7 @@ pub const Vm = struct {
         };
 
         std.fs.cwd().deleteFile(self.socket_path) catch {};
+        std.fs.cwd().deleteFile(self.vsock_uds_path) catch {};
 
         const argv: []const []const u8 = &.{ config.firecracker_bin, "--api-sock", self.socket_path };
         var child = std.process.Child.init(argv, self.allocator);
@@ -165,6 +166,7 @@ pub const Vm = struct {
         std.log.info("Starting VM {s} from snapshot", .{types.formatId(self.id)});
 
         std.fs.cwd().deleteFile(self.socket_path) catch {};
+        std.fs.cwd().deleteFile(self.vsock_uds_path) catch {};
 
         const argv: []const []const u8 = &.{ config.firecracker_bin, "--api-sock", self.socket_path };
         var child = std.process.Child.init(argv, self.allocator);
@@ -294,12 +296,9 @@ pub const VmPool = struct {
             };
 
             vm.startFromSnapshot(self.snapshot_mgr, vm_config) catch |err| {
-                std.log.warn("Failed to start VM from snapshot: {}, falling back to cold start", .{err});
-                vm.start(vm_config) catch |start_err| {
-                    std.log.err("Failed to cold start VM: {}", .{start_err});
-                    vm.deinit();
-                    continue;
-                };
+                std.log.err("Failed to start VM: {}", .{err});
+                vm.deinit();
+                continue;
             };
 
             try self.warm_vms.append(self.allocator, vm);
