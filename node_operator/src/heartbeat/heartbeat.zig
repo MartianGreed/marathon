@@ -231,7 +231,7 @@ fn getHostname() []const u8 {
 test "heartbeat client init" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try @import("../snapshot/manager.zig").SnapshotManager.init(allocator, "/tmp");
+    var snapshot_mgr = try @import("../snapshot/manager.zig").SnapshotManager.init(allocator, "/tmp/marathon-heartbeat-test-init");
     defer snapshot_mgr.deinit();
 
     var pool = vm.VmPool.init(allocator, &snapshot_mgr, .{});
@@ -248,7 +248,7 @@ test "heartbeat client init" {
 test "stop flag transitions correctly" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try @import("../snapshot/manager.zig").SnapshotManager.init(allocator, "/tmp");
+    var snapshot_mgr = try @import("../snapshot/manager.zig").SnapshotManager.init(allocator, "/tmp/marathon-heartbeat-test-stop");
     defer snapshot_mgr.deinit();
 
     var pool = vm.VmPool.init(allocator, &snapshot_mgr, .{});

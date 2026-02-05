@@ -167,7 +167,7 @@ test "snapshot manager init with temp dir" {
 test "getSnapshot returns null for unknown name" {
     const allocator = std.testing.allocator;
 
-    var mgr = try SnapshotManager.init(allocator, "/tmp");
+    var mgr = try SnapshotManager.init(allocator, "/tmp/marathon-test-unknown-snapshot");
     defer mgr.deinit();
 
     const result = mgr.getSnapshot("nonexistent-snapshot");
@@ -177,7 +177,7 @@ test "getSnapshot returns null for unknown name" {
 test "getDefaultSnapshot returns null when no base snapshot" {
     const allocator = std.testing.allocator;
 
-    var mgr = try SnapshotManager.init(allocator, "/tmp");
+    var mgr = try SnapshotManager.init(allocator, "/tmp/marathon-test-default-snapshot");
     defer mgr.deinit();
 
     const result = mgr.getDefaultSnapshot();
