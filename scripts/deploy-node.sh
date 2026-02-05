@@ -208,7 +208,8 @@ SyslogIdentifier=marathon-node-operator
 # Security hardening
 NoNewPrivileges=false
 ProtectSystem=strict
-ReadWritePaths=$MARATHON_DIR /dev/kvm
+RuntimeDirectory=marathon
+ReadWritePaths=$MARATHON_DIR /dev/kvm /run/marathon
 
 [Install]
 WantedBy=multi-user.target
