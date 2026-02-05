@@ -108,6 +108,16 @@ pub const Vm = struct {
             return error.FirecrackerNotFound;
         };
 
+        std.fs.accessAbsolute(config.kernel_path, .{}) catch {
+            std.log.err("Kernel image not found at {s}", .{config.kernel_path});
+            return error.KernelNotFound;
+        };
+
+        std.fs.accessAbsolute(config.rootfs_path, .{}) catch {
+            std.log.err("Rootfs not found at {s}", .{config.rootfs_path});
+            return error.RootfsNotFound;
+        };
+
         std.fs.cwd().deleteFile(self.socket_path) catch {};
         std.fs.cwd().deleteFile(self.vsock_uds_path) catch {};
 
@@ -284,6 +294,9 @@ pub const VmPool = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        var consecutive_failures: u32 = 0;
+        const max_failures: u32 = 3;
+
         while (self.warm_vms.items.len < target) {
             const vm = try Vm.init(self.allocator);
             errdefer vm.deinit();
@@ -298,9 +311,15 @@ pub const VmPool = struct {
             vm.startFromSnapshot(self.snapshot_mgr, vm_config) catch |err| {
                 std.log.err("Failed to start VM: {}", .{err});
                 vm.deinit();
+                consecutive_failures += 1;
+                if (consecutive_failures >= max_failures) {
+                    std.log.err("warm pool: {d} consecutive failures, aborting", .{consecutive_failures});
+                    return;
+                }
                 continue;
             };
 
+            consecutive_failures = 0;
             try self.warm_vms.append(self.allocator, vm);
         }
     }
