@@ -3,6 +3,7 @@ const net = std.net;
 const tls = std.crypto.tls;
 const Certificate = std.crypto.Certificate;
 const protocol = @import("protocol.zig");
+const log = std.log.scoped(.grpc);
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -179,7 +180,7 @@ pub const Client = struct {
                 self.stream.?.close();
                 self.stream = null;
             }
-            std.debug.print("[grpc] TCP connected to {s}:{d} (resolved)\n", .{ host, port });
+            log.debug("TCP connected to {s}:{d} (resolved)\n", .{ host, port });
             if (tls_enabled) try self.initTls(host, ca_path);
             return;
         };
@@ -188,21 +189,21 @@ pub const Client = struct {
             self.stream.?.close();
             self.stream = null;
         }
-        std.debug.print("[grpc] TCP connected to {s}:{d}\n", .{ host, port });
+        log.debug("TCP connected to {s}:{d}\n", .{ host, port });
         if (tls_enabled) try self.initTls(host, ca_path);
     }
 
     fn initTls(self: *Client, host: []const u8, ca_path: ?[]const u8) !void {
         const s = self.stream orelse return error.NotConnected;
 
-        std.debug.print("[grpc] Initializing TLS for host: {s}\n", .{host});
+        log.debug("Initializing TLS for host: {s}\n", .{host});
         var ca_bundle: Certificate.Bundle = .{};
         if (ca_path) |path| {
             try ca_bundle.addCertsFromFilePathAbsolute(self.allocator, path);
-            std.debug.print("[grpc] CA bundle loaded from: {s}\n", .{path});
+            log.debug("CA bundle loaded from: {s}\n", .{path});
         } else {
             try ca_bundle.rescan(self.allocator);
-            std.debug.print("[grpc] CA bundle loaded from system defaults\n", .{});
+            log.debug("CA bundle loaded from system defaults\n", .{});
         }
         errdefer ca_bundle.deinit(self.allocator);
 
@@ -221,14 +222,14 @@ pub const Client = struct {
         const tc = try self.allocator.create(tls.Client);
         errdefer self.allocator.destroy(tc);
 
-        std.debug.print("[grpc] TLS handshake starting...\n", .{});
+        log.debug("TLS handshake starting...\n", .{});
         tc.* = tls.Client.init(stream_reader.interface(), &stream_writer.interface, .{
             .host = .{ .explicit = host },
             .ca = .{ .bundle = ca_bundle },
             .read_buffer = tls_read_buf,
             .write_buffer = tls_write_buf,
         }) catch |err| {
-            std.debug.print("[grpc] TLS handshake failed: {}\n", .{err});
+            log.debug("TLS handshake failed: {}\n", .{err});
             return err;
         };
 
@@ -241,7 +242,7 @@ pub const Client = struct {
         self.stream_reader = stream_reader;
         self.stream_writer = stream_writer;
         self.tls_client = tc;
-        std.debug.print("[grpc] TLS handshake complete\n", .{});
+        log.debug("TLS handshake complete\n", .{});
     }
 
     pub fn close(self: *Client) void {
@@ -284,7 +285,7 @@ pub const Client = struct {
 
     fn writeAllBytes(self: *Client, data: []const u8) !void {
         const mode: []const u8 = if (self.tls_client != null) "TLS" else "plain";
-        std.debug.print("[grpc] Writing {d} bytes ({s})\n", .{ data.len, mode });
+        log.debug("Writing {d} bytes ({s})\n", .{ data.len, mode });
         if (self.tls_client) |tc| {
             try tc.writer.writeAll(data);
             try tc.writer.flush();
@@ -296,7 +297,7 @@ pub const Client = struct {
 
     fn readExactBytes(self: *Client, buf: []u8) !void {
         const mode: []const u8 = if (self.tls_client != null) "TLS" else "plain";
-        std.debug.print("[grpc] Reading {d} bytes ({s})...\n", .{ buf.len, mode });
+        log.debug("Reading {d} bytes ({s})...\n", .{ buf.len, mode });
         if (self.tls_client) |tc| {
             tc.reader.readSliceAll(buf) catch |err| switch (err) {
                 error.EndOfStream => return error.ConnectionClosed,
@@ -443,15 +444,15 @@ pub const Client = struct {
         const data = try msg.encode(self.allocator);
         defer self.allocator.free(data);
 
-        std.debug.print("[grpc] streamCall: sending request_id={d} msg_type={s}\n", .{ request_id, @tagName(msg_type) });
+        log.debug("streamCall: sending request_id={d} msg_type={s}\n", .{ request_id, @tagName(msg_type) });
         try self.writeAllBytes(data);
-        std.debug.print("[grpc] streamCall: request sent, waiting for events...\n", .{});
+        log.debug("streamCall: request sent, waiting for events...\n", .{});
 
         while (true) {
             var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
             self.readExactBytes(&header_buf) catch |err| {
                 if (err == error.ConnectionClosed) {
-                    std.debug.print("[grpc] streamCall: connection closed by server\n", .{});
+                    log.debug("streamCall: connection closed by server\n", .{});
                     return;
                 }
                 return err;
@@ -459,18 +460,18 @@ pub const Client = struct {
 
             const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
             if (!std.mem.eql(u8, &header.magic, &.{ 'M', 'R', 'T', 'N' })) {
-                std.debug.print("[grpc] streamCall: invalid magic in response header\n", .{});
+                log.debug("streamCall: invalid magic in response header\n", .{});
                 return error.InvalidMagic;
             }
 
-            std.debug.print("[grpc] streamCall: received header msg_type={s} payload_len={d} request_id={d}\n", .{ @tagName(header.msg_type), header.payload_len, header.request_id });
+            log.debug("streamCall: received header msg_type={s} payload_len={d} request_id={d}\n", .{ @tagName(header.msg_type), header.payload_len, header.request_id });
 
             const payload_buf = try self.allocator.alloc(u8, header.payload_len);
             defer self.allocator.free(payload_buf);
 
             self.readExactBytes(payload_buf) catch |err| {
                 if (err == error.ConnectionClosed) {
-                    std.debug.print("[grpc] streamCall: connection closed while reading payload\n", .{});
+                    log.debug("streamCall: connection closed while reading payload\n", .{});
                     return;
                 }
                 return err;
@@ -483,7 +484,7 @@ pub const Client = struct {
             @memcpy(full_buf[@sizeOf(protocol.Header)..], payload_buf);
 
             const event = try protocol.Message(EventType).decode(self.allocator, full_buf);
-            std.debug.print("[grpc] streamCall: decoded event successfully\n", .{});
+            log.debug("streamCall: decoded event successfully\n", .{});
 
             if (!callback(event)) break;
         }

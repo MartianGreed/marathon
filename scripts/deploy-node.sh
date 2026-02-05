@@ -226,6 +226,7 @@ EnvironmentFile=$CONFIG_DIR/node-operator.env
 ExecStart=/usr/local/bin/marathon-node-operator
 Restart=always
 RestartSec=5
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=marathon-node-operator
