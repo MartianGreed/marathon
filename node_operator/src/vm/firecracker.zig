@@ -180,9 +180,17 @@ pub const VmPool = struct {
         defer self.mutex.unlock();
 
         if (self.active_vms.fetchRemove(vm_id)) |kv| {
-            const vm = kv.value;
-            vm.releaseTask();
-            vm.deinit();
+            const released_vm = kv.value;
+            released_vm.releaseTask();
+            const total = self.warm_vms.items.len + self.active_vms.count() + 1;
+            if (total <= self.config.total_vm_slots) {
+                self.warm_vms.append(self.allocator, released_vm) catch {
+                    released_vm.deinit();
+                    return;
+                };
+            } else {
+                released_vm.deinit();
+            }
         }
     }
 
@@ -329,7 +337,7 @@ test "pool acquire and release cycle" {
     try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
 
     pool.release(vm.?.id);
-    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
 }
 
@@ -357,6 +365,84 @@ test "pool counts are accurate" {
     try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 2), pool.activeCount());
     try std.testing.expectEqual(@as(usize, 3), pool.totalCount());
+}
+
+test "pool release recycles vm back to warm pool" {
+    const allocator = std.testing.allocator;
+
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    defer snapshot_mgr.deinit();
+
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    defer pool.deinit();
+
+    try pool.warmPool(2);
+    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+
+    const vm1 = pool.acquire().?;
+    const vm2 = pool.acquire().?;
+    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 2), pool.activeCount());
+
+    pool.release(vm1.id);
+    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
+    try std.testing.expectEqual(@as(usize, 2), pool.totalCount());
+
+    pool.release(vm2.id);
+    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
+    try std.testing.expectEqual(@as(usize, 2), pool.totalCount());
+}
+
+test "pool release destroys vm when at capacity" {
+    const allocator = std.testing.allocator;
+
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    defer snapshot_mgr.deinit();
+
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{ .total_vm_slots = 2 });
+    defer pool.deinit();
+
+    try pool.warmPool(2);
+    const vm1 = pool.acquire().?;
+    const vm1_id = vm1.id;
+
+    // Fill warm pool back to capacity while vm1 is still active
+    try pool.warmPool(2);
+    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
+
+    // Release vm1 — total would be 2 warm + 0 active + 1 returned = 3 > 2 slots
+    pool.release(vm1_id);
+    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
+}
+
+test "pool acquire-release-acquire reuses recycled vm" {
+    const allocator = std.testing.allocator;
+
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    defer snapshot_mgr.deinit();
+
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    defer pool.deinit();
+
+    try pool.warmPool(1);
+    const vm1 = pool.acquire().?;
+    const vm1_id = vm1.id;
+
+    pool.release(vm1_id);
+    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
+
+    // Acquire again — should get the recycled VM
+    const vm2 = pool.acquire().?;
+    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
+
+    // Recycled VM should be in ready state with no task
+    try std.testing.expectEqual(VmState.ready, vm2.state);
+    try std.testing.expect(vm2.task_id == null);
 }
 
 test "vm stop with running process" {

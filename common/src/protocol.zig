@@ -315,6 +315,7 @@ pub const NodeCommand = struct {
     command_type: CommandType,
     task_id: ?types.TaskId = null,
     execute_request: ?ExecuteTaskRequest = null,
+    warm_pool_target: ?u32 = null,
 };
 
 pub const HeartbeatResponse = struct {
@@ -471,6 +472,74 @@ test "roundtrip encoding" {
     try std.testing.expectEqualStrings(original.repo_url, decoded.repo_url);
     try std.testing.expectEqualStrings(original.branch, decoded.branch);
     try std.testing.expectEqual(original.create_pr, decoded.create_pr);
+}
+
+test "NodeCommand with warm_pool_target roundtrip" {
+    const allocator = std.testing.allocator;
+
+    const original = NodeCommand{
+        .command_type = .warm_pool,
+        .task_id = null,
+        .execute_request = null,
+        .warm_pool_target = 8,
+    };
+
+    const encoded = try encodePayload(NodeCommand, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(NodeCommand, allocator, encoded);
+
+    try std.testing.expectEqual(original.command_type, decoded.command_type);
+    try std.testing.expectEqual(@as(?types.TaskId, null), decoded.task_id);
+    try std.testing.expectEqual(@as(?u32, 8), decoded.warm_pool_target);
+}
+
+test "NodeCommand with null warm_pool_target roundtrip" {
+    const allocator = std.testing.allocator;
+
+    const original = NodeCommand{
+        .command_type = .execute_task,
+        .task_id = null,
+        .execute_request = null,
+        .warm_pool_target = null,
+    };
+
+    const encoded = try encodePayload(NodeCommand, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(NodeCommand, allocator, encoded);
+
+    try std.testing.expectEqual(original.command_type, decoded.command_type);
+    try std.testing.expectEqual(@as(?u32, null), decoded.warm_pool_target);
+}
+
+test "HeartbeatResponse with warm_pool command roundtrip" {
+    const allocator = std.testing.allocator;
+
+    const commands = [_]NodeCommand{
+        .{ .command_type = .warm_pool, .warm_pool_target = 3 },
+        .{ .command_type = .drain },
+    };
+
+    const original = HeartbeatResponse{
+        .timestamp = 1234567890,
+        .acknowledged = true,
+        .commands = &commands,
+    };
+
+    const encoded = try encodePayload(HeartbeatResponse, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(HeartbeatResponse, allocator, encoded);
+    defer allocator.free(decoded.commands);
+
+    try std.testing.expectEqual(original.timestamp, decoded.timestamp);
+    try std.testing.expectEqual(original.acknowledged, decoded.acknowledged);
+    try std.testing.expectEqual(@as(usize, 2), decoded.commands.len);
+    try std.testing.expectEqual(CommandType.warm_pool, decoded.commands[0].command_type);
+    try std.testing.expectEqual(@as(?u32, 3), decoded.commands[0].warm_pool_target);
+    try std.testing.expectEqual(CommandType.drain, decoded.commands[1].command_type);
+    try std.testing.expectEqual(@as(?u32, null), decoded.commands[1].warm_pool_target);
 }
 
 test "VsockStartPayload encodes/decodes max_iterations and completion_promise" {
