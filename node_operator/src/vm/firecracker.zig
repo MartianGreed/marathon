@@ -18,6 +18,7 @@ pub const Vm = struct {
     state: VmState,
     process: ?std.process.Child,
     socket_path: []const u8,
+    vsock_uds_path: []const u8,
     vsock_cid: u32,
     task_id: ?types.TaskId,
     start_time: ?i64,
@@ -33,6 +34,13 @@ pub const Vm = struct {
             "/tmp/firecracker-{s}.sock",
             .{types.formatId(id)},
         );
+        errdefer allocator.free(socket_path);
+
+        const vsock_uds_path = try std.fmt.allocPrint(
+            allocator,
+            "/tmp/firecracker-{s}-vsock.sock",
+            .{types.formatId(id)},
+        );
 
         vm.* = .{
             .allocator = allocator,
@@ -40,6 +48,7 @@ pub const Vm = struct {
             .state = .creating,
             .process = null,
             .socket_path = socket_path,
+            .vsock_uds_path = vsock_uds_path,
             .vsock_cid = generateCid(),
             .task_id = null,
             .start_time = null,
@@ -51,20 +60,111 @@ pub const Vm = struct {
     pub fn deinit(self: *Vm) void {
         self.stop() catch {};
         self.allocator.free(self.socket_path);
+        self.allocator.free(self.vsock_uds_path);
         self.allocator.destroy(self);
     }
 
     pub fn start(self: *Vm, config: VmConfig) !void {
-        _ = config;
+        std.log.info("Starting VM {s} (cold start)", .{types.formatId(self.id)});
+
+        std.fs.accessAbsolute(config.firecracker_bin, .{}) catch {
+            std.log.err("Firecracker binary not found at {s}", .{config.firecracker_bin});
+            return error.FirecrackerNotFound;
+        };
+
+        std.fs.cwd().deleteFile(self.socket_path) catch {};
+
+        const argv: []const []const u8 = &.{ config.firecracker_bin, "--api-sock", self.socket_path };
+        var child = std.process.Child.init(argv, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        self.process = child;
+        errdefer {
+            if (self.process) |*proc| {
+                _ = proc.kill() catch {};
+                _ = proc.wait() catch {};
+                self.process = null;
+            }
+        }
+
+        waitForSocket(self.socket_path, 5000) catch |err| {
+            std.log.err("Firecracker socket not ready: {}", .{err});
+            return error.FirecrackerStartFailed;
+        };
+
+        var buf: [4096]u8 = undefined;
+        const boot_body = try std.fmt.bufPrint(&buf, "{{\"kernel_image_path\":\"{s}\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off\"}}", .{config.kernel_path});
+        try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/boot-source", boot_body);
+
+        const rootfs_body = try std.fmt.bufPrint(&buf, "{{\"drive_id\":\"rootfs\",\"path_on_host\":\"{s}\",\"is_root_device\":true,\"is_read_only\":false}}", .{config.rootfs_path});
+        try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/drives/rootfs", rootfs_body);
+
+        const vsock_body = try std.fmt.bufPrint(&buf, "{{\"vsock_id\":\"vsock0\",\"guest_cid\":{d},\"uds_path\":\"{s}\"}}", .{ self.vsock_cid, self.vsock_uds_path });
+        try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/vsock", vsock_body);
+
+        const machine_body = try std.fmt.bufPrint(&buf, "{{\"vcpu_count\":{d},\"mem_size_mib\":{d}}}", .{ config.vcpu_count, config.mem_size_mib });
+        try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/machine-config", machine_body);
+
+        try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/actions", "{\"action_type\":\"InstanceStart\"}");
+
+        waitForVsockReady(self.vsock_uds_path, config.vsock_port, 30) catch |err| {
+            std.log.err("Vsock not ready after VM start: {}", .{err});
+            return error.VsockNotReady;
+        };
+
         self.state = .ready;
         self.start_time = std.time.milliTimestamp();
+        std.log.info("VM {s} started successfully (CID: {d})", .{ types.formatId(self.id), self.vsock_cid });
     }
 
     pub fn startFromSnapshot(self: *Vm, snapshot_mgr: *snapshot.SnapshotManager, config: VmConfig) !void {
-        _ = snapshot_mgr;
-        _ = config;
+        const base_snapshot = snapshot_mgr.getDefaultSnapshot() orelse {
+            std.log.warn("No base snapshot available, falling back to cold start", .{});
+            return self.start(config);
+        };
+
+        std.log.info("Starting VM {s} from snapshot", .{types.formatId(self.id)});
+
+        std.fs.cwd().deleteFile(self.socket_path) catch {};
+
+        const argv: []const []const u8 = &.{ config.firecracker_bin, "--api-sock", self.socket_path };
+        var child = std.process.Child.init(argv, self.allocator);
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+        self.process = child;
+        errdefer {
+            if (self.process) |*proc| {
+                _ = proc.kill() catch {};
+                _ = proc.wait() catch {};
+                self.process = null;
+            }
+        }
+
+        waitForSocket(self.socket_path, 5000) catch |err| {
+            std.log.err("Firecracker socket not ready: {}", .{err});
+            return error.FirecrackerStartFailed;
+        };
+
+        var buf: [4096]u8 = undefined;
+        const snapshot_file = try std.fmt.bufPrint(&buf, "{s}/snapshot", .{base_snapshot.path});
+        var buf2: [4096]u8 = undefined;
+        const mem_file = try std.fmt.bufPrint(&buf2, "{s}/mem", .{base_snapshot.path});
+        var buf3: [4096]u8 = undefined;
+        const load_body = try std.fmt.bufPrint(&buf3, "{{\"snapshot_path\":\"{s}\",\"mem_file_path\":\"{s}\",\"resume_vm\":true}}", .{ snapshot_file, mem_file });
+        try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/snapshot/load", load_body);
+
+        waitForVsockReady(self.vsock_uds_path, config.vsock_port, 10) catch |err| {
+            std.log.err("Vsock not ready after snapshot restore: {}", .{err});
+            return error.VsockNotReady;
+        };
+
         self.state = .ready;
         self.start_time = std.time.milliTimestamp();
+        std.log.info("VM {s} restored from snapshot successfully", .{types.formatId(self.id)});
     }
 
     pub fn stop(self: *Vm) !void {
@@ -73,6 +173,8 @@ pub const Vm = struct {
             _ = proc.wait() catch {};
             self.process = null;
         }
+        std.fs.cwd().deleteFile(self.socket_path) catch {};
+        std.fs.cwd().deleteFile(self.vsock_uds_path) catch {};
         self.state = .stopped;
     }
 
@@ -218,6 +320,94 @@ fn generateCid() u32 {
     return (cid % 0xFFFF_FFFC) + 3;
 }
 
+fn waitForSocket(path: []const u8, timeout_ms: u64) !void {
+    const start = std.time.milliTimestamp();
+    const timeout = @as(i64, @intCast(timeout_ms));
+
+    while (std.time.milliTimestamp() - start < timeout) {
+        const stat = std.fs.cwd().statFile(path) catch {
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+            continue;
+        };
+        if (stat.kind == .unix_domain_socket) {
+            return;
+        }
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+    return error.SocketTimeout;
+}
+
+fn firecrackerApiCall(allocator: std.mem.Allocator, socket_path: []const u8, method: []const u8, endpoint: []const u8, body: []const u8) !void {
+    const stream = std.net.connectUnixSocket(socket_path) catch |err| {
+        std.log.err("Failed to connect to Firecracker socket {s}: {}", .{ socket_path, err });
+        return error.SocketConnectionFailed;
+    };
+    defer stream.close();
+
+    var request_buf: [8192]u8 = undefined;
+    const request = std.fmt.bufPrint(&request_buf, "{s} {s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ method, endpoint, body.len, body }) catch {
+        return error.RequestTooLarge;
+    };
+
+    _ = stream.write(request) catch |err| {
+        std.log.err("Failed to send request to Firecracker: {}", .{err});
+        return error.RequestFailed;
+    };
+
+    var response_buf: [4096]u8 = undefined;
+    const bytes_read = stream.read(&response_buf) catch |err| {
+        std.log.err("Failed to read response from Firecracker: {}", .{err});
+        return error.ResponseFailed;
+    };
+
+    if (bytes_read == 0) {
+        return error.EmptyResponse;
+    }
+
+    const response = response_buf[0..bytes_read];
+
+    if (std.mem.startsWith(u8, response, "HTTP/1.1 2") or std.mem.startsWith(u8, response, "HTTP/1.0 2")) {
+        std.log.debug("Firecracker API {s} {s}: success", .{ method, endpoint });
+        return;
+    }
+
+    if (std.mem.indexOf(u8, response, "\r\n\r\n")) |header_end| {
+        const body_start = header_end + 4;
+        if (body_start < response.len) {
+            const response_body = response[body_start..];
+            var log_buf: [512]u8 = undefined;
+            const log_len = @min(response_body.len, log_buf.len - 1);
+            @memcpy(log_buf[0..log_len], response_body[0..log_len]);
+            std.log.err("Firecracker API {s} {s} failed: {s}", .{ method, endpoint, log_buf[0..log_len] });
+        }
+    }
+
+    _ = allocator;
+    return error.ApiCallFailed;
+}
+
+fn waitForVsockReady(vsock_path: []const u8, port: u32, max_retries: u32) !void {
+    _ = port;
+    var retries: u32 = 0;
+    while (retries < max_retries) : (retries += 1) {
+        const stat = std.fs.cwd().statFile(vsock_path) catch {
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+            continue;
+        };
+        if (stat.kind == .unix_domain_socket) {
+            const stream = std.net.connectUnixSocket(vsock_path) catch {
+                std.Thread.sleep(500 * std.time.ns_per_ms);
+                continue;
+            };
+            stream.close();
+            std.log.debug("Vsock at {s} is ready", .{vsock_path});
+            return;
+        }
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+    }
+    return error.VsockTimeout;
+}
+
 test "vm state transitions" {
     try std.testing.expectEqual(VmState.creating, VmState.creating);
 }
@@ -240,26 +430,13 @@ test "vm init creates valid state" {
     try std.testing.expect(vm.vsock_cid >= 3);
 }
 
-test "vm start transitions to ready" {
-    const allocator = std.testing.allocator;
-    const vm = try Vm.init(allocator);
-    defer vm.deinit();
-
-    try std.testing.expectEqual(VmState.creating, vm.state);
-
-    try vm.start(.{});
-
-    try std.testing.expectEqual(VmState.ready, vm.state);
-    try std.testing.expect(vm.start_time != null);
-}
-
 test "vm stop transitions to stopped" {
     const allocator = std.testing.allocator;
     const vm = try Vm.init(allocator);
     defer vm.deinit();
 
-    try vm.start(.{});
-    try std.testing.expectEqual(VmState.ready, vm.state);
+    vm.state = .ready;
+    vm.start_time = std.time.milliTimestamp();
 
     try vm.stop();
 
@@ -271,8 +448,8 @@ test "vm assign and release task" {
     const vm = try Vm.init(allocator);
     defer vm.deinit();
 
-    try vm.start(.{});
-    try std.testing.expectEqual(VmState.ready, vm.state);
+    vm.state = .ready;
+    vm.start_time = std.time.milliTimestamp();
     try std.testing.expect(vm.task_id == null);
 
     var task_id: types.TaskId = undefined;
@@ -295,126 +472,104 @@ test "vm uptime tracking" {
 
     try std.testing.expect(vm.getUptimeMs() == null);
 
-    try vm.start(.{});
+    vm.state = .ready;
+    vm.start_time = std.time.milliTimestamp();
 
     const uptime = vm.getUptimeMs();
     try std.testing.expect(uptime != null);
     try std.testing.expect(uptime.? >= 0);
 }
 
-test "pool warmPool adds vms" {
+test "pool acquire returns null when empty" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-empty");
     defer snapshot_mgr.deinit();
 
     var pool = VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
-
-    try pool.warmPool(2);
-
-    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
-}
-
-test "pool acquire and release cycle" {
-    const allocator = std.testing.allocator;
-
-    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
-    defer snapshot_mgr.deinit();
-
-    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
-    defer pool.deinit();
-
-    try pool.warmPool(1);
-    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
-    try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
 
     const vm = pool.acquire();
-    try std.testing.expect(vm != null);
-    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
-    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
-
-    pool.release(vm.?.id);
-    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
-    try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
+    try std.testing.expect(vm == null);
 }
 
-test "pool counts are accurate" {
+test "pool counts start at zero" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-counts");
     defer snapshot_mgr.deinit();
 
     var pool = VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pool.totalCount());
-
-    try pool.warmPool(3);
-    try std.testing.expectEqual(@as(usize, 3), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
-    try std.testing.expectEqual(@as(usize, 3), pool.totalCount());
-
-    const vm1 = pool.acquire();
-    const vm2 = pool.acquire();
-    try std.testing.expect(vm1 != null);
-    try std.testing.expect(vm2 != null);
-
-    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
-    try std.testing.expectEqual(@as(usize, 2), pool.activeCount());
-    try std.testing.expectEqual(@as(usize, 3), pool.totalCount());
 }
 
-test "pool release recycles vm back to warm pool" {
+test "pool release with manual vm insertion" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-release");
     defer snapshot_mgr.deinit();
 
     var pool = VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
-    try pool.warmPool(2);
-    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+    const vm = try Vm.init(allocator);
+    vm.state = .ready;
+    vm.start_time = std.time.milliTimestamp();
 
-    const vm1 = pool.acquire().?;
-    const vm2 = pool.acquire().?;
-    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
-    try std.testing.expectEqual(@as(usize, 2), pool.activeCount());
+    pool.mutex.lock();
+    try pool.warm_vms.append(allocator, vm);
+    pool.mutex.unlock();
 
-    pool.release(vm1.id);
     try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
-    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
-    try std.testing.expectEqual(@as(usize, 2), pool.totalCount());
 
-    pool.release(vm2.id);
-    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+    const acquired = pool.acquire();
+    try std.testing.expect(acquired != null);
+    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
+
+    pool.release(acquired.?.id);
+    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
-    try std.testing.expectEqual(@as(usize, 2), pool.totalCount());
 }
 
 test "pool release destroys vm when at capacity" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-capacity");
     defer snapshot_mgr.deinit();
 
     var pool = VmPool.init(allocator, &snapshot_mgr, .{ .total_vm_slots = 2 });
     defer pool.deinit();
 
-    try pool.warmPool(2);
-    const vm1 = pool.acquire().?;
-    const vm1_id = vm1.id;
+    const vm1 = try Vm.init(allocator);
+    vm1.state = .ready;
+    const vm2 = try Vm.init(allocator);
+    vm2.state = .ready;
+    const vm3 = try Vm.init(allocator);
+    vm3.state = .ready;
 
-    // Fill warm pool back to capacity while vm1 is still active
-    try pool.warmPool(2);
+    pool.mutex.lock();
+    try pool.warm_vms.append(allocator, vm1);
+    try pool.warm_vms.append(allocator, vm2);
+    pool.mutex.unlock();
+
+    const acquired = pool.acquire().?;
+    const acquired_id = acquired.id;
+
+    pool.mutex.lock();
+    try pool.warm_vms.append(allocator, vm3);
+    pool.mutex.unlock();
+
     try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
 
-    // Release vm1 — total would be 2 warm + 0 active + 1 returned = 3 > 2 slots
-    pool.release(vm1_id);
+    pool.release(acquired_id);
     try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
 }
@@ -422,25 +577,30 @@ test "pool release destroys vm when at capacity" {
 test "pool acquire-release-acquire reuses recycled vm" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp");
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-recycle");
     defer snapshot_mgr.deinit();
 
     var pool = VmPool.init(allocator, &snapshot_mgr, .{});
     defer pool.deinit();
 
-    try pool.warmPool(1);
+    const vm = try Vm.init(allocator);
+    vm.state = .ready;
+    vm.start_time = std.time.milliTimestamp();
+
+    pool.mutex.lock();
+    try pool.warm_vms.append(allocator, vm);
+    pool.mutex.unlock();
+
     const vm1 = pool.acquire().?;
     const vm1_id = vm1.id;
 
     pool.release(vm1_id);
     try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
 
-    // Acquire again — should get the recycled VM
     const vm2 = pool.acquire().?;
     try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
 
-    // Recycled VM should be in ready state with no task
     try std.testing.expectEqual(VmState.ready, vm2.state);
     try std.testing.expect(vm2.task_id == null);
 }

@@ -91,7 +91,7 @@ test "task executor init" {
     const allocator = std.testing.allocator;
 
     const snapshot_mgr = @import("../snapshot/manager.zig");
-    var mgr = try snapshot_mgr.SnapshotManager.init(allocator, "/tmp");
+    var mgr = try snapshot_mgr.SnapshotManager.init(allocator, "/tmp/marathon-executor-test");
     defer mgr.deinit();
 
     var pool = vm.VmPool.init(allocator, &mgr, .{});
