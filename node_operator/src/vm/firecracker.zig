@@ -23,12 +23,38 @@ pub const Vm = struct {
     task_id: ?types.TaskId,
     start_time: ?i64,
 
+    var socket_dir_initialized: bool = false;
+    var socket_dir_buf: [64]u8 = undefined;
+    var socket_dir_len: usize = 0;
+
     fn getSocketDir() []const u8 {
-        std.fs.cwd().makePath("/run/marathon") catch {
-            std.fs.cwd().makePath("/tmp/marathon") catch {};
-            return "/tmp/marathon";
-        };
-        return "/run/marathon";
+        if (socket_dir_initialized) {
+            return socket_dir_buf[0..socket_dir_len];
+        }
+
+        const dirs = [_][]const u8{ "/run/marathon", "/var/run/marathon", "/tmp/marathon" };
+        for (dirs) |dir| {
+            std.fs.cwd().makePath(dir) catch continue;
+            // Verify directory exists and is writable
+            const test_path_buf = std.fmt.bufPrint(&socket_dir_buf, "{s}/.test", .{dir}) catch continue;
+            const test_file = std.fs.cwd().createFile(test_path_buf, .{}) catch continue;
+            test_file.close();
+            std.fs.cwd().deleteFile(test_path_buf) catch {};
+
+            @memcpy(socket_dir_buf[0..dir.len], dir);
+            socket_dir_len = dir.len;
+            socket_dir_initialized = true;
+            std.log.info("Using socket directory: {s}", .{dir});
+            return socket_dir_buf[0..socket_dir_len];
+        }
+
+        // Last resort fallback
+        const fallback = "/tmp";
+        @memcpy(socket_dir_buf[0..fallback.len], fallback);
+        socket_dir_len = fallback.len;
+        socket_dir_initialized = true;
+        std.log.warn("Using fallback socket directory: {s}", .{fallback});
+        return socket_dir_buf[0..socket_dir_len];
     }
 
     pub fn init(allocator: std.mem.Allocator) !*Vm {
