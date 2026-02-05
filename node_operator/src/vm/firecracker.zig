@@ -23,23 +23,33 @@ pub const Vm = struct {
     task_id: ?types.TaskId,
     start_time: ?i64,
 
+    fn getSocketDir() []const u8 {
+        std.fs.cwd().makePath("/run/marathon") catch {
+            std.fs.cwd().makePath("/tmp/marathon") catch {};
+            return "/tmp/marathon";
+        };
+        return "/run/marathon";
+    }
+
     pub fn init(allocator: std.mem.Allocator) !*Vm {
         const vm = try allocator.create(Vm);
 
         var id: types.VmId = undefined;
         std.crypto.random.bytes(&id);
 
+        const socket_dir = getSocketDir();
+
         const socket_path = try std.fmt.allocPrint(
             allocator,
-            "/tmp/firecracker-{s}.sock",
-            .{types.formatId(id)},
+            "{s}/firecracker-{s}.sock",
+            .{ socket_dir, types.formatId(id) },
         );
         errdefer allocator.free(socket_path);
 
         const vsock_uds_path = try std.fmt.allocPrint(
             allocator,
-            "/tmp/firecracker-{s}-vsock.sock",
-            .{types.formatId(id)},
+            "{s}/firecracker-{s}-vsock.sock",
+            .{ socket_dir, types.formatId(id) },
         );
 
         vm.* = .{
