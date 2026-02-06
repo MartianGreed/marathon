@@ -31,6 +31,7 @@ pub fn main() !void {
     std.log.info("Warm pool initialized: {d} VMs ready", .{vm_pool.warmCount()});
 
     var executor = task_executor.TaskExecutor.init(allocator, &vm_pool);
+    defer executor.deinit();
 
     var heartbeat_client = heartbeat.HeartbeatClient.init(
         allocator,

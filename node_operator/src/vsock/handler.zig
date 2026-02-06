@@ -4,6 +4,8 @@ const common = @import("common");
 const types = common.types;
 const protocol = common.protocol;
 
+const log = std.log.scoped(.vsock_handler);
+
 const vsock = if (builtin.os.tag == .linux) common.vsock else struct {
     pub const Connection = struct {
         fd: i32,
@@ -253,7 +255,31 @@ pub const TaskRunner = struct {
     }
 
     pub fn run(self: *TaskRunner, request: protocol.VsockStartPayload) !TaskResult {
-        try self.handler.connect();
+        const max_retries: u32 = 5;
+        const retry_delay_ns: u64 = 2 * std.time.ns_per_s;
+        var attempt: u32 = 0;
+        while (true) {
+            self.handler.connect() catch |err| {
+                attempt += 1;
+                if (attempt >= max_retries) {
+                    log.err("vsock connect failed after {d} attempts: task_id={s} err={}", .{
+                        max_retries,
+                        &types.formatId(self.task_id),
+                        err,
+                    });
+                    return err;
+                }
+                log.warn("vsock connect attempt {d}/{d} failed, retrying: task_id={s} err={}", .{
+                    attempt,
+                    max_retries,
+                    &types.formatId(self.task_id),
+                    err,
+                });
+                common.compat.sleep(retry_delay_ns);
+                continue;
+            };
+            break;
+        }
         defer self.handler.disconnect();
 
         _ = self.handler.receive() catch |err| {

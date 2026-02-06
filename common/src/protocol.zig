@@ -18,6 +18,7 @@ pub const MessageType = enum(u8) {
     heartbeat_response = 0x22,
     node_status = 0x23,
     node_command = 0x24,
+    report_task_result = 0x25,
 
     vsock_ready = 0x30,
     vsock_output = 0x31,
@@ -289,6 +290,14 @@ pub const TaskEvent = struct {
     };
 };
 
+pub const TaskResultReport = struct {
+    task_id: types.TaskId,
+    success: bool,
+    error_message: ?[]const u8,
+    metrics: types.UsageMetrics,
+    pr_url: ?[]const u8,
+};
+
 pub const HeartbeatPayload = struct {
     node_id: types.NodeId,
     timestamp: i64,
@@ -302,6 +311,7 @@ pub const HeartbeatPayload = struct {
     disk_available_bytes: i64,
     healthy: bool,
     draining: bool,
+    completed_tasks: []const TaskResultReport,
 };
 
 pub const CommandType = enum(u8) {
@@ -442,6 +452,16 @@ pub const ErrorResponse = struct {
     code: []const u8,
     message: []const u8,
 };
+
+pub fn freeDecoded(comptime T: type, allocator: std.mem.Allocator, value: T) void {
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (field.type == []const u8) {
+            allocator.free(@field(value, field.name));
+        } else if (field.type == ?[]const u8) {
+            if (@field(value, field.name)) |s| allocator.free(s);
+        }
+    }
+}
 
 test "roundtrip encoding" {
     const allocator = std.testing.allocator;
