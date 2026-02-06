@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-KERNEL_VERSION="${1:-5.10.217}"
+KERNEL_VERSION="${1:-5.10.210}"
 OUTPUT_DIR="${2:-.}"
 
 echo "Downloading Firecracker-compatible kernel..."

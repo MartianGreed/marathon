@@ -12,6 +12,8 @@ pub const VmState = enum {
     failed,
 };
 
+const snapshot_vsock_path = "/run/marathon/snapshot-base-vsock.sock";
+
 pub const Vm = struct {
     allocator: std.mem.Allocator,
     id: types.VmId,
@@ -177,6 +179,7 @@ pub const Vm = struct {
 
         std.fs.cwd().deleteFile(self.socket_path) catch {};
         std.fs.cwd().deleteFile(self.vsock_uds_path) catch {};
+        std.fs.cwd().deleteFile(snapshot_vsock_path) catch {};
 
         const argv: []const []const u8 = &.{ config.firecracker_bin, "--api-sock", self.socket_path };
         var child = std.process.Child.init(argv, self.allocator);
@@ -205,7 +208,23 @@ pub const Vm = struct {
         const mem_file = try std.fmt.bufPrint(&buf2, "{s}/mem", .{base_snapshot.path});
         var buf3: [4096]u8 = undefined;
         const load_body = try std.fmt.bufPrint(&buf3, "{{\"snapshot_path\":\"{s}\",\"mem_file_path\":\"{s}\",\"resume_vm\":true}}", .{ snapshot_file, mem_file });
-        try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/snapshot/load", load_body);
+
+        firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/snapshot/load", load_body) catch |err| {
+            std.log.warn("Snapshot load failed: {}, falling back to cold start", .{err});
+            if (self.process) |*proc| {
+                _ = proc.kill() catch {};
+                _ = proc.wait() catch {};
+                self.process = null;
+            }
+            std.fs.cwd().deleteFile(self.socket_path) catch {};
+            std.fs.cwd().deleteFile(snapshot_vsock_path) catch {};
+            return self.start(config);
+        };
+
+        std.fs.cwd().rename(snapshot_vsock_path, self.vsock_uds_path) catch |err| {
+            std.log.err("Failed to rename vsock socket from {s} to {s}: {}", .{ snapshot_vsock_path, self.vsock_uds_path, err });
+            return error.VsockNotReady;
+        };
 
         waitForVsockReady(self.vsock_uds_path, config.vsock_port, 10) catch |err| {
             std.log.err("Vsock not ready after snapshot restore: {}", .{err});

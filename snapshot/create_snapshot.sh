@@ -13,6 +13,7 @@ echo "  Kernel: $KERNEL_PATH"
 echo "  Rootfs: $ROOTFS_PATH"
 
 mkdir -p "$SNAPSHOT_DIR"
+mkdir -p /run/marathon
 
 cleanup() {
     echo "Cleaning up..."
@@ -53,7 +54,7 @@ curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/drives/rootfs' \
     }"
 
 echo "Configuring vsock..."
-VSOCK_PATH="${SOCKET%.sock}-vsock.sock"
+VSOCK_PATH="/run/marathon/snapshot-base-vsock.sock"
 curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/vsock' \
     -H 'Content-Type: application/json' \
     -d "{
