@@ -70,17 +70,25 @@ EOF
 EOF
 
     cat > "$ROOTFS_DIR/etc/init.d/marathon-agent" << 'EOF'
-#!/bin/sh
-case "$1" in
-    start)
-        /usr/local/bin/marathon-vm-agent &
-        ;;
-    stop)
-        killall marathon-vm-agent
-        ;;
-esac
+#!/sbin/openrc-run
+
+name="marathon-agent"
+description="Marathon VM Agent"
+command="/usr/local/bin/marathon-vm-agent"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/marathon-agent.log"
+error_log="/var/log/marathon-agent.log"
+
+depend() {
+    need localmount
+    after bootmisc
+}
 EOF
     chmod +x "$ROOTFS_DIR/etc/init.d/marathon-agent"
+
+    mkdir -p "$ROOTFS_DIR/etc/runlevels/default"
+    ln -sf /etc/init.d/marathon-agent "$ROOTFS_DIR/etc/runlevels/default/marathon-agent"
 
     echo "Installing marathon-vm-agent..."
     if [ -f "../zig-out/bin/marathon-vm-agent" ]; then

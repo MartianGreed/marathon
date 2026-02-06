@@ -177,6 +177,22 @@ pub const Vm = struct {
 
         std.log.info("Starting VM {s} from snapshot", .{types.formatId(self.id)});
 
+        const vsock_dir = std.fs.path.dirname(snapshot_vsock_path) orelse "/run/marathon";
+        const test_file_path = blk: {
+            var buf: [256]u8 = undefined;
+            break :blk std.fmt.bufPrint(&buf, "{s}/.writable_test", .{vsock_dir}) catch {
+                std.log.warn("Snapshot vsock dir path too long, falling back to cold start", .{});
+                return self.start(config);
+            };
+        };
+        if (std.fs.cwd().createFile(test_file_path, .{})) |f| {
+            f.close();
+            std.fs.cwd().deleteFile(test_file_path) catch {};
+        } else |_| {
+            std.log.warn("Snapshot vsock dir {s} not writable (EROFS?), skipping restore", .{vsock_dir});
+            return self.start(config);
+        }
+
         std.fs.cwd().deleteFile(self.socket_path) catch {};
         std.fs.cwd().deleteFile(self.vsock_uds_path) catch {};
         std.fs.cwd().deleteFile(snapshot_vsock_path) catch {};
@@ -532,7 +548,6 @@ fn firecrackerApiCall(allocator: std.mem.Allocator, socket_path: []const u8, met
 }
 
 fn waitForVsockReady(vsock_path: []const u8, port: u32, max_retries: u32) !void {
-    _ = port;
     var retries: u32 = 0;
     while (retries < max_retries) : (retries += 1) {
         const stat = std.fs.cwd().statFile(vsock_path) catch {
@@ -544,9 +559,31 @@ fn waitForVsockReady(vsock_path: []const u8, port: u32, max_retries: u32) !void 
                 std.Thread.sleep(500 * std.time.ns_per_ms);
                 continue;
             };
-            stream.close();
-            std.log.debug("Vsock at {s} is ready", .{vsock_path});
-            return;
+            defer stream.close();
+
+            var connect_buf: [64]u8 = undefined;
+            const connect_msg = std.fmt.bufPrint(&connect_buf, "CONNECT {d}\n", .{port}) catch {
+                std.Thread.sleep(500 * std.time.ns_per_ms);
+                continue;
+            };
+            _ = stream.write(connect_msg) catch {
+                std.Thread.sleep(500 * std.time.ns_per_ms);
+                continue;
+            };
+
+            var response_buf: [32]u8 = undefined;
+            const n = stream.read(&response_buf) catch {
+                std.Thread.sleep(500 * std.time.ns_per_ms);
+                continue;
+            };
+            if (n >= 2 and std.mem.startsWith(u8, response_buf[0..n], "OK")) {
+                std.log.debug("Vsock at {s} port {d} is ready (guest agent responding)", .{ vsock_path, port });
+                return;
+            }
+
+            std.log.debug("Vsock CONNECT got unexpected response, retrying ({d}/{d})", .{ retries + 1, max_retries });
+            std.Thread.sleep(500 * std.time.ns_per_ms);
+            continue;
         }
         std.Thread.sleep(500 * std.time.ns_per_ms);
     }
