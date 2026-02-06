@@ -202,8 +202,9 @@ create_snapshot() {
     log_info "Creating initial base snapshot..."
     mkdir -p "$SNAPSHOT_BASE"
 
-    SOCKET="/tmp/marathon-snapshot-$$.sock"
-    VSOCK_PATH="/tmp/marathon-snapshot-$$-vsock.sock"
+    mkdir -p /run/marathon
+    SOCKET="/run/marathon/marathon-snapshot-$$.sock"
+    VSOCK_PATH="/run/marathon/snapshot-base-vsock.sock"
     rm -f "$SOCKET" "$VSOCK_PATH"
 
     firecracker --api-sock "$SOCKET" &
