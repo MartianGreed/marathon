@@ -581,7 +581,11 @@ fn waitForVsockReady(vsock_path: []const u8, port: u32, max_retries: u32) !void 
                 return;
             }
 
-            std.log.debug("Vsock CONNECT got unexpected response, retrying ({d}/{d})", .{ retries + 1, max_retries });
+            if (n == 0) {
+                std.log.warn("Vsock CONNECT returned 0 bytes (no guest listener?), retrying ({d}/{d})", .{ retries + 1, max_retries });
+            } else {
+                std.log.warn("Vsock CONNECT got unexpected response: '{s}' ({d} bytes), retrying ({d}/{d})", .{ response_buf[0..n], n, retries + 1, max_retries });
+            }
             std.Thread.sleep(500 * std.time.ns_per_ms);
             continue;
         }

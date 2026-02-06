@@ -10,7 +10,8 @@ echo "  Directory: $ROOTFS_DIR"
 echo "  Size: $ROOTFS_SIZE"
 echo "  Output: $OUTPUT"
 
-if [ ! -d "$ROOTFS_DIR" ]; then
+if [ ! -x "$ROOTFS_DIR/bin/busybox" ]; then
+    rm -rf "$ROOTFS_DIR"
     echo "Creating rootfs directory structure..."
     mkdir -p "$ROOTFS_DIR"/{bin,sbin,usr/bin,usr/sbin,lib,lib64,etc,dev,proc,sys,tmp,root,workspace,var/log}
 
