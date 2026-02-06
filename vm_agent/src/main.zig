@@ -45,10 +45,24 @@ pub fn main() !void {
     const prompt_wrap = prompt_wrapper.PromptWrapper.init();
     var cleaner = cleanup.Cleanup.initWithStrategy(cleanup.CleanupStrategy.fromString(config.cleanup_strategy));
 
-    try client.sendReady();
-    std.log.info("Agent ready, waiting for task...", .{});
+    var task: claude_wrapper.TaskInfo = undefined;
+    while (true) {
+        client.sendReady() catch |err| {
+            std.log.warn("Connection closed during ready handshake (probe?), re-listening", .{});
+            client.resetConnection();
+            if (err == error.ConnectionClosed) continue;
+            return err;
+        };
+        std.log.info("Agent ready, waiting for task...", .{});
 
-    const task = try client.receiveTask();
+        task = client.receiveTask() catch |err| {
+            std.log.warn("Connection closed before task received (probe?), re-listening", .{});
+            client.resetConnection();
+            if (err == error.ConnectionClosed) continue;
+            return err;
+        };
+        break;
+    }
     std.log.info("Received task, starting execution", .{});
 
     var setup = repo_setup.RepoSetup.init(allocator, config.work_dir, task.github_token);
