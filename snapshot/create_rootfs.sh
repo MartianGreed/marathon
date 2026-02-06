@@ -16,20 +16,26 @@ if [ ! -x "$ROOTFS_DIR/bin/busybox" ]; then
     mkdir -p "$ROOTFS_DIR"/{bin,sbin,usr/bin,usr/sbin,lib,lib64,etc,dev,proc,sys,tmp,root,workspace,var/log}
 
     echo "Installing base system (Alpine Linux)..."
-    ALPINE_VERSION="3.19"
+    ALPINE_VERSION="3.21"
     ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 
     TMPDIR_ROOTFS="$(mktemp -d)"
     trap "rm -rf '$TMPDIR_ROOTFS'" EXIT
 
-    wget -q "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/x86_64/apk-tools-static-2.14.0-r5.x86_64.apk" -O "$TMPDIR_ROOTFS/apk-tools.apk"
+    wget -q "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/x86_64/APKINDEX.tar.gz" -O "$TMPDIR_ROOTFS/APKINDEX.tar.gz"
+    tar -xzf "$TMPDIR_ROOTFS/APKINDEX.tar.gz" -C "$TMPDIR_ROOTFS" APKINDEX
+    APK_TOOLS_VER=$(awk '/^P:apk-tools-static/{getline; print}' "$TMPDIR_ROOTFS/APKINDEX" | sed 's/V://')
+    wget -q "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/x86_64/apk-tools-static-${APK_TOOLS_VER}.apk" -O "$TMPDIR_ROOTFS/apk-tools.apk"
     tar -xzf "$TMPDIR_ROOTFS/apk-tools.apk" -C "$TMPDIR_ROOTFS"
 
-    "$TMPDIR_ROOTFS/sbin/apk.static" -X "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" \
+    "$TMPDIR_ROOTFS/sbin/apk.static" \
+        -X "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" \
+        -X "${ALPINE_MIRROR}/v${ALPINE_VERSION}/community" \
         -U --allow-untrusted --root "$ROOTFS_DIR" --initdb \
-        add alpine-base busybox openssh git curl jq nodejs npm
+        add alpine-base busybox bash openssh git curl jq nodejs npm
 
     echo "Installing Claude Code CLI..."
+    cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
     chroot "$ROOTFS_DIR" npm install -g @anthropic-ai/claude-code
 
     echo "Installing jj (Jujutsu VCS)..."
