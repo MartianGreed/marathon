@@ -2,7 +2,7 @@
 set -euo pipefail
 
 FIRECRACKER_VERSION="1.8.0"
-KERNEL_VERSION="5.10.217"
+KERNEL_VERSION="5.10.210"
 MARATHON_DIR="/var/lib/marathon"
 CONFIG_DIR="/etc/marathon"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -137,8 +137,8 @@ download_kernel() {
     KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.8/x86_64/vmlinux-${KERNEL_VERSION}"
 
     if ! wget -q -O "$KERNEL_PATH" "$KERNEL_URL"; then
-        log_warn "Failed to download kernel from primary source, trying alternative..."
-        KERNEL_URL="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64/vmlinux-${KERNEL_VERSION}"
+        log_warn "Failed to download kernel from primary source, trying quickstart kernel..."
+        KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin"
         wget -q -O "$KERNEL_PATH" "$KERNEL_URL" || {
             log_error "Failed to download kernel"
             exit 1
