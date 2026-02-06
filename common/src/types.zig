@@ -142,6 +142,7 @@ pub const NodeStatus = struct {
     active_task_ids: []TaskId,
 
     pub fn availableSlots(self: NodeStatus) u32 {
+        if (self.active_vms >= self.total_vm_slots) return 0;
         return self.total_vm_slots - self.active_vms;
     }
 
@@ -156,7 +157,7 @@ pub const NodeStatus = struct {
         const cpu_factor = 1.0 - self.cpu_usage;
         const mem_factor = 1.0 - self.memory_usage;
 
-        return (slot_factor * 0.4) + (warm_factor * 0.3) + (cpu_factor * 0.15) + (mem_factor * 0.15);
+        return (slot_factor * 0.3) + (warm_factor * 0.4) + (cpu_factor * 0.15) + (mem_factor * 0.15);
     }
 };
 
