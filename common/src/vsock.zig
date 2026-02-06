@@ -40,6 +40,33 @@ pub const Connection = struct {
         };
     }
 
+    pub fn connectUds(allocator: std.mem.Allocator, uds_path: []const u8, port: u32) !Connection {
+        const stream = std.net.connectUnixSocket(uds_path) catch |err| {
+            std.log.err("failed to connect to vsock UDS at {s}: {}", .{ uds_path, err });
+            return error.ConnectionFailed;
+        };
+        const fd = stream.handle;
+        errdefer posix.close(fd);
+
+        var connect_buf: [64]u8 = undefined;
+        const connect_msg = std.fmt.bufPrint(&connect_buf, "CONNECT {d}\n", .{port}) catch
+            return error.BufferOverflow;
+
+        _ = posix.write(fd, connect_msg) catch return error.ConnectionFailed;
+
+        var response_buf: [128]u8 = undefined;
+        const n = posix.read(fd, &response_buf) catch return error.ConnectionFailed;
+        if (n == 0) return error.ConnectionClosed;
+
+        const response = response_buf[0..n];
+        if (!std.mem.startsWith(u8, response, "OK ")) {
+            std.log.err("vsock UDS handshake failed: {s}", .{response});
+            return error.HandshakeFailed;
+        }
+
+        return .{ .fd = fd, .allocator = allocator };
+    }
+
     pub fn close(self: *Connection) void {
         if (self.fd >= 0) {
             posix.close(self.fd);

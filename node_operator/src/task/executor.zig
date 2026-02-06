@@ -48,7 +48,7 @@ pub const TaskExecutor = struct {
 
         var runner = vsock.TaskRunner.init(
             self.allocator,
-            vm_instance.vsock_cid,
+            vm_instance.vsock_uds_path,
             9999,
             request.task_id,
         );
