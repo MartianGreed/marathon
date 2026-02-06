@@ -333,6 +333,56 @@ pub const VmPool = struct {
         return vm;
     }
 
+    pub fn acquireOrCreate(self: *VmPool) !*Vm {
+        self.mutex.lock();
+
+        if (self.warm_vms.pop()) |warm_vm| {
+            self.active_vms.put(warm_vm.id, warm_vm) catch {
+                self.mutex.unlock();
+                return error.NoAvailableVm;
+            };
+            self.mutex.unlock();
+            return warm_vm;
+        }
+
+        if (self.warm_vms.items.len + self.active_vms.count() >= self.config.total_vm_slots) {
+            self.mutex.unlock();
+            return error.NoAvailableVm;
+        }
+
+        self.mutex.unlock();
+
+        std.log.info("no warm VMs available, creating on-demand", .{});
+        const new_vm = Vm.init(self.allocator) catch |err| {
+            std.log.err("failed to create on-demand VM: {}", .{err});
+            return error.NoAvailableVm;
+        };
+        errdefer new_vm.deinit();
+
+        const vm_config = VmConfig{
+            .firecracker_bin = self.config.firecracker_bin,
+            .kernel_path = self.config.kernel_path,
+            .rootfs_path = self.config.rootfs_path,
+            .snapshot_path = self.config.snapshot_path,
+        };
+
+        new_vm.startFromSnapshot(self.snapshot_mgr, vm_config) catch |err| {
+            std.log.err("failed to start on-demand VM: {}", .{err});
+            new_vm.deinit();
+            return error.NoAvailableVm;
+        };
+
+        self.mutex.lock();
+        self.active_vms.put(new_vm.id, new_vm) catch {
+            self.mutex.unlock();
+            new_vm.deinit();
+            return error.NoAvailableVm;
+        };
+        self.mutex.unlock();
+
+        return new_vm;
+    }
+
     pub fn release(self: *VmPool, vm_id: types.VmId) void {
         self.mutex.lock();
         defer self.mutex.unlock();
