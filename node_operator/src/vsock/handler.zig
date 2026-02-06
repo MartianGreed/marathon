@@ -255,7 +255,7 @@ pub const TaskRunner = struct {
     }
 
     pub fn run(self: *TaskRunner, request: protocol.VsockStartPayload) !TaskResult {
-        const max_retries: u32 = 5;
+        const max_retries: u32 = 15;
         const retry_delay_ns: u64 = 2 * std.time.ns_per_s;
         var attempt: u32 = 0;
         while (true) {
