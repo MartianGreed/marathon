@@ -42,6 +42,13 @@ const LinuxVsockClient = struct {
         self.connection = try listener.accept();
     }
 
+    pub fn resetConnection(self: *LinuxVsockClient) void {
+        if (self.connection) |*conn| {
+            conn.close();
+            self.connection = null;
+        }
+    }
+
     pub fn sendReady(self: *LinuxVsockClient) !void {
         if (self.connection == null) {
             try self.waitForConnection();
