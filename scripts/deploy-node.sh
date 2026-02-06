@@ -124,22 +124,33 @@ download_kernel() {
     KERNEL_PATH="$MARATHON_DIR/kernel/vmlinux"
 
     if [[ -f "$KERNEL_PATH" ]]; then
-        log_info "Kernel already exists at $KERNEL_PATH"
-        return
+        if file "$KERNEL_PATH" | grep -q "ELF"; then
+            log_info "Kernel already exists at $KERNEL_PATH (verified ELF)"
+            return
+        fi
+        log_warn "Existing kernel is not valid ELF, re-downloading..."
+        rm -f "$KERNEL_PATH"
     fi
 
     log_info "Downloading kernel $KERNEL_VERSION..."
 
-    KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux-${KERNEL_VERSION}"
+    KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.8/x86_64/vmlinux-${KERNEL_VERSION}"
 
     if ! wget -q -O "$KERNEL_PATH" "$KERNEL_URL"; then
         log_warn "Failed to download kernel from primary source, trying alternative..."
-        KERNEL_URL="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/vmlinux-${KERNEL_VERSION}"
+        KERNEL_URL="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64/vmlinux-${KERNEL_VERSION}"
         wget -q -O "$KERNEL_PATH" "$KERNEL_URL" || {
             log_error "Failed to download kernel"
             exit 1
         }
     fi
+
+    if ! file "$KERNEL_PATH" | grep -q "ELF"; then
+        log_error "Downloaded kernel is not a valid ELF binary"
+        rm -f "$KERNEL_PATH"
+        exit 1
+    fi
+    log_info "Kernel verified as valid ELF binary"
 
     chmod 644 "$KERNEL_PATH"
     log_info "Kernel downloaded to $KERNEL_PATH"
@@ -166,6 +177,100 @@ download_rootfs() {
     chmod 644 "$ROOTFS_PATH"
     log_info "Rootfs downloaded to $ROOTFS_PATH"
     log_warn "Note: This is a minimal test rootfs. For production, build custom rootfs with 'make rootfs'"
+}
+
+create_snapshot() {
+    SNAPSHOT_BASE="$MARATHON_DIR/snapshots/base"
+    if [[ -f "$SNAPSHOT_BASE/snapshot" ]] && [[ -f "$SNAPSHOT_BASE/mem" ]]; then
+        log_info "Base snapshot already exists"
+        return
+    fi
+
+    KERNEL_PATH="$MARATHON_DIR/kernel/vmlinux"
+    ROOTFS_PATH="$MARATHON_DIR/rootfs/rootfs.ext4"
+
+    if [[ ! -f "$KERNEL_PATH" ]] || [[ ! -f "$ROOTFS_PATH" ]]; then
+        log_warn "Kernel or rootfs not available, skipping snapshot creation"
+        return
+    fi
+
+    if ! command -v firecracker &>/dev/null; then
+        log_warn "Firecracker not installed, skipping snapshot creation"
+        return
+    fi
+
+    log_info "Creating initial base snapshot..."
+    mkdir -p "$SNAPSHOT_BASE"
+
+    SOCKET="/tmp/marathon-snapshot-$$.sock"
+    VSOCK_PATH="/tmp/marathon-snapshot-$$-vsock.sock"
+    rm -f "$SOCKET" "$VSOCK_PATH"
+
+    firecracker --api-sock "$SOCKET" &
+    FC_PID=$!
+    sleep 1
+
+    if [[ ! -S "$SOCKET" ]]; then
+        log_error "Firecracker socket not created for snapshot"
+        kill $FC_PID 2>/dev/null || true
+        return
+    fi
+
+    curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/boot-source' \
+        -H 'Content-Type: application/json' \
+        -d "{
+            \"kernel_image_path\": \"$KERNEL_PATH\",
+            \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off\"
+        }"
+
+    curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/drives/rootfs' \
+        -H 'Content-Type: application/json' \
+        -d "{
+            \"drive_id\": \"rootfs\",
+            \"path_on_host\": \"$ROOTFS_PATH\",
+            \"is_root_device\": true,
+            \"is_read_only\": false
+        }"
+
+    curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/vsock' \
+        -H 'Content-Type: application/json' \
+        -d "{
+            \"vsock_id\": \"vsock0\",
+            \"guest_cid\": 3,
+            \"uds_path\": \"$VSOCK_PATH\"
+        }"
+
+    curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/machine-config' \
+        -H 'Content-Type: application/json' \
+        -d '{
+            "vcpu_count": 2,
+            "mem_size_mib": 512,
+            "track_dirty_pages": true
+        }'
+
+    curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/actions' \
+        -H 'Content-Type: application/json' \
+        -d '{"action_type": "InstanceStart"}'
+
+    log_info "Waiting for VM to boot..."
+    sleep 10
+
+    curl -s --unix-socket "$SOCKET" -X PATCH 'http://localhost/vm' \
+        -H 'Content-Type: application/json' \
+        -d '{"state": "Paused"}'
+
+    curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/snapshot/create' \
+        -H 'Content-Type: application/json' \
+        -d "{
+            \"snapshot_path\": \"$SNAPSHOT_BASE/snapshot\",
+            \"mem_file_path\": \"$SNAPSHOT_BASE/mem\",
+            \"snapshot_type\": \"Full\"
+        }"
+
+    kill $FC_PID 2>/dev/null || true
+    rm -f "$SOCKET" "$VSOCK_PATH"
+
+    log_info "Base snapshot created at $SNAPSHOT_BASE"
 }
 
 write_config() {
@@ -323,6 +428,7 @@ main() {
     create_directories
     download_kernel
     download_rootfs || true
+    create_snapshot
     write_config
     create_systemd_service
     install_binary

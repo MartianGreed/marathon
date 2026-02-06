@@ -137,7 +137,7 @@ pub const NodeOperatorConfig = struct {
     jailer_bin: []const u8 = "/usr/bin/jailer",
 
     snapshot_path: []const u8 = "/tmp/marathon/snapshots",
-    rootfs_path: []const u8 = "/tmp/marathon/rootfs",
+    rootfs_path: []const u8 = "/tmp/marathon/rootfs/rootfs.ext4",
     kernel_path: []const u8 = "/tmp/marathon/kernel/vmlinux",
 
     vsock_port: u32 = 9999,
