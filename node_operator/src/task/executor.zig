@@ -20,13 +20,10 @@ pub const TaskExecutor = struct {
     }
 
     pub fn executeTask(self: *TaskExecutor, request: protocol.ExecuteTaskRequest) !void {
-        self.mutex.lock();
-        const vm_instance = self.vm_pool.acquire() orelse {
-            self.mutex.unlock();
-            log.err("no available VM for task_id={s}", .{&types.formatId(request.task_id)});
+        const vm_instance = self.vm_pool.acquireOrCreate() catch |err| {
+            log.err("failed to acquire VM for task_id={s} err={}", .{ &types.formatId(request.task_id), err });
             return error.NoAvailableVm;
         };
-        self.mutex.unlock();
 
         log.info("task starting: task_id={s} vm_id={s}", .{
             &types.formatId(request.task_id),
