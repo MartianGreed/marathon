@@ -192,6 +192,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         std.debug.print("Error: Failed to submit task: {}\n", .{err});
         return;
     };
+    defer protocol.freeDecoded(protocol.TaskEvent, allocator, response.payload);
 
     const task_id_str = types.formatId(response.payload.task_id);
     std.debug.print("{s}\n", .{&task_id_str});
@@ -220,6 +221,7 @@ fn handleStatus(config: common.config.ClientConfig, allocator: std.mem.Allocator
         std.debug.print("Error: Failed to get task status: {}\n", .{err});
         return;
     };
+    defer protocol.freeDecoded(protocol.TaskResponse, allocator, response.payload);
 
     const r = response.payload;
     const id_str = types.formatId(r.task_id);
@@ -257,6 +259,7 @@ fn handleCancel(config: common.config.ClientConfig, allocator: std.mem.Allocator
         std.debug.print("Error: Failed to cancel task: {}\n", .{err});
         return;
     };
+    defer protocol.freeDecoded(protocol.CancelResponse, allocator, response.payload);
 
     if (response.payload.success) {
         std.debug.print("Task cancelled.\n", .{});

@@ -102,6 +102,9 @@ pub const HeartbeatClient = struct {
             break :blk out;
         } else [_]u8{0} ** 32;
 
+        const completed_tasks = self.executor.drainResults();
+        defer self.allocator.free(completed_tasks);
+
         const payload = protocol.HeartbeatPayload{
             .node_id = self.node_id,
             .timestamp = timestamp,
@@ -115,6 +118,7 @@ pub const HeartbeatClient = struct {
             .disk_available_bytes = status.disk_available_bytes,
             .healthy = status.healthy,
             .draining = status.draining,
+            .completed_tasks = completed_tasks,
         };
 
         var raw = try self.client.callWithHeader(.heartbeat_request, payload);
@@ -238,6 +242,7 @@ test "heartbeat client init" {
     defer pool.deinit();
 
     var executor = task_executor.TaskExecutor.init(allocator, &pool);
+    defer executor.deinit();
 
     var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, &executor, null, false, null);
     defer client.deinit();
@@ -255,6 +260,7 @@ test "stop flag transitions correctly" {
     defer pool.deinit();
 
     var executor = task_executor.TaskExecutor.init(allocator, &pool);
+    defer executor.deinit();
 
     var client = HeartbeatClient.init(allocator, "localhost", 8080, &pool, &executor, null, false, null);
     defer client.deinit();

@@ -286,6 +286,20 @@ pub const Server = struct {
             });
         }
 
+        for (payload.completed_tasks) |report| {
+            const state: types.TaskState = if (report.success) .completed else .failed;
+            self.scheduler.completeTask(report.task_id, .{
+                .state = state,
+                .usage = report.metrics,
+                .error_message = report.error_message,
+                .pr_url = report.pr_url,
+            });
+            log.info("task result received via heartbeat: task_id={s} success={}", .{
+                &types.formatId(report.task_id),
+                report.success,
+            });
+        }
+
         if (status.availableSlots() > 0) {
             self.tryScheduleTasks();
         }

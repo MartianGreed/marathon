@@ -11,12 +11,24 @@ pub const TaskExecutor = struct {
     allocator: std.mem.Allocator,
     vm_pool: *vm.VmPool,
     mutex: std.Thread.Mutex = .{},
+    completed_results: std.ArrayListUnmanaged(protocol.TaskResultReport) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, vm_pool: *vm.VmPool) TaskExecutor {
         return .{
             .allocator = allocator,
             .vm_pool = vm_pool,
         };
+    }
+
+    pub fn deinit(self: *TaskExecutor) void {
+        self.completed_results.deinit(self.allocator);
+    }
+
+    pub fn drainResults(self: *TaskExecutor) []protocol.TaskResultReport {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.completed_results.toOwnedSlice(self.allocator) catch return &[_]protocol.TaskResultReport{};
     }
 
     pub fn executeTask(self: *TaskExecutor, request: protocol.ExecuteTaskRequest) !void {
@@ -68,19 +80,40 @@ pub const TaskExecutor = struct {
             .completion_promise = null,
         };
 
-        const result = runner.run(vsock_payload) catch |err| {
+        const report: protocol.TaskResultReport = if (runner.run(vsock_payload)) |result| .{
+            .task_id = request.task_id,
+            .success = result.success,
+            .error_message = result.error_message,
+            .metrics = result.metrics,
+            .pr_url = result.pr_url,
+        } else |err| blk: {
             log.err("task execution failed: task_id={s} err={}", .{
                 &types.formatId(request.task_id),
                 err,
             });
-            return;
+            break :blk .{
+                .task_id = request.task_id,
+                .success = false,
+                .error_message = @errorName(err),
+                .metrics = .{},
+                .pr_url = null,
+            };
         };
 
         log.info("task completed: task_id={s} success={} pr_url={s}", .{
             &types.formatId(request.task_id),
-            result.success,
-            result.pr_url orelse "none",
+            report.success,
+            report.pr_url orelse "none",
         });
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.completed_results.append(self.allocator, report) catch |err| {
+            log.err("failed to queue task result: task_id={s} err={}", .{
+                &types.formatId(request.task_id),
+                err,
+            });
+        };
     }
 };
 
@@ -94,6 +127,6 @@ test "task executor init" {
     var pool = vm.VmPool.init(allocator, &mgr, .{});
     defer pool.deinit();
 
-    const executor = TaskExecutor.init(allocator, &pool);
-    _ = executor;
+    var executor = TaskExecutor.init(allocator, &pool);
+    defer executor.deinit();
 }
