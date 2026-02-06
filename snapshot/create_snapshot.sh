@@ -55,13 +55,18 @@ curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/drives/rootfs' \
 
 echo "Configuring vsock..."
 VSOCK_PATH="/run/marathon/snapshot-base-vsock.sock"
-curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/vsock' \
+rm -f "$VSOCK_PATH"
+VSOCK_RESP=$(curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/vsock' \
     -H 'Content-Type: application/json' \
     -d "{
         \"vsock_id\": \"vsock0\",
         \"guest_cid\": 3,
         \"uds_path\": \"$VSOCK_PATH\"
-    }"
+    }")
+if echo "$VSOCK_RESP" | grep -q "fault_message"; then
+    echo "Error: Vsock configuration failed: $VSOCK_RESP"
+    exit 1
+fi
 
 echo "Configuring machine..."
 curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/machine-config' \
