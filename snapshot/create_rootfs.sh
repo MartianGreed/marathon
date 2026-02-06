@@ -10,7 +10,8 @@ echo "  Directory: $ROOTFS_DIR"
 echo "  Size: $ROOTFS_SIZE"
 echo "  Output: $OUTPUT"
 
-if [ ! -d "$ROOTFS_DIR" ]; then
+if [ ! -x "$ROOTFS_DIR/bin/busybox" ]; then
+    rm -rf "$ROOTFS_DIR"
     echo "Creating rootfs directory structure..."
     mkdir -p "$ROOTFS_DIR"/{bin,sbin,usr/bin,usr/sbin,lib,lib64,etc,dev,proc,sys,tmp,root,workspace,var/log}
 
@@ -18,10 +19,13 @@ if [ ! -d "$ROOTFS_DIR" ]; then
     ALPINE_VERSION="3.19"
     ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 
-    wget -q "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/x86_64/apk-tools-static-2.14.0-r5.x86_64.apk" -O /tmp/apk-tools.apk
-    tar -xzf /tmp/apk-tools.apk -C /tmp
+    TMPDIR_ROOTFS="$(mktemp -d)"
+    trap "rm -rf '$TMPDIR_ROOTFS'" EXIT
 
-    /tmp/sbin/apk.static -X "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" \
+    wget -q "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/x86_64/apk-tools-static-2.14.0-r5.x86_64.apk" -O "$TMPDIR_ROOTFS/apk-tools.apk"
+    tar -xzf "$TMPDIR_ROOTFS/apk-tools.apk" -C "$TMPDIR_ROOTFS"
+
+    "$TMPDIR_ROOTFS/sbin/apk.static" -X "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" \
         -U --allow-untrusted --root "$ROOTFS_DIR" --initdb \
         add alpine-base busybox openssh git curl jq nodejs npm
 
@@ -30,14 +34,14 @@ if [ ! -d "$ROOTFS_DIR" ]; then
 
     echo "Installing jj (Jujutsu VCS)..."
     JJ_VERSION="0.23.0"
-    wget -q "https://github.com/martinvonz/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz" -O /tmp/jj.tar.gz
-    tar -xzf /tmp/jj.tar.gz -C "$ROOTFS_DIR/usr/local/bin"
+    wget -q "https://github.com/martinvonz/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz" -O "$TMPDIR_ROOTFS/jj.tar.gz"
+    tar -xzf "$TMPDIR_ROOTFS/jj.tar.gz" -C "$ROOTFS_DIR/usr/local/bin"
 
     echo "Installing GitHub CLI..."
     GH_VERSION="2.43.1"
-    wget -q "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" -O /tmp/gh.tar.gz
-    tar -xzf /tmp/gh.tar.gz -C /tmp
-    cp /tmp/gh_*/bin/gh "$ROOTFS_DIR/usr/local/bin/"
+    wget -q "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" -O "$TMPDIR_ROOTFS/gh.tar.gz"
+    tar -xzf "$TMPDIR_ROOTFS/gh.tar.gz" -C "$TMPDIR_ROOTFS"
+    cp "$TMPDIR_ROOTFS"/gh_*/bin/gh "$ROOTFS_DIR/usr/local/bin/"
 
     echo "Configuring system..."
 
