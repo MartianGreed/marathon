@@ -15,6 +15,12 @@ const vsock = if (builtin.os.tag == .linux) common.vsock else struct {
             return .{ .fd = -1, .allocator = allocator };
         }
 
+        pub fn connectUds(allocator: std.mem.Allocator, uds_path: []const u8, port: u32) !Connection {
+            _ = uds_path;
+            _ = port;
+            return .{ .fd = -1, .allocator = allocator };
+        }
+
         pub fn close(self: *Connection) void {
             _ = self;
         }
@@ -31,15 +37,15 @@ const vsock = if (builtin.os.tag == .linux) common.vsock else struct {
 
 pub const VsockHandler = struct {
     allocator: std.mem.Allocator,
-    cid: u32,
+    uds_path: []const u8,
     port: u32,
     connection: ?vsock.Connection,
     callback: ?*const fn (VsockEvent) void,
 
-    pub fn init(allocator: std.mem.Allocator, cid: u32, port: u32) VsockHandler {
+    pub fn init(allocator: std.mem.Allocator, uds_path: []const u8, port: u32) VsockHandler {
         return .{
             .allocator = allocator,
-            .cid = cid,
+            .uds_path = uds_path,
             .port = port,
             .connection = null,
             .callback = null,
@@ -51,7 +57,7 @@ pub const VsockHandler = struct {
     }
 
     pub fn connect(self: *VsockHandler) !void {
-        self.connection = try vsock.Connection.connect(self.allocator, self.cid, self.port);
+        self.connection = try vsock.Connection.connectUds(self.allocator, self.uds_path, self.port);
     }
 
     pub fn disconnect(self: *VsockHandler) void {
@@ -232,10 +238,10 @@ pub const TaskRunner = struct {
     metrics: types.UsageMetrics,
     output_callback: ?*const fn (types.OutputType, []const u8) void,
 
-    pub fn init(allocator: std.mem.Allocator, cid: u32, port: u32, task_id: types.TaskId) TaskRunner {
+    pub fn init(allocator: std.mem.Allocator, uds_path: []const u8, port: u32, task_id: types.TaskId) TaskRunner {
         return .{
             .allocator = allocator,
-            .handler = VsockHandler.init(allocator, cid, port),
+            .handler = VsockHandler.init(allocator, uds_path, port),
             .task_id = task_id,
             .metrics = .{},
             .output_callback = null,
@@ -317,7 +323,7 @@ pub const TaskResult = struct {
 
 test "vsock handler init" {
     const allocator = std.testing.allocator;
-    var handler = VsockHandler.init(allocator, 3, 9999);
+    var handler = VsockHandler.init(allocator, "/tmp/test-vsock.sock", 9999);
     defer handler.deinit();
 }
 
@@ -463,7 +469,7 @@ test "vsock stub connection close" {
     conn.close();
 
     // Test VsockHandler with connection set and disconnect
-    var handler = VsockHandler.init(allocator, 3, 9999);
+    var handler = VsockHandler.init(allocator, "/tmp/test-vsock.sock", 9999);
     handler.connection = vsock.Connection{ .fd = -1, .allocator = allocator };
     handler.disconnect();
 
