@@ -548,6 +548,7 @@ fn firecrackerApiCall(allocator: std.mem.Allocator, socket_path: []const u8, met
 }
 
 fn waitForVsockReady(vsock_path: []const u8, port: u32, max_retries: u32) !void {
+    _ = port;
     var retries: u32 = 0;
     while (retries < max_retries) : (retries += 1) {
         const stat = std.fs.cwd().statFile(vsock_path) catch {
@@ -555,39 +556,8 @@ fn waitForVsockReady(vsock_path: []const u8, port: u32, max_retries: u32) !void 
             continue;
         };
         if (stat.kind == .unix_domain_socket) {
-            const stream = std.net.connectUnixSocket(vsock_path) catch {
-                std.Thread.sleep(500 * std.time.ns_per_ms);
-                continue;
-            };
-            defer stream.close();
-
-            var connect_buf: [64]u8 = undefined;
-            const connect_msg = std.fmt.bufPrint(&connect_buf, "CONNECT {d}\n", .{port}) catch {
-                std.Thread.sleep(500 * std.time.ns_per_ms);
-                continue;
-            };
-            _ = stream.write(connect_msg) catch {
-                std.Thread.sleep(500 * std.time.ns_per_ms);
-                continue;
-            };
-
-            var response_buf: [32]u8 = undefined;
-            const n = stream.read(&response_buf) catch {
-                std.Thread.sleep(500 * std.time.ns_per_ms);
-                continue;
-            };
-            if (n >= 2 and std.mem.startsWith(u8, response_buf[0..n], "OK")) {
-                std.log.debug("Vsock at {s} port {d} is ready (guest agent responding)", .{ vsock_path, port });
-                return;
-            }
-
-            if (n == 0) {
-                std.log.warn("Vsock CONNECT returned 0 bytes (no guest listener?), retrying ({d}/{d})", .{ retries + 1, max_retries });
-            } else {
-                std.log.warn("Vsock CONNECT got unexpected response: '{s}' ({d} bytes), retrying ({d}/{d})", .{ response_buf[0..n], n, retries + 1, max_retries });
-            }
-            std.Thread.sleep(500 * std.time.ns_per_ms);
-            continue;
+            std.log.debug("Vsock socket ready at {s}", .{vsock_path});
+            return;
         }
         std.Thread.sleep(500 * std.time.ns_per_ms);
     }
