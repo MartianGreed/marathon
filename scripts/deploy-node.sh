@@ -89,6 +89,13 @@ install_firecracker() {
 
     log_info "Installing Firecracker $FIRECRACKER_VERSION..."
 
+    if systemctl is-active --quiet marathon-node-operator 2>/dev/null; then
+        log_info "Stopping marathon-node-operator for Firecracker upgrade..."
+        systemctl stop marathon-node-operator
+    fi
+    pkill -x firecracker || true
+    sleep 1
+
     RELEASE_URL="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
     TEMP_DIR=$(mktemp -d)
     trap "rm -rf $TEMP_DIR" EXIT
