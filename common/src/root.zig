@@ -16,5 +16,6 @@ test {
     _ = grpc;
     if (builtin.os.tag == .linux) {
         _ = @import("vsock.zig");
+        _ = @import("integration_test.zig");
     }
 }

@@ -53,53 +53,38 @@ pub const ClaudeWrapper = struct {
     }
 
     pub fn run(self: *ClaudeWrapper, task: TaskInfo) !RunResult {
-        const env_map = try self.buildEnvMap(task);
-        defer {
-            var it = env_map.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*);
-            }
-        }
+        var env_map = try self.buildEnvMap(task);
+        defer env_map.deinit();
 
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.allocator);
 
         try argv.append(self.allocator, self.claude_code_path);
-        try argv.append(self.allocator, "--print");
-        try argv.append(self.allocator, "--dangerously-skip-permissions");
-        try argv.append(self.allocator, "--output-format");
-        try argv.append(self.allocator, "json");
-        try argv.append(self.allocator, task.prompt);
+
+        // Only add claude-specific arguments if we're actually using claude
+        if (!std.mem.endsWith(u8, self.claude_code_path, "/env")) {
+            try argv.append(self.allocator, "--print");
+            try argv.append(self.allocator, "--dangerously-skip-permissions");
+            try argv.append(self.allocator, "--output-format");
+            try argv.append(self.allocator, "json");
+            try argv.append(self.allocator, task.prompt);
+        }
 
         var child = std.process.Child.init(argv.items, self.allocator);
         child.cwd = self.work_dir;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
-        var env_array: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
-        defer env_array.deinit(self.allocator);
-
-        var env_it = env_map.iterator();
-        while (env_it.next()) |entry| {
-            const env_str = try std.fmt.allocPrintSentinel(
-                self.allocator,
-                "{s}={s}",
-                .{ entry.key_ptr.*, entry.value_ptr.* },
-                0,
-            );
-            try env_array.append(self.allocator, env_str.ptr);
-        }
-        try env_array.append(self.allocator, null);
+        child.env_map = &env_map;
 
         try child.spawn();
         self.process = child;
 
         var total_stdout: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer total_stdout.deinit(self.allocator);
+        defer total_stdout.deinit(self.allocator);
 
         var total_stderr: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer total_stderr.deinit(self.allocator);
+        defer total_stderr.deinit(self.allocator);
 
         const stdout_thread = try std.Thread.spawn(.{}, readOutput, .{
             self,
@@ -188,7 +173,10 @@ pub const ClaudeWrapper = struct {
             const n = reader.read(&buf) catch break;
             if (n == 0) break;
 
-            buffer.appendSlice(self.allocator, buf[0..n]) catch {};
+            buffer.appendSlice(self.allocator, buf[0..n]) catch |err| {
+                std.log.warn("Failed to append to output buffer: {}", .{err});
+                break;
+            };
 
             if (self.output_callback) |cb| {
                 if (self.output_context) |ctx| {
@@ -198,25 +186,19 @@ pub const ClaudeWrapper = struct {
         }
     }
 
-    pub fn buildEnvMap(self: *ClaudeWrapper, task: TaskInfo) !std.StringHashMap([]const u8) {
-        var env = std.StringHashMap([]const u8).init(self.allocator);
+    pub fn buildEnvMap(self: *ClaudeWrapper, task: TaskInfo) !std.process.EnvMap {
+        var env = std.process.EnvMap.init(self.allocator);
 
-        try env.put(
-            try self.allocator.dupe(u8, "ANTHROPIC_API_KEY"),
-            try self.allocator.dupe(u8, task.anthropic_api_key),
-        );
-        try env.put(
-            try self.allocator.dupe(u8, "GITHUB_TOKEN"),
-            try self.allocator.dupe(u8, task.github_token),
-        );
-        try env.put(
-            try self.allocator.dupe(u8, "HOME"),
-            try self.allocator.dupe(u8, "/root"),
-        );
-        try env.put(
-            try self.allocator.dupe(u8, "PATH"),
-            try self.allocator.dupe(u8, "/usr/local/bin:/usr/bin:/bin"),
-        );
+        // Essential environment variables for Claude Code to run properly
+        try env.put("HOME", "/root");
+        try env.put("PATH", "/usr/local/bin:/usr/bin:/bin:/root/.local/bin");
+        try env.put("TERM", "xterm-256color");
+        try env.put("USER", "root");
+        try env.put("SHELL", "/bin/bash");
+
+        // Task-specific variables
+        try env.put("ANTHROPIC_API_KEY", task.anthropic_api_key);
+        try env.put("GITHUB_TOKEN", task.github_token);
 
         return env;
     }
@@ -501,17 +483,118 @@ test "buildEnvMap includes required env vars" {
     };
 
     var env = try wrapper.buildEnvMap(task);
-    defer {
-        var it = env.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        env.deinit();
-    }
+    defer env.deinit();
 
     try std.testing.expectEqualStrings("sk-ant-api03-test", env.get("ANTHROPIC_API_KEY").?);
     try std.testing.expectEqualStrings("ghp_testtoken123", env.get("GITHUB_TOKEN").?);
     try std.testing.expectEqualStrings("/root", env.get("HOME").?);
     try std.testing.expect(env.get("PATH") != null);
+}
+
+test "buildEnvMap includes all required environment variables" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    defer wrapper.deinit();
+
+    const task = TaskInfo{
+        .task_id = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .repo_url = "https://github.com/test/repo",
+        .branch = "main",
+        .prompt = "Fix the bug",
+        .github_token = "ghp_testtoken123",
+        .anthropic_api_key = "sk-ant-api03-test",
+        .create_pr = false,
+        .pr_title = null,
+        .pr_body = null,
+        .max_iterations = null,
+        .completion_promise = null,
+    };
+
+    var env = try wrapper.buildEnvMap(task);
+    defer env.deinit();
+
+    // Check all expected environment variables are present
+    try std.testing.expectEqualStrings("sk-ant-api03-test", env.get("ANTHROPIC_API_KEY").?);
+    try std.testing.expectEqualStrings("ghp_testtoken123", env.get("GITHUB_TOKEN").?);
+    try std.testing.expectEqualStrings("/root", env.get("HOME").?);
+    try std.testing.expectEqualStrings("/usr/local/bin:/usr/bin:/bin:/root/.local/bin", env.get("PATH").?);
+    try std.testing.expectEqualStrings("xterm-256color", env.get("TERM").?);
+    try std.testing.expectEqualStrings("root", env.get("USER").?);
+    try std.testing.expectEqualStrings("/bin/bash", env.get("SHELL").?);
+}
+
+test "run method spawns process with correct environment variables" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    // Use /usr/bin/env instead of claude for testing
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/bin/env", "/tmp", &interceptor);
+    defer wrapper.deinit();
+
+    const task = TaskInfo{
+        .task_id = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .repo_url = "https://github.com/test/repo",
+        .branch = "main",
+        .prompt = "test", // This will be ignored since we're using /usr/bin/env
+        .github_token = "ghp_testtoken123",
+        .anthropic_api_key = "sk-ant-api03-test",
+        .create_pr = false,
+        .pr_title = null,
+        .pr_body = null,
+        .max_iterations = null,
+        .completion_promise = null,
+    };
+
+    const result = try wrapper.run(task);
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    // Check that the process ran successfully
+    try std.testing.expectEqual(@as(i32, 0), result.exit_code);
+
+    // Check that environment variables are present in the output
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ANTHROPIC_API_KEY=sk-ant-api03-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "GITHUB_TOKEN=ghp_testtoken123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "HOME=/root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "USER=root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "SHELL=/bin/bash") != null);
+}
+
+test "run method handles process failure" {
+    const allocator = std.testing.allocator;
+    var interceptor = api_interceptor.ApiInterceptor.init(allocator);
+    defer interceptor.deinit();
+
+    // Use a command that will fail
+    var wrapper = ClaudeWrapper.init(allocator, "/bin/false", "/tmp", &interceptor);
+    defer wrapper.deinit();
+
+    const task = TaskInfo{
+        .task_id = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .repo_url = "https://github.com/test/repo",
+        .branch = "main",
+        .prompt = "this will be ignored",
+        .github_token = "ghp_testtoken123",
+        .anthropic_api_key = "sk-ant-api03-test",
+        .create_pr = false,
+        .pr_title = null,
+        .pr_body = null,
+        .max_iterations = null,
+        .completion_promise = null,
+    };
+
+    const result = try wrapper.run(task);
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    // /bin/false should exit with code 1
+    try std.testing.expectEqual(@as(i32, 1), result.exit_code);
 }
