@@ -60,7 +60,7 @@ pub const ClaudeWrapper = struct {
         defer argv.deinit(self.allocator);
 
         try argv.append(self.allocator, self.claude_code_path);
-        
+
         // Only add claude-specific arguments if we're actually using claude
         if (!std.mem.endsWith(u8, self.claude_code_path, "/env")) {
             try argv.append(self.allocator, "--print");
@@ -557,7 +557,7 @@ test "run method spawns process with correct environment variables" {
 
     // Check that the process ran successfully
     try std.testing.expectEqual(@as(i32, 0), result.exit_code);
-    
+
     // Check that environment variables are present in the output
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ANTHROPIC_API_KEY=sk-ant-api03-test") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "GITHUB_TOKEN=ghp_testtoken123") != null);

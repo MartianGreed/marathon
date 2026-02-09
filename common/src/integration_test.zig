@@ -20,7 +20,7 @@ fn vmAgentSide(allocator: std.mem.Allocator, fd: posix.fd_t) !void {
 
     // Define an empty payload type
     const EmptyPayload = struct {};
-    
+
     // Send vsock_ready
     try conn.send(protocol.MessageType.vsock_ready, 1, EmptyPayload{});
 
@@ -87,7 +87,7 @@ fn nodeOperatorSide(allocator: std.mem.Allocator, fd: posix.fd_t) !void {
 
     // Define an empty payload type for vsock_ready
     const EmptyPayload = struct {};
-    
+
     // Receive vsock_ready
     const ready_msg = try conn.receive(EmptyPayload);
     defer {
@@ -149,7 +149,7 @@ fn nodeOperatorSide(allocator: std.mem.Allocator, fd: posix.fd_t) !void {
     try testing.expectEqualStrings("https://github.com/test/repo/pull/123", complete_msg.payload.pr_url.?);
     try testing.expectEqual(@as(u32, 3), complete_msg.payload.iteration);
     try testing.expectEqual(true, complete_msg.payload.promise_found);
-    
+
     // Check metrics in complete message
     try testing.expectEqual(@as(i64, 1000), complete_msg.payload.metrics.input_tokens);
     try testing.expectEqual(@as(i64, 500), complete_msg.payload.metrics.output_tokens);
@@ -178,7 +178,7 @@ test "vsock protocol integration test over UDS" {
 
 test "protocol error handling - invalid magic" {
     const allocator = testing.allocator;
-    
+
     var fds: [2]posix.fd_t = undefined;
     const sock_result = std.os.linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
     if (sock_result != 0) return error.SocketPairFailed;
@@ -190,10 +190,10 @@ test "protocol error handling - invalid magic" {
     // Send invalid header
     const invalid_header = [_]u8{ 'B', 'A', 'D', '!', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     _ = try posix.send(fds[0], &invalid_header, 0);
-    
+
     // Try to receive and expect error
     var conn = createConnectionFromFd(allocator, fds[1]);
-    
+
     const EmptyPayload = struct {};
     const receive_result = conn.receive(EmptyPayload);
     try testing.expectError(error.InvalidMagic, receive_result);
@@ -201,7 +201,7 @@ test "protocol error handling - invalid magic" {
 
 test "protocol error handling - connection closed during read" {
     const allocator = testing.allocator;
-    
+
     var fds: [2]posix.fd_t = undefined;
     const sock_result = std.os.linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
     if (sock_result != 0) return error.SocketPairFailed;
@@ -209,10 +209,10 @@ test "protocol error handling - connection closed during read" {
 
     // Close one end immediately
     posix.close(fds[0]);
-    
+
     // Try to receive from closed connection
     var conn = createConnectionFromFd(allocator, fds[1]);
-    
+
     const EmptyPayload = struct {};
     const receive_result = conn.receive(EmptyPayload);
     try testing.expectError(error.ConnectionClosed, receive_result);
