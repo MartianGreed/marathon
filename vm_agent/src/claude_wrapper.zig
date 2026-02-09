@@ -53,14 +53,8 @@ pub const ClaudeWrapper = struct {
     }
 
     pub fn run(self: *ClaudeWrapper, task: TaskInfo) !RunResult {
-        const env_map = try self.buildEnvMap(task);
-        defer {
-            var it = env_map.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*);
-            }
-        }
+        var env_map = try self.buildEnvMap(task);
+        defer env_map.deinit();
 
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.allocator);
@@ -77,20 +71,7 @@ pub const ClaudeWrapper = struct {
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
-        var env_array: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
-        defer env_array.deinit(self.allocator);
-
-        var env_it = env_map.iterator();
-        while (env_it.next()) |entry| {
-            const env_str = try std.fmt.allocPrintSentinel(
-                self.allocator,
-                "{s}={s}",
-                .{ entry.key_ptr.*, entry.value_ptr.* },
-                0,
-            );
-            try env_array.append(self.allocator, env_str.ptr);
-        }
-        try env_array.append(self.allocator, null);
+        child.env_map = &env_map;
 
         try child.spawn();
         self.process = child;
@@ -198,25 +179,19 @@ pub const ClaudeWrapper = struct {
         }
     }
 
-    pub fn buildEnvMap(self: *ClaudeWrapper, task: TaskInfo) !std.StringHashMap([]const u8) {
-        var env = std.StringHashMap([]const u8).init(self.allocator);
+    pub fn buildEnvMap(self: *ClaudeWrapper, task: TaskInfo) !std.process.EnvMap {
+        var env = std.process.EnvMap.init(self.allocator);
 
-        try env.put(
-            try self.allocator.dupe(u8, "ANTHROPIC_API_KEY"),
-            try self.allocator.dupe(u8, task.anthropic_api_key),
-        );
-        try env.put(
-            try self.allocator.dupe(u8, "GITHUB_TOKEN"),
-            try self.allocator.dupe(u8, task.github_token),
-        );
-        try env.put(
-            try self.allocator.dupe(u8, "HOME"),
-            try self.allocator.dupe(u8, "/root"),
-        );
-        try env.put(
-            try self.allocator.dupe(u8, "PATH"),
-            try self.allocator.dupe(u8, "/usr/local/bin:/usr/bin:/bin"),
-        );
+        // Essential environment variables for Claude Code to run properly
+        try env.put("HOME", "/root");
+        try env.put("PATH", "/usr/local/bin:/usr/bin:/bin:/root/.local/bin");
+        try env.put("TERM", "xterm-256color");
+        try env.put("USER", "root");
+        try env.put("SHELL", "/bin/bash");
+
+        // Task-specific variables
+        try env.put("ANTHROPIC_API_KEY", task.anthropic_api_key);
+        try env.put("GITHUB_TOKEN", task.github_token);
 
         return env;
     }
@@ -501,14 +476,7 @@ test "buildEnvMap includes required env vars" {
     };
 
     var env = try wrapper.buildEnvMap(task);
-    defer {
-        var it = env.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        env.deinit();
-    }
+    defer env.deinit();
 
     try std.testing.expectEqualStrings("sk-ant-api03-test", env.get("ANTHROPIC_API_KEY").?);
     try std.testing.expectEqualStrings("ghp_testtoken123", env.get("GITHUB_TOKEN").?);
