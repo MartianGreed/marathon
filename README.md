@@ -79,6 +79,38 @@ Key environment variables:
 | `MARATHON_REDIS_URL` | Redis connection string |
 | `GITHUB_TOKEN` | GitHub token for PR creation |
 
+## Local Development
+
+Single script to get everything running locally:
+
+```bash
+# Start everything (postgres, redis, firecracker setup, orchestrator, node_operator)
+./scripts/local-dev.sh start
+
+# Check status
+./scripts/local-dev.sh status
+
+# View logs
+./scripts/local-dev.sh logs              # all services
+./scripts/local-dev.sh logs orchestrator  # orchestrator only
+
+# Stop everything
+./scripts/local-dev.sh stop
+```
+
+**KVM detection:** The script checks for `/dev/kvm`. If available, it automatically:
+- Downloads and installs Firecracker
+- Downloads a compatible kernel (`vmlinux`)
+- Builds the Alpine-based rootfs with Claude Code pre-installed
+- Creates a Firecracker VM snapshot for fast restoration
+- Sets `MARATHON_WARM_POOL_TARGET=5` for VM pre-warming
+
+Without KVM (e.g., most cloud VMs), the script sets `MARATHON_WARM_POOL_TARGET=0` and skips all Firecracker setup. Orchestrator + node_operator still run for API/scheduling testing.
+
+Edit `scripts/local-dev.env` to customize environment variables.
+
+**Prerequisites:** PostgreSQL 16+, Redis 7+ (auto-installed on Ubuntu/Debian if missing).
+
 ## Documentation
 
 - [Node Operator Guide](docs/node-operator.md)

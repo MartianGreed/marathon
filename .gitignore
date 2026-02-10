@@ -22,3 +22,7 @@ coverage/
 __pycache__/
 *.pyc
 .claude-modified-files
+
+# Local dev logs
+logs/
+test-build
