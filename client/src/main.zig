@@ -188,13 +188,28 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         .pr_body = pr_body,
     };
 
-    const response = client.call(.submit_task, request, protocol.TaskEvent) catch |err| {
+    var raw_response = client.callWithHeader(.submit_task, request) catch |err| {
         std.debug.print("Error: Failed to submit task: {}\n", .{err});
         return;
     };
-    defer protocol.freeDecoded(protocol.TaskEvent, allocator, response.payload);
+    defer raw_response.deinit();
 
-    const task_id_str = types.formatId(response.payload.task_id);
+    // Check if server returned an error
+    if (raw_response.header.msg_type == .error_response) {
+        const err_resp = raw_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const event = raw_response.decodeAs(protocol.TaskEvent) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    const task_id_str = types.formatId(event.task_id);
     std.debug.print("{s}\n", .{&task_id_str});
 }
 
