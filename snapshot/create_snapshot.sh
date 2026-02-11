@@ -20,6 +20,7 @@ cleanup() {
     curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/actions' \
         -H 'Content-Type: application/json' \
         -d '{"action_type": "SendCtrlAltDel"}' || true
+    ip link del tap_snap 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -67,6 +68,20 @@ if echo "$VSOCK_RESP" | grep -q "fault_message"; then
     echo "Error: Vsock configuration failed: $VSOCK_RESP"
     exit 1
 fi
+
+echo "Configuring network..."
+TAP_NAME="tap_snap"
+ip tuntap add "$TAP_NAME" mode tap 2>/dev/null || true
+ip addr add 172.16.0.1/30 dev "$TAP_NAME" 2>/dev/null || true
+ip link set "$TAP_NAME" up
+
+curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/network-interfaces/eth0' \
+    -H 'Content-Type: application/json' \
+    -d "{
+        \"iface_id\": \"eth0\",
+        \"guest_mac\": \"AA:FC:00:00:00:01\",
+        \"host_dev_name\": \"$TAP_NAME\"
+    }"
 
 echo "Configuring machine..."
 curl -s --unix-socket "$SOCKET" -X PUT 'http://localhost/machine-config' \

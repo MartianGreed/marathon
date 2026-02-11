@@ -100,10 +100,11 @@ pub const TaskExecutor = struct {
             };
         };
 
-        log.info("task completed: task_id={s} success={} pr_url={s}", .{
+        log.info("task completed: task_id={s} success={} pr_url={s} error={s}", .{
             &types.formatId(request.task_id),
             report.success,
             report.pr_url orelse "none",
+            report.error_message orelse "none",
         });
 
         self.mutex.lock();

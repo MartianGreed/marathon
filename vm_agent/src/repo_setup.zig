@@ -14,47 +14,35 @@ pub const RepoSetup = struct {
     }
 
     pub fn clone(self: *RepoSetup, repo_url: []const u8, branch: []const u8) !void {
+        // Clean workspace to ensure fresh clone (rootfs may be reused)
+        std.fs.deleteTreeAbsolute(self.work_dir) catch {};
         std.fs.makeDirAbsolute(self.work_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
+        // Build authenticated git URL: https://x-access-token:TOKEN@github.com/owner/repo
         const repo_spec = try self.extractRepoSpec(repo_url);
+        const auth_url = try std.fmt.allocPrint(self.allocator, "https://x-access-token:{s}@github.com/{s}", .{ self.github_token, repo_spec });
+        defer self.allocator.free(auth_url);
 
-        var env_map = std.process.EnvMap.init(self.allocator);
-        defer env_map.deinit();
-        try env_map.put("GH_TOKEN", self.github_token);
-        try env_map.put("PATH", "/usr/local/bin:/usr/bin:/bin");
-        try env_map.put("HOME", "/root");
-
-        const gh_args = [_][]const u8{
-            "gh",
-            "repo",
-            "clone",
-            repo_spec,
-            self.work_dir,
-            "--",
-            "--branch",
-            branch,
-            "--depth",
-            "1",
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "git", "clone", "--branch", branch, "--depth", "1", auth_url, self.work_dir },
+            .cwd = null,
+        }) catch |err| {
+            std.log.err("git clone spawn failed: {s}", .{@errorName(err)});
+            return error.GitCloneFailed;
         };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
 
-        var clone_proc = std.process.Child.init(&gh_args, self.allocator);
-        clone_proc.cwd = "/tmp";
-        clone_proc.env_map = &env_map;
-        clone_proc.stderr_behavior = .Pipe;
-        clone_proc.stdout_behavior = .Pipe;
-
-        try clone_proc.spawn();
-        const term = try clone_proc.wait();
-
-        const success = switch (term) {
+        const success = switch (result.term) {
             .Exited => |code| code == 0,
             else => false,
         };
 
         if (!success) {
-            std.log.err("gh repo clone failed for {s}", .{repo_spec});
+            std.log.err("git clone failed for {s}: {s}", .{ repo_spec, result.stderr });
             return error.GitCloneFailed;
         }
 

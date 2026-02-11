@@ -222,6 +222,7 @@ pub const TaskRunner = struct {
             switch (event) {
                 .ready => {},
                 .output => |output| {
+                    log.info("vm output [{s}]: {s}", .{ @tagName(output.output_type), output.data });
                     if (self.output_callback) |cb| {
                         cb(output.output_type, output.data);
                     }

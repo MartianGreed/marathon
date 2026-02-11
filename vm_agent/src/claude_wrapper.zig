@@ -75,6 +75,11 @@ pub const ClaudeWrapper = struct {
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
 
+        // Run Claude Code as non-root user (marathon:marathon, uid/gid 1000)
+        // Claude Code refuses --dangerously-skip-permissions as root
+        child.uid = 1000;
+        child.gid = 1000;
+
         child.env_map = &env_map;
 
         try child.spawn();
@@ -190,10 +195,11 @@ pub const ClaudeWrapper = struct {
         var env = std.process.EnvMap.init(self.allocator);
 
         // Essential environment variables for Claude Code to run properly
-        try env.put("HOME", "/root");
-        try env.put("PATH", "/usr/local/bin:/usr/bin:/bin:/root/.local/bin");
+        // Run as marathon user (Claude Code refuses --dangerously-skip-permissions as root)
+        try env.put("HOME", "/home/marathon");
+        try env.put("PATH", "/usr/local/bin:/usr/bin:/bin:/home/marathon/.local/bin");
         try env.put("TERM", "xterm-256color");
-        try env.put("USER", "root");
+        try env.put("USER", "marathon");
         try env.put("SHELL", "/bin/bash");
 
         // Task-specific variables
@@ -487,7 +493,7 @@ test "buildEnvMap includes required env vars" {
 
     try std.testing.expectEqualStrings("sk-ant-api03-test", env.get("ANTHROPIC_API_KEY").?);
     try std.testing.expectEqualStrings("ghp_testtoken123", env.get("GITHUB_TOKEN").?);
-    try std.testing.expectEqualStrings("/root", env.get("HOME").?);
+    try std.testing.expectEqualStrings("/home/marathon", env.get("HOME").?);
     try std.testing.expect(env.get("PATH") != null);
 }
 
@@ -519,10 +525,10 @@ test "buildEnvMap includes all required environment variables" {
     // Check all expected environment variables are present
     try std.testing.expectEqualStrings("sk-ant-api03-test", env.get("ANTHROPIC_API_KEY").?);
     try std.testing.expectEqualStrings("ghp_testtoken123", env.get("GITHUB_TOKEN").?);
-    try std.testing.expectEqualStrings("/root", env.get("HOME").?);
-    try std.testing.expectEqualStrings("/usr/local/bin:/usr/bin:/bin:/root/.local/bin", env.get("PATH").?);
+    try std.testing.expectEqualStrings("/home/marathon", env.get("HOME").?);
+    try std.testing.expectEqualStrings("/usr/local/bin:/usr/bin:/bin:/home/marathon/.local/bin", env.get("PATH").?);
     try std.testing.expectEqualStrings("xterm-256color", env.get("TERM").?);
-    try std.testing.expectEqualStrings("root", env.get("USER").?);
+    try std.testing.expectEqualStrings("marathon", env.get("USER").?);
     try std.testing.expectEqualStrings("/bin/bash", env.get("SHELL").?);
 }
 
@@ -561,8 +567,8 @@ test "run method spawns process with correct environment variables" {
     // Check that environment variables are present in the output
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "ANTHROPIC_API_KEY=sk-ant-api03-test") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "GITHUB_TOKEN=ghp_testtoken123") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "HOME=/root") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "USER=root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "HOME=/home/marathon") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "USER=marathon") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "SHELL=/bin/bash") != null);
 }
 
