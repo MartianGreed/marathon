@@ -68,11 +68,28 @@ pub const RepoSetup = struct {
     }
 
     pub fn configureDefaults(self: *RepoSetup) !void {
+        // Mark workspace as safe for root (git safe.directory check)
+        self.runGitConfigGlobal("safe.directory", self.work_dir) catch {};
         try self.runGitConfig("user.name", "Marathon Agent");
         try self.runGitConfig("user.email", "marathon@local");
         try self.runGitConfig("credential.helper", "store --file=/tmp/.git-credentials");
 
         try self.writeCredentials();
+    }
+
+    fn runGitConfigGlobal(self: *RepoSetup, key: []const u8, value: []const u8) !void {
+        const args = [_][]const u8{ "git", "config", "--global", "--add", key, value };
+        var proc = std.process.Child.init(&args, self.allocator);
+        try proc.spawn();
+        const term = try proc.wait();
+        const success = switch (term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        if (!success) {
+            std.log.warn("git config --global {s} failed", .{key});
+            return error.GitConfigFailed;
+        }
     }
 
     fn runGitConfig(self: *RepoSetup, key: []const u8, value: []const u8) !void {
