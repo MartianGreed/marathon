@@ -423,16 +423,31 @@ pub const VmPool = struct {
         defer self.mutex.unlock();
 
         if (self.active_vms.fetchRemove(vm_id)) |kv| {
-            const released_vm = kv.value;
-            released_vm.releaseTask();
-            const total = self.warm_vms.items.len + self.active_vms.count() + 1;
-            if (total <= self.config.total_vm_slots) {
-                self.warm_vms.append(self.allocator, released_vm) catch {
-                    released_vm.deinit();
+            var released_vm = kv.value;
+            // Always destroy used VMs — the vm-agent inside has already exited
+            // after serving a task, so the vsock listener is dead. We need a
+            // fresh snapshot restore for the next task.
+            released_vm.stop() catch {};
+            released_vm.deinit();
+
+            // Replenish warm pool with a fresh snapshot-restored VM
+            const total = self.warm_vms.items.len + self.active_vms.count();
+            if (total < self.config.total_vm_slots and self.warm_vms.items.len < self.config.warm_pool_target) {
+                const new_vm = Vm.init(self.allocator) catch return;
+                const vm_config = VmConfig{
+                    .firecracker_bin = self.config.firecracker_bin,
+                    .kernel_path = self.config.kernel_path,
+                    .rootfs_path = self.config.rootfs_path,
+                    .snapshot_path = self.config.snapshot_path,
+                };
+                new_vm.startFromSnapshot(self.snapshot_mgr, vm_config) catch |err| {
+                    std.log.warn("Failed to replenish warm pool: {}", .{err});
+                    new_vm.deinit();
                     return;
                 };
-            } else {
-                released_vm.deinit();
+                self.warm_vms.append(self.allocator, new_vm) catch {
+                    new_vm.deinit();
+                };
             }
         }
     }
@@ -642,7 +657,7 @@ test "pool acquire returns null when empty" {
     var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-empty");
     defer snapshot_mgr.deinit();
 
-    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{ .warm_pool_target = 0 });
     defer pool.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
@@ -657,7 +672,7 @@ test "pool counts start at zero" {
     var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-counts");
     defer snapshot_mgr.deinit();
 
-    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{ .warm_pool_target = 0 });
     defer pool.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), pool.totalCount());
@@ -671,7 +686,7 @@ test "pool release with manual vm insertion" {
     var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-release");
     defer snapshot_mgr.deinit();
 
-    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{ .warm_pool_target = 0 });
     defer pool.deinit();
 
     const vm = try Vm.init(allocator);
@@ -690,25 +705,24 @@ test "pool release with manual vm insertion" {
     try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
 
     pool.release(acquired.?.id);
-    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
+    // VM is destroyed on release (vm-agent exits after task), replenish fails without Firecracker
+    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
 }
 
-test "pool release destroys vm when at capacity" {
+test "pool release always destroys used vm" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-capacity");
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-destroy");
     defer snapshot_mgr.deinit();
 
-    var pool = VmPool.init(allocator, &snapshot_mgr, .{ .total_vm_slots = 2 });
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{ .total_vm_slots = 5, .warm_pool_target = 0 });
     defer pool.deinit();
 
     const vm1 = try Vm.init(allocator);
     vm1.state = .ready;
     const vm2 = try Vm.init(allocator);
     vm2.state = .ready;
-    const vm3 = try Vm.init(allocator);
-    vm3.state = .ready;
 
     pool.mutex.lock();
     try pool.warm_vms.append(allocator, vm1);
@@ -718,47 +732,47 @@ test "pool release destroys vm when at capacity" {
     const acquired = pool.acquire().?;
     const acquired_id = acquired.id;
 
-    pool.mutex.lock();
-    try pool.warm_vms.append(allocator, vm3);
-    pool.mutex.unlock();
-
-    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
 
     pool.release(acquired_id);
-    try std.testing.expectEqual(@as(usize, 2), pool.warmCount());
+    // Used VM destroyed, replenish fails without Firecracker — remaining warm VM stays
+    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
     try std.testing.expectEqual(@as(usize, 0), pool.activeCount());
 }
 
-test "pool acquire-release-acquire reuses recycled vm" {
+test "pool acquire after release gets different vm" {
     const allocator = std.testing.allocator;
 
-    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-recycle");
+    var snapshot_mgr = try snapshot.SnapshotManager.init(allocator, "/tmp/marathon-pool-test-different");
     defer snapshot_mgr.deinit();
 
-    var pool = VmPool.init(allocator, &snapshot_mgr, .{});
+    var pool = VmPool.init(allocator, &snapshot_mgr, .{ .warm_pool_target = 0 });
     defer pool.deinit();
 
-    const vm = try Vm.init(allocator);
-    vm.state = .ready;
-    vm.start_time = std.time.milliTimestamp();
+    const vm1 = try Vm.init(allocator);
+    vm1.state = .ready;
+    vm1.start_time = std.time.milliTimestamp();
+    const vm2 = try Vm.init(allocator);
+    vm2.state = .ready;
+    vm2.start_time = std.time.milliTimestamp();
+    const vm2_id = vm2.id;
 
     pool.mutex.lock();
-    try pool.warm_vms.append(allocator, vm);
+    try pool.warm_vms.append(allocator, vm1);
+    try pool.warm_vms.append(allocator, vm2);
     pool.mutex.unlock();
 
-    const vm1 = pool.acquire().?;
-    const vm1_id = vm1.id;
+    const acquired = pool.acquire().?;
+    const acquired_id = acquired.id;
 
-    pool.release(vm1_id);
-    try std.testing.expectEqual(@as(usize, 1), pool.warmCount());
+    pool.release(acquired_id);
+    // Used VM destroyed, not recycled
 
-    const vm2 = pool.acquire().?;
-    try std.testing.expectEqual(@as(usize, 0), pool.warmCount());
-    try std.testing.expectEqual(@as(usize, 1), pool.activeCount());
-
-    try std.testing.expectEqual(VmState.ready, vm2.state);
-    try std.testing.expect(vm2.task_id == null);
+    const next = pool.acquire().?;
+    // Should get the other warm VM, not the destroyed one
+    try std.testing.expect(!std.mem.eql(u8, &next.id, &acquired_id));
+    _ = vm2_id;
 }
 
 test "vm stop with running process" {

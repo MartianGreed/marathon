@@ -331,8 +331,8 @@ pub const ClientConfig = struct {
     }
 };
 
-test "config from env" {
-    const allocator = std.testing.allocator;
-    const config = try OrchestratorConfig.fromEnv(allocator);
+test "config defaults" {
+    const config = OrchestratorConfig{};
     try std.testing.expectEqual(@as(u16, 8080), config.listen_port);
+    try std.testing.expectEqualStrings("0.0.0.0", config.listen_address);
 }
