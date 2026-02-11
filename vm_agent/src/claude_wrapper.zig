@@ -77,8 +77,11 @@ pub const ClaudeWrapper = struct {
 
         // Run Claude Code as non-root user (marathon:marathon, uid/gid 1000)
         // Claude Code refuses --dangerously-skip-permissions as root
-        child.uid = 1000;
-        child.gid = 1000;
+        // Only set uid/gid when running as root (avoid permission errors in CI/tests)
+        if (std.os.linux.getuid() == 0) {
+            child.uid = 1000;
+            child.gid = 1000;
+        }
 
         child.env_map = &env_map;
 
