@@ -70,18 +70,18 @@ install_zig() {
         return
     fi
     # Check common local install paths
-    for p in /tmp/zig-linux-x86_64-*/zig /usr/local/bin/zig; do
+    for p in /tmp/zig-x86_64-linux-*/zig /tmp/zig-linux-x86_64-*/zig /usr/local/bin/zig; do
         if [[ -x "$p" ]]; then
             export PATH="$(dirname "$p"):$PATH"
             ok "Zig: $(zig version)"
             return
         fi
     done
-    info "Installing Zig 0.14.0..."
+    info "Installing Zig 0.15.2..."
     cd /tmp
-    curl -sL "https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz" -o zig.tar.xz
+    curl -sL "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz" -o zig.tar.xz
     tar xf zig.tar.xz && rm zig.tar.xz
-    export PATH="/tmp/zig-linux-x86_64-0.14.0:$PATH"
+    export PATH="/tmp/zig-x86_64-linux-0.15.2:$PATH"
     ok "Zig installed: $(zig version)"
 }
 
