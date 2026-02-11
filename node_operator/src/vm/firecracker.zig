@@ -423,16 +423,31 @@ pub const VmPool = struct {
         defer self.mutex.unlock();
 
         if (self.active_vms.fetchRemove(vm_id)) |kv| {
-            const released_vm = kv.value;
-            released_vm.releaseTask();
-            const total = self.warm_vms.items.len + self.active_vms.count() + 1;
-            if (total <= self.config.total_vm_slots) {
-                self.warm_vms.append(self.allocator, released_vm) catch {
-                    released_vm.deinit();
+            var released_vm = kv.value;
+            // Always destroy used VMs — the vm-agent inside has already exited
+            // after serving a task, so the vsock listener is dead. We need a
+            // fresh snapshot restore for the next task.
+            released_vm.stop() catch {};
+            released_vm.deinit();
+
+            // Replenish warm pool with a fresh snapshot-restored VM
+            const total = self.warm_vms.items.len + self.active_vms.count();
+            if (total < self.config.total_vm_slots and self.warm_vms.items.len < self.config.warm_pool_target) {
+                const new_vm = Vm.init(self.allocator) catch return;
+                const vm_config = VmConfig{
+                    .firecracker_bin = self.config.firecracker_bin,
+                    .kernel_path = self.config.kernel_path,
+                    .rootfs_path = self.config.rootfs_path,
+                    .snapshot_path = self.config.snapshot_path,
+                };
+                new_vm.startFromSnapshot(self.snapshot_mgr, vm_config) catch |err| {
+                    std.log.err("Failed to replenish warm pool: {}", .{err});
+                    new_vm.deinit();
                     return;
                 };
-            } else {
-                released_vm.deinit();
+                self.warm_vms.append(self.allocator, new_vm) catch {
+                    new_vm.deinit();
+                };
             }
         }
     }
