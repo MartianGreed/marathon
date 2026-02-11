@@ -28,6 +28,7 @@ pub const Vm = struct {
     start_time: ?i64,
     tap_name: ?[]const u8,
     vm_index: u32,
+    rootfs_copy_path: ?[]const u8,
 
     var socket_dir_initialized: bool = false;
     var socket_dir_buf: [64]u8 = undefined;
@@ -97,6 +98,7 @@ pub const Vm = struct {
             .start_time = null,
             .tap_name = null,
             .vm_index = vm_index,
+            .rootfs_copy_path = null,
         };
 
         return vm;
@@ -109,9 +111,56 @@ pub const Vm = struct {
 
     pub fn deinit(self: *Vm) void {
         self.stop() catch {};
+        // Clean up per-VM rootfs copy
+        if (self.rootfs_copy_path) |path| {
+            std.fs.deleteFileAbsolute(path) catch |err| {
+                std.log.warn("Failed to delete VM rootfs copy {s}: {}", .{ path, err });
+            };
+            self.allocator.free(path);
+            self.rootfs_copy_path = null;
+        }
         self.allocator.free(self.socket_path);
         self.allocator.free(self.vsock_uds_path);
         self.allocator.destroy(self);
+    }
+
+    fn copyRootfs(self: *Vm, base_rootfs: []const u8) ![]const u8 {
+        const vm_id_str = types.formatId(self.id);
+        const dest = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ base_rootfs, vm_id_str });
+        errdefer self.allocator.free(dest);
+
+        // Try cp --reflink=auto for CoW, fall back to regular copy
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "cp", "--reflink=auto", base_rootfs, dest },
+        }) catch {
+            // Fallback: use Zig's copyFile
+            std.fs.copyFileAbsolute(base_rootfs, dest, .{}) catch |err| {
+                std.log.err("Failed to copy rootfs to {s}: {}", .{ dest, err });
+                return error.RootfsCopyFailed;
+            };
+            self.rootfs_copy_path = dest;
+            return dest;
+        };
+        self.allocator.free(result.stdout);
+        self.allocator.free(result.stderr);
+
+        const success = switch (result.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+
+        if (!success) {
+            // Fallback
+            std.fs.copyFileAbsolute(base_rootfs, dest, .{}) catch |err| {
+                std.log.err("Failed to copy rootfs to {s}: {}", .{ dest, err });
+                return error.RootfsCopyFailed;
+            };
+        }
+
+        self.rootfs_copy_path = dest;
+        std.log.info("Created per-VM rootfs copy: {s}", .{dest});
+        return dest;
     }
 
     pub fn start(self: *Vm, config: VmConfig) !void {
@@ -131,6 +180,9 @@ pub const Vm = struct {
             std.log.err("Rootfs not found at {s}", .{config.rootfs_path});
             return error.RootfsNotFound;
         };
+
+        // Create per-VM rootfs copy to avoid shared state between VMs
+        const vm_rootfs = try self.copyRootfs(config.rootfs_path);
 
         std.fs.cwd().deleteFile(self.socket_path) catch {};
         std.fs.cwd().deleteFile(self.vsock_uds_path) catch {};
@@ -160,7 +212,7 @@ pub const Vm = struct {
         const boot_body = try std.fmt.bufPrint(&buf, "{{\"kernel_image_path\":\"{s}\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off marathon.vm_index={d}\"}}", .{ config.kernel_path, self.vm_index });
         try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/boot-source", boot_body);
 
-        const rootfs_body = try std.fmt.bufPrint(&buf, "{{\"drive_id\":\"rootfs\",\"path_on_host\":\"{s}\",\"is_root_device\":true,\"is_read_only\":false}}", .{config.rootfs_path});
+        const rootfs_body = try std.fmt.bufPrint(&buf, "{{\"drive_id\":\"rootfs\",\"path_on_host\":\"{s}\",\"is_root_device\":true,\"is_read_only\":false}}", .{vm_rootfs});
         try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/drives/rootfs", rootfs_body);
 
         const vsock_body = try std.fmt.bufPrint(&buf, "{{\"vsock_id\":\"vsock0\",\"guest_cid\":{d},\"uds_path\":\"{s}\"}}", .{ self.vsock_cid, self.vsock_uds_path });
