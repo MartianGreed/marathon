@@ -14,6 +14,8 @@ pub const VmState = enum {
 
 const snapshot_vsock_path = "/run/marathon/snapshot-base-vsock.sock";
 
+const network = @import("network.zig");
+
 pub const Vm = struct {
     allocator: std.mem.Allocator,
     id: types.VmId,
@@ -24,6 +26,8 @@ pub const Vm = struct {
     vsock_cid: u32,
     task_id: ?types.TaskId,
     start_time: ?i64,
+    tap_name: ?[]const u8,
+    vm_index: u32,
 
     var socket_dir_initialized: bool = false;
     var socket_dir_buf: [64]u8 = undefined;
@@ -80,6 +84,7 @@ pub const Vm = struct {
             .{ socket_dir, types.formatId(id) },
         );
 
+        const vm_index = nextVmIndex();
         vm.* = .{
             .allocator = allocator,
             .id = id,
@@ -90,9 +95,16 @@ pub const Vm = struct {
             .vsock_cid = generateCid(),
             .task_id = null,
             .start_time = null,
+            .tap_name = null,
+            .vm_index = vm_index,
         };
 
         return vm;
+    }
+
+    var vm_index_counter: u32 = 0;
+    fn nextVmIndex() u32 {
+        return @atomicRmw(u32, &vm_index_counter, .Add, 1, .seq_cst);
     }
 
     pub fn deinit(self: *Vm) void {
@@ -145,7 +157,7 @@ pub const Vm = struct {
         };
 
         var buf: [4096]u8 = undefined;
-        const boot_body = try std.fmt.bufPrint(&buf, "{{\"kernel_image_path\":\"{s}\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off\"}}", .{config.kernel_path});
+        const boot_body = try std.fmt.bufPrint(&buf, "{{\"kernel_image_path\":\"{s}\",\"boot_args\":\"console=ttyS0 reboot=k panic=1 pci=off marathon.vm_index={d}\"}}", .{ config.kernel_path, self.vm_index });
         try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/boot-source", boot_body);
 
         const rootfs_body = try std.fmt.bufPrint(&buf, "{{\"drive_id\":\"rootfs\",\"path_on_host\":\"{s}\",\"is_root_device\":true,\"is_read_only\":false}}", .{config.rootfs_path});
@@ -153,6 +165,18 @@ pub const Vm = struct {
 
         const vsock_body = try std.fmt.bufPrint(&buf, "{{\"vsock_id\":\"vsock0\",\"guest_cid\":{d},\"uds_path\":\"{s}\"}}", .{ self.vsock_cid, self.vsock_uds_path });
         try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/vsock", vsock_body);
+
+        // Setup networking
+        self.tap_name = network.createTap(self.allocator, self.vm_index) catch |err| blk: {
+            std.log.warn("Failed to create TAP device: {} - VM will have no network", .{err});
+            break :blk null;
+        };
+        if (self.tap_name) |tap| {
+            var mac_buf: [32]u8 = undefined;
+            const mac = try network.macAddress(self.vm_index, &mac_buf);
+            const net_body = try std.fmt.bufPrint(&buf, "{{\"iface_id\":\"eth0\",\"guest_mac\":\"{s}\",\"host_dev_name\":\"{s}\"}}", .{ mac, tap });
+            try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/network-interfaces/eth0", net_body);
+        }
 
         const machine_body = try std.fmt.bufPrint(&buf, "{{\"vcpu_count\":{d},\"mem_size_mib\":{d}}}", .{ config.vcpu_count, config.mem_size_mib });
         try firecrackerApiCall(self.allocator, self.socket_path, "PUT", "/machine-config", machine_body);
@@ -170,6 +194,11 @@ pub const Vm = struct {
     }
 
     pub fn startFromSnapshot(self: *Vm, snapshot_mgr: *snapshot.SnapshotManager, config: VmConfig) !void {
+        // Always use cold start — snapshot restore doesn't support per-VM networking
+        // TODO: optimize with snapshot + virtio-net passthrough later
+        if (true) {
+            return self.start(config);
+        }
         const base_snapshot = snapshot_mgr.getDefaultSnapshot() orelse {
             std.log.warn("No base snapshot available, falling back to cold start", .{});
             return self.start(config);
@@ -260,6 +289,11 @@ pub const Vm = struct {
         }
         std.fs.cwd().deleteFile(self.socket_path) catch {};
         std.fs.cwd().deleteFile(self.vsock_uds_path) catch {};
+        if (self.tap_name) |tap| {
+            network.destroyTap(self.allocator, tap);
+            self.allocator.free(tap);
+            self.tap_name = null;
+        }
         self.state = .stopped;
     }
 

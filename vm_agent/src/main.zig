@@ -12,6 +12,15 @@ const cleanup = @import("cleanup.zig");
 const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
 pub fn main() !void {
+    // Redirect stderr to log file for persistent logging
+    // OpenRC's output_log/error_log may not capture all output
+    if (std.fs.createFileAbsolute("/var/log/marathon-agent-debug.log", .{ .truncate = true })) |log_file| {
+        const log_fd = log_file.handle;
+        // dup2 the log file to stderr (fd 2)
+        std.posix.dup2(log_fd, 2) catch {};
+        std.posix.close(log_fd);
+    } else |_| {}
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -44,6 +53,9 @@ pub fn main() !void {
 
     const prompt_wrap = prompt_wrapper.PromptWrapper.init();
     var cleaner = cleanup.Cleanup.initWithStrategy(cleanup.CleanupStrategy.fromString(config.cleanup_strategy));
+
+    // Wait for network to be ready (init scripts may not have finished)
+    waitForNetwork(allocator);
 
     var task: claude_wrapper.TaskInfo = undefined;
     while (true) {
@@ -144,6 +156,28 @@ pub fn main() !void {
 
     std.log.warn("Max iterations ({d}) reached without completion promise", .{max_iterations});
     try client.sendError("max_iterations", "Reached iteration limit without completion");
+}
+
+fn waitForNetwork(allocator: std.mem.Allocator) void {
+    // Wait up to 30s for network connectivity (DNS resolution)
+    var attempt: u32 = 0;
+    while (attempt < 15) : (attempt += 1) {
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "ping", "-c", "1", "-W", "1", "8.8.8.8" },
+        }) catch {
+            common.compat.sleep(2 * std.time.ns_per_s);
+            continue;
+        };
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        if (result.term.Exited == 0) {
+            std.log.info("Network ready after {d} attempts", .{attempt + 1});
+            return;
+        }
+        common.compat.sleep(2 * std.time.ns_per_s);
+    }
+    std.log.warn("Network not available after 30s, continuing anyway", .{});
 }
 
 fn extractRepoName(repo_url: []const u8) []const u8 {

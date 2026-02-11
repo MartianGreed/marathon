@@ -79,6 +79,15 @@ EOF
 }
 EOF
 
+    # Create marathon user for running Claude Code (can't use --dangerously-skip-permissions as root)
+    echo "marathon:x:1000:1000:Marathon:/home/marathon:/bin/bash" >> "$ROOTFS_DIR/etc/passwd"
+    echo "marathon:x:1000:" >> "$ROOTFS_DIR/etc/group"
+    echo "marathon:!:19000:0:99999:7:::" >> "$ROOTFS_DIR/etc/shadow" 2>/dev/null || true
+    mkdir -p "$ROOTFS_DIR/home/marathon/.config/claude-code"
+    cp "$ROOTFS_DIR/root/.config/claude-code/settings.json" "$ROOTFS_DIR/home/marathon/.config/claude-code/"
+    mkdir -p "$ROOTFS_DIR/workspace"
+    chown -R 1000:1000 "$ROOTFS_DIR/home/marathon" "$ROOTFS_DIR/workspace"
+
     cat > "$ROOTFS_DIR/etc/init.d/marathon-agent" << 'EOF'
 #!/sbin/openrc-run
 
@@ -92,12 +101,46 @@ error_log="/var/log/marathon-agent.log"
 
 depend() {
     need localmount
-    after bootmisc
+    after bootmisc marathon-network
+}
+
+start_pre() {
+    chown marathon:marathon /workspace
 }
 EOF
     chmod +x "$ROOTFS_DIR/etc/init.d/marathon-agent"
 
+    # Network configuration script - configures eth0 on boot
+    # Uses MAC address last byte to determine subnet: 172.16.X.2/30 where X = last octet of MAC
+    cat > "$ROOTFS_DIR/etc/init.d/marathon-network" << 'NETEOF'
+#!/sbin/openrc-run
+
+name="marathon-network"
+description="Configure VM network"
+
+depend() {
+    before marathon-agent
+    need localmount
+}
+
+start() {
+    ebegin "Configuring network"
+    # Extract VM index from kernel cmdline
+    VM_INDEX=$(cat /proc/cmdline 2>/dev/null | tr ' ' '\n' | grep 'marathon.vm_index=' | cut -d= -f2 || echo "0")
+    [ -z "$VM_INDEX" ] && VM_INDEX=0
+    GATEWAY="172.16.${VM_INDEX}.1"
+    GUEST_IP="172.16.${VM_INDEX}.2"
+
+    ip link set eth0 up 2>/dev/null
+    ip addr add "${GUEST_IP}/30" dev eth0 2>/dev/null || true
+    ip route add default via "${GATEWAY}" 2>/dev/null || true
+    eend $?
+}
+NETEOF
+    chmod +x "$ROOTFS_DIR/etc/init.d/marathon-network"
+
     mkdir -p "$ROOTFS_DIR/etc/runlevels/default"
+    ln -sf /etc/init.d/marathon-network "$ROOTFS_DIR/etc/runlevels/default/marathon-network"
     ln -sf /etc/init.d/marathon-agent "$ROOTFS_DIR/etc/runlevels/default/marathon-agent"
 
     echo "Installing marathon-vm-agent..."
