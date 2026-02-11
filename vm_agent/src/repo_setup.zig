@@ -20,6 +20,15 @@ pub const RepoSetup = struct {
             if (err != error.PathAlreadyExists) return err;
         };
 
+        // Chown workspace to marathon user (uid 1000) so Claude Code can write to it
+        if (std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "chown", "-R", "1000:1000", self.work_dir },
+        })) |r| {
+            self.allocator.free(r.stdout);
+            self.allocator.free(r.stderr);
+        } else |_| {}
+
         // Build authenticated git URL: https://x-access-token:TOKEN@github.com/owner/repo
         const repo_spec = try self.extractRepoSpec(repo_url);
         const auth_url = try std.fmt.allocPrint(self.allocator, "https://x-access-token:{s}@github.com/{s}", .{ self.github_token, repo_spec });
@@ -45,6 +54,15 @@ pub const RepoSetup = struct {
             std.log.err("git clone failed for {s}: {s}", .{ repo_spec, result.stderr });
             return error.GitCloneFailed;
         }
+
+        // Chown cloned files to marathon user so Claude Code can modify them
+        if (std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "chown", "-R", "1000:1000", self.work_dir },
+        })) |r| {
+            self.allocator.free(r.stdout);
+            self.allocator.free(r.stderr);
+        } else |_| {}
 
         std.log.info("Cloned {s} to {s}", .{ repo_spec, self.work_dir });
     }
