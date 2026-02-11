@@ -21,12 +21,12 @@ set -euo pipefail
 API_BASE="https://api.latitude.sh"
 PROJECT_ID="${LATITUDE_PROJECT_ID:-proj_mgWeN6doeaYd7}"
 PLAN="c1-tiny-x86"
-SITE="US"
+SITE="MIA2"
 OS="ubuntu_22_04_x64_lts"
 HOSTNAME_PREFIX="marathon-e2e"
 COST_PER_HOUR="0.09"
 REPO_URL="https://github.com/MartianGreed/marathon.git"
-REPO_BRANCH="feat/local-dev-script"
+REPO_BRANCH="${MARATHON_E2E_BRANCH:-main}"
 
 STATE_DIR="/tmp/marathon-e2e"
 STATE_FILE="$STATE_DIR/state.json"
@@ -132,13 +132,12 @@ apt-get update -y
 apt-get install -y git
 
 # Clone repo
-cd /root
-git clone -b BRANCH_PLACEHOLDER REPO_PLACEHOLDER marathon
-cd marathon
+git clone -b BRANCH_PLACEHOLDER REPO_PLACEHOLDER /opt/marathon
+cd /opt/marathon
 
 # Run the full local-dev setup
 chmod +x scripts/local-dev.sh
-./scripts/local-dev.sh start
+bash scripts/local-dev.sh start
 
 # Mark completion
 echo "setup_complete $(date +%s)" > /tmp/marathon-setup-complete
@@ -159,8 +158,28 @@ do_provision() {
     local ssh_key_id
     ssh_key_id=$(setup_ssh_key)
 
-    local userdata
-    userdata=$(get_userdata)
+    # Create user_data resource on Latitude
+    local userdata_content
+    userdata_content=$(get_userdata | base64 -w0)
+
+    info "Creating user_data resource on Latitude..."
+    # Clean up any old user_data resources
+    local old_ud_id
+    old_ud_id=$(api GET /user_data | jq -r '.data[]? | select(.attributes.description == "marathon-e2e-bootstrap") | .id' | head -1)
+    if [[ -n "$old_ud_id" ]]; then
+        api DELETE "/user_data/$old_ud_id" || true
+    fi
+
+    local ud_resp
+    ud_resp=$(api_or_die POST /user_data -d "$(jq -n \
+        --arg content "$userdata_content" \
+        --arg desc "marathon-e2e-bootstrap" \
+        '{data: {type: "user_data", attributes: {description: $desc, content: $content}}}'
+    )")
+    local userdata_id
+    userdata_id=$(echo "$ud_resp" | jq -r '.data.id')
+    [[ -n "$userdata_id" && "$userdata_id" != "null" ]] || die "Failed to create user_data resource"
+    ok "User data created: $userdata_id"
 
     info "Creating server ($PLAN, $SITE, $OS)..."
     local resp
@@ -171,11 +190,11 @@ do_provision() {
         --arg os "$OS" \
         --arg hostname "$HOSTNAME_PREFIX-$(date +%s)" \
         --arg ssh_key "$ssh_key_id" \
-        --arg userdata "$userdata" \
+        --arg userdata_id "$userdata_id" \
         '{data: {type: "servers", attributes: {
             project: $project, plan: $plan, site: $site,
             operating_system: $os, hostname: $hostname,
-            ssh_keys: [$ssh_key], user_data: $userdata
+            ssh_keys: [$ssh_key], user_data: $userdata_id
         }}}'
     )")
 
@@ -218,7 +237,7 @@ do_provision() {
     info "Waiting for SSH..."
     deadline=$(($(date +%s) + 300))
     while [[ $(date +%s) -lt $deadline ]]; do
-        if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "echo ok" &>/dev/null; then
+        if ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "echo ok" &>/dev/null; then
             ok "SSH accessible"
             break
         fi
@@ -229,13 +248,13 @@ do_provision() {
     info "Waiting for cloud-init to complete (timeout: ${CLOUDINIT_TIMEOUT}s)..."
     deadline=$(($(date +%s) + CLOUDINIT_TIMEOUT))
     while [[ $(date +%s) -lt $deadline ]]; do
-        if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "test -f /tmp/marathon-setup-complete" &>/dev/null; then
+        if ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "test -f /tmp/marathon-setup-complete" &>/dev/null; then
             ok "Cloud-init complete!"
             break
         fi
         # Show progress
         local log_tail
-        log_tail=$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "tail -1 /var/log/marathon-setup.log 2>/dev/null" 2>/dev/null || echo "waiting...")
+        log_tail=$(ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "tail -1 /var/log/marathon-setup.log 2>/dev/null" 2>/dev/null || echo "waiting...")
         printf "  %s\r" "$log_tail"
         sleep 20
     done
@@ -260,7 +279,7 @@ do_test() {
     run_test() {
         local name="$1" cmd="$2"
         total=$((total+1))
-        if ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "$cmd" &>/dev/null; then
+        if ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "$cmd" &>/dev/null; then
             ok "PASS: $name"; passed=$((passed+1))
         else
             err "FAIL: $name"; failed=$((failed+1))
@@ -271,7 +290,7 @@ do_test() {
         local name="$1" cmd="$2"
         total=$((total+1))
         local output
-        output=$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "$cmd" 2>/dev/null) || true
+        output=$(ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "$cmd" 2>/dev/null) || true
         if [[ -n "$output" ]]; then
             ok "PASS: $name — $output"; passed=$((passed+1))
         else
@@ -292,12 +311,12 @@ do_test() {
     echo
     info "=== Integration Tests ==="
     run_test "Node operator registered with orchestrator" \
-        "grep -q 'registered\|registration\|connected' /root/marathon/logs/node_operator*.log 2>/dev/null || journalctl -u marathon-node-operator --no-pager 2>/dev/null | grep -qi 'register'"
+        "grep -q 'registered\|registration\|connected' /opt/marathon/logs/node_operator*.log 2>/dev/null || journalctl -u marathon-node-operator --no-pager 2>/dev/null | grep -qi 'register'"
 
     # Check warm pool
     local warm_pool_output
-    warm_pool_output=$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" \
-        "grep -o 'Warm pool initialized: [0-9]* VMs ready' /root/marathon/logs/*.log 2>/dev/null || echo ''" 2>/dev/null)
+    warm_pool_output=$(ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" \
+        "grep -o 'Warm pool initialized: [0-9]* VMs ready' /opt/marathon/logs/*.log 2>/dev/null || echo ''" 2>/dev/null)
     total=$((total+1))
     if [[ "$warm_pool_output" =~ "VMs ready" ]]; then
         local vm_count
@@ -311,8 +330,8 @@ do_test() {
             info "=== Task Submission Test ==="
             total=$((total+1))
             local task_output
-            task_output=$(ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" \
-                "cd /root/marathon && ./zig-out/bin/marathon-client submit --task 'echo hello-marathon' 2>&1 || true" 2>/dev/null)
+            task_output=$(ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" \
+                "cd /opt/marathon && ./zig-out/bin/marathon-client submit --task 'echo hello-marathon' 2>&1 || true" 2>/dev/null)
             if [[ -n "$task_output" ]]; then
                 ok "PASS: Task submitted — $task_output"
                 passed=$((passed+1))
@@ -329,7 +348,7 @@ do_test() {
     # Collect logs summary
     echo
     info "=== Setup Log Summary ==="
-    ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" \
+    ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" \
         "tail -20 /var/log/marathon-setup.log 2>/dev/null" 2>/dev/null || true
 
     echo
@@ -353,6 +372,15 @@ do_teardown() {
     fi
 
     delete_ssh_key
+
+    # Clean up user_data
+    local ud_id
+    ud_id=$(api GET /user_data | jq -r '.data[]? | select(.attributes.description == "marathon-e2e-bootstrap") | .id' | head -1)
+    if [[ -n "$ud_id" ]]; then
+        info "Deleting user_data $ud_id..."
+        api DELETE "/user_data/$ud_id" || true
+        ok "User data deleted"
+    fi
 
     # Cost summary
     local start_ts
