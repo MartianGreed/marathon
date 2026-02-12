@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const common = @import("common");
 const types = common.types;
 const protocol = common.protocol;
+const OutputBuffer = @import("../task/output_buffer.zig").OutputBuffer;
 
 const log = std.log.scoped(.vsock_handler);
 
@@ -165,6 +166,7 @@ pub const TaskRunner = struct {
     task_id: types.TaskId,
     metrics: types.UsageMetrics,
     output_callback: ?*const fn (types.OutputType, []const u8) void,
+    output_buffer: ?*OutputBuffer = null,
 
     pub fn init(allocator: std.mem.Allocator, uds_path: []const u8, port: u32, task_id: types.TaskId) TaskRunner {
         return .{
@@ -225,6 +227,9 @@ pub const TaskRunner = struct {
                     log.info("vm output [{s}]: {s}", .{ @tagName(output.output_type), output.data });
                     if (self.output_callback) |cb| {
                         cb(output.output_type, output.data);
+                    }
+                    if (self.output_buffer) |buf| {
+                        buf.push(self.task_id, output.output_type, output.data);
                     }
                 },
                 .metrics => |m| {

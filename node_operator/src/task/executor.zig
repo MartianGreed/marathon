@@ -4,6 +4,7 @@ const types = common.types;
 const protocol = common.protocol;
 const vm = @import("../vm/firecracker.zig");
 const vsock = @import("../vsock/handler.zig");
+const OutputBuffer = @import("output_buffer.zig").OutputBuffer;
 
 const log = std.log.scoped(.task_executor);
 
@@ -12,16 +13,19 @@ pub const TaskExecutor = struct {
     vm_pool: *vm.VmPool,
     mutex: std.Thread.Mutex = .{},
     completed_results: std.ArrayListUnmanaged(protocol.TaskResultReport) = .empty,
+    output_buffer: OutputBuffer,
 
     pub fn init(allocator: std.mem.Allocator, vm_pool: *vm.VmPool) TaskExecutor {
         return .{
             .allocator = allocator,
             .vm_pool = vm_pool,
+            .output_buffer = OutputBuffer.init(allocator),
         };
     }
 
     pub fn deinit(self: *TaskExecutor) void {
         self.completed_results.deinit(self.allocator);
+        self.output_buffer.deinit();
     }
 
     pub fn drainResults(self: *TaskExecutor) []protocol.TaskResultReport {
@@ -29,6 +33,10 @@ pub const TaskExecutor = struct {
         defer self.mutex.unlock();
 
         return self.completed_results.toOwnedSlice(self.allocator) catch return &[_]protocol.TaskResultReport{};
+    }
+
+    pub fn drainOutput(self: *TaskExecutor) []protocol.TaskOutputEvent {
+        return self.output_buffer.drain();
     }
 
     pub fn executeTask(self: *TaskExecutor, request: protocol.ExecuteTaskRequest) !void {
@@ -65,6 +73,10 @@ pub const TaskExecutor = struct {
             request.task_id,
         );
         defer runner.deinit();
+
+        // Wire up output forwarding to the shared output buffer.
+        // The heartbeat drains this buffer and forwards events to the orchestrator.
+        runner.output_buffer = &self.output_buffer;
 
         const vsock_payload = protocol.VsockStartPayload{
             .task_id = request.task_id,
