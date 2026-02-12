@@ -263,9 +263,9 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     }
 
     // Follow mode: poll for task events until terminal state
-    const stdout = std.io.getStdOut().writer();
-    stdout.print("⏳ Task submitted: {s}\n", .{&task_id_str}) catch {};
-    stdout.print("📋 State: {s}\n", .{@tagName(event.state)}) catch {};
+    
+    std.debug.print("⏳ Task submitted: {s}\n", .{&task_id_str});
+    std.debug.print("📋 State: {s}\n", .{@tagName(event.state)});
 
     // Close the submit connection and poll with get_task + get_task_events
     client.close();
@@ -273,7 +273,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     defer poll_client.close();
 
     poll_client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
-        stdout.print("⚠️  Failed to connect for follow mode: {}\n", .{err}) catch {};
+        std.debug.print("⚠️  Failed to connect for follow mode: {}\n", .{err});
         return;
     };
 
@@ -288,7 +288,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
             var simple_resp = poll_client.callWithHeader(.get_task, protocol.GetTaskRequest{
                 .task_id = event.task_id,
             }) catch {
-                stdout.print("⚠️  Connection lost: {}\n", .{err}) catch {};
+                std.debug.print("⚠️  Connection lost: {}\n", .{err});
                 break;
             };
             defer simple_resp.deinit();
@@ -297,48 +297,48 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
                 const r = simple_resp.decodeAs(protocol.TaskResponse) catch continue;
                 if (r.state != last_state) {
                     last_state = r.state;
-                    printStateChange(stdout, r.state);
+                    printStateChange(r.state);
                 }
                 if (r.state.isTerminal()) {
-                    if (r.error_message) |msg| stdout.print("   Error: {s}\n", .{msg}) catch {};
-                    if (r.pr_url) |url| stdout.print("   PR: {s}\n", .{url}) catch {};
+                    if (r.error_message) |msg| std.debug.print("   Error: {s}\n", .{msg});
+                    if (r.pr_url) |url| std.debug.print("   PR: {s}\n", .{url});
                     break;
                 }
             }
-            std.time.sleep(2 * std.time.ns_per_s);
+            common.compat.sleep(2 * std.time.ns_per_s);
             continue;
         };
         defer status_resp.deinit();
 
         if (status_resp.header.msg_type == .task_events_response) {
             const events_resp = status_resp.decodeAs(protocol.TaskEventsResponse) catch {
-                std.time.sleep(2 * std.time.ns_per_s);
+                common.compat.sleep(2 * std.time.ns_per_s);
                 continue;
             };
 
             if (events_resp.state != last_state) {
                 last_state = events_resp.state;
-                printStateChange(stdout, events_resp.state);
+                printStateChange(events_resp.state);
             }
 
             for (events_resp.events) |evt| {
                 if (evt.data.len > 0) {
-                    stdout.print("📋 {s}\n", .{evt.data}) catch {};
+                    std.debug.print("📋 {s}\n", .{evt.data});
                 }
             }
 
             if (events_resp.state.isTerminal()) {
-                if (events_resp.error_message) |msg| stdout.print("   Error: {s}\n", .{msg}) catch {};
-                if (events_resp.pr_url) |url| stdout.print("   PR: {s}\n", .{url}) catch {};
+                if (events_resp.error_message) |msg| std.debug.print("   Error: {s}\n", .{msg});
+                if (events_resp.pr_url) |url| std.debug.print("   PR: {s}\n", .{url});
                 break;
             }
         }
 
-        std.time.sleep(2 * std.time.ns_per_s);
+        common.compat.sleep(2 * std.time.ns_per_s);
     }
 }
 
-fn printStateChange(writer: anytype, state: types.TaskState) void {
+fn printStateChange(state: types.TaskState) void {
     const icon: []const u8 = switch (state) {
         .queued => "⏳",
         .starting => "🖥️ ",
@@ -348,7 +348,7 @@ fn printStateChange(writer: anytype, state: types.TaskState) void {
         .cancelled => "🚫",
         .unspecified => "❓",
     };
-    writer.print("{s} State: {s}\n", .{ icon, @tagName(state) }) catch {};
+    std.debug.print("{s} State: {s}\n", .{ icon, @tagName(state) });
 }
 
 fn handleStatus(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
