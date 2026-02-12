@@ -68,13 +68,40 @@ pub const RepoSetup = struct {
     }
 
     pub fn configureDefaults(self: *RepoSetup) !void {
-        // Mark workspace as safe for root (git safe.directory check)
+        // Mark workspace as safe for root (vm_agent runs as root)
         self.runGitConfigGlobal("safe.directory", self.work_dir) catch {};
+
+        // Mark workspace as safe for marathon user (uid 1000) who runs Claude Code.
+        // Without this, git refuses to operate in a directory owned by a different user.
+        self.runGitConfigForUser("safe.directory", self.work_dir) catch {};
+
         try self.runGitConfig("user.name", "Marathon Agent");
         try self.runGitConfig("user.email", "marathon@local");
         try self.runGitConfig("credential.helper", "store --file=/tmp/.git-credentials");
 
         try self.writeCredentials();
+    }
+
+    /// Run git config --global as the marathon user (uid 1000) so that Claude Code
+    /// inherits the setting. Writes to /home/marathon/.gitconfig.
+    fn runGitConfigForUser(self: *RepoSetup, key: []const u8, value: []const u8) !void {
+        const cmd = std.fmt.allocPrint(self.allocator, "git config --global --add {s} {s}", .{ key, value }) catch return error.GitConfigFailed;
+        defer self.allocator.free(cmd);
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "su", "-s", "/bin/sh", "marathon", "-c", cmd },
+        }) catch return error.GitConfigFailed;
+        self.allocator.free(result.stdout);
+        self.allocator.free(result.stderr);
+
+        const success = switch (result.term) {
+            .Exited => |code| code == 0,
+            else => false,
+        };
+        if (!success) {
+            std.log.warn("git config --global (as marathon) {s} failed", .{key});
+            return error.GitConfigFailed;
+        }
     }
 
     fn runGitConfigGlobal(self: *RepoSetup, key: []const u8, value: []const u8) !void {
@@ -123,6 +150,15 @@ pub const RepoSetup = struct {
         defer self.allocator.free(creds);
 
         try file.writeAll(creds);
+
+        // Chown credentials file to marathon user (uid 1000) so Claude Code can read it.
+        // Without this, credential.helper fails because the file is root-owned with mode 0600.
+        const chown = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &.{ "chown", "1000:1000", creds_path },
+        }) catch return;
+        self.allocator.free(chown.stdout);
+        self.allocator.free(chown.stderr);
     }
 
     fn extractRepoSpec(self: *RepoSetup, repo_url: []const u8) ![]const u8 {
