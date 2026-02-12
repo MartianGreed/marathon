@@ -324,6 +324,9 @@ pub const Server = struct {
                         .pr_body = task.pr_body,
                         .timeout_ms = 600000,
                         .max_tokens = 100000,
+                        .env_vars = task.env_vars,
+                        .max_iterations = task.max_iterations,
+                        .completion_promise = task.completion_promise,
                     },
                 }) catch {
                     log.err("failed to build command for task_id={s}", .{&types.formatId(task.id)});
@@ -441,6 +444,9 @@ pub const RequestHandler = struct {
         task.pr_title = request.pr_title;
         task.pr_body = request.pr_body;
         task.github_token = if (request.github_token.len > 0) try self.allocator.dupe(u8, request.github_token) else null;
+        task.env_vars = request.env_vars;
+        task.max_iterations = request.max_iterations;
+        task.completion_promise = request.completion_promise;
 
         if (self.task_repo) |repo| {
             log.info("handleSubmitTask: persisting task to DB", .{});

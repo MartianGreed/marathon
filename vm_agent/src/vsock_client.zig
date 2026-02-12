@@ -77,6 +77,7 @@ const LinuxVsockClient = struct {
             .pr_body = msg.payload.pr_body,
             .max_iterations = msg.payload.max_iterations,
             .completion_promise = msg.payload.completion_promise,
+            .env_vars = msg.payload.env_vars,
         };
     }
 

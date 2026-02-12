@@ -251,6 +251,8 @@ fn decodeValue(comptime T: type, allocator: std.mem.Allocator, data: []const u8,
     }
 }
 
+pub const EnvVar = types.EnvVar;
+
 pub const SubmitTaskRequest = struct {
     repo_url: []const u8,
     branch: []const u8,
@@ -259,6 +261,9 @@ pub const SubmitTaskRequest = struct {
     create_pr: bool,
     pr_title: ?[]const u8,
     pr_body: ?[]const u8,
+    env_vars: []const EnvVar = &[_]EnvVar{},
+    max_iterations: ?u32 = null,
+    completion_promise: ?[]const u8 = null,
 };
 
 pub const ExecuteTaskRequest = struct {
@@ -273,6 +278,9 @@ pub const ExecuteTaskRequest = struct {
     pr_body: ?[]const u8,
     timeout_ms: i64,
     max_tokens: i64,
+    env_vars: []const EnvVar = &[_]EnvVar{},
+    max_iterations: ?u32 = null,
+    completion_promise: ?[]const u8 = null,
 };
 
 pub const TaskEvent = struct {
@@ -346,6 +354,7 @@ pub const VsockStartPayload = struct {
     pr_body: ?[]const u8,
     max_iterations: ?u32,
     completion_promise: ?[]const u8,
+    env_vars: []const EnvVar = &[_]EnvVar{},
 };
 
 pub const VsockOutputPayload = struct {

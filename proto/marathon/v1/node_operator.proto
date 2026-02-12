@@ -39,6 +39,13 @@ message ExecuteTaskRequest {
   // Resource limits
   int64 timeout_ms = 10;
   int64 max_tokens = 11;
+
+  // Arbitrary environment variables for the agent
+  map<string, string> env_vars = 12;
+
+  // Ralph loop configuration
+  int32 max_iterations = 13;
+  string completion_promise = 14;
 }
 
 message HeartbeatRequest {
@@ -161,4 +168,11 @@ message VsockCommand {
   bool create_pr = 8;
   string pr_title = 9;
   string pr_body = 10;
+
+  // Arbitrary environment variables
+  map<string, string> env_vars = 11;
+
+  // Ralph loop configuration
+  int32 max_iterations = 12;
+  string completion_promise = 13;
 }
