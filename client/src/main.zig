@@ -263,7 +263,6 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     }
 
     // Follow mode: poll for task events until terminal state
-    
     std.debug.print("⏳ Task submitted: {s}\n", .{&task_id_str});
     std.debug.print("📋 State: {s}\n", .{@tagName(event.state)});
 
