@@ -76,8 +76,9 @@ pub const TaskExecutor = struct {
             .create_pr = request.create_pr,
             .pr_title = request.pr_title,
             .pr_body = request.pr_body,
-            .max_iterations = null,
-            .completion_promise = null,
+            .max_iterations = request.max_iterations,
+            .completion_promise = request.completion_promise,
+            .env_vars = request.env_vars,
         };
 
         const report: protocol.TaskResultReport = if (runner.run(vsock_payload)) |result| .{

@@ -81,6 +81,13 @@ message SubmitTaskRequest {
   bool create_pr = 5;
   string pr_title = 6;
   string pr_body = 7;
+
+  // Arbitrary environment variables for the agent
+  map<string, string> env_vars = 8;
+
+  // Ralph loop configuration
+  int32 max_iterations = 9;
+  string completion_promise = 10;
 }
 
 message TaskEvent {

@@ -5,6 +5,11 @@ pub const NodeId = [16]u8;
 pub const VmId = [16]u8;
 pub const ClientId = [16]u8;
 
+pub const EnvVar = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const TaskState = enum(u8) {
     unspecified = 0,
     queued = 1,
@@ -76,6 +81,10 @@ pub const Task = struct {
     pr_title: ?[]const u8,
     pr_body: ?[]const u8,
     github_token: ?[]const u8,
+
+    env_vars: []const EnvVar = &[_]EnvVar{},
+    max_iterations: ?u32 = null,
+    completion_promise: ?[]const u8 = null,
 
     pub fn deinit(self: *Task) void {
         self.allocator.free(self.repo_url);

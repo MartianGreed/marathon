@@ -79,6 +79,9 @@ fn printUsage() void {
         \\  --pr               Create a PR on completion
         \\  --pr-title <text>  PR title
         \\  --pr-body <text>   PR body
+        \\  -e KEY=VALUE       Environment variable for the agent (repeatable)
+        \\  --max-iterations N Max ralph loop iterations (default: 50)
+        \\  --completion-promise <text>  String that signals task completion
         \\
         \\Environment Variables:
         \\  MARATHON_ORCHESTRATOR_ADDRESS  Orchestrator address
@@ -87,6 +90,7 @@ fn printUsage() void {
         \\
         \\Examples:
         \\  marathon submit --repo https://github.com/user/repo --prompt "Fix the bug"
+        \\  marathon submit --repo https://github.com/user/repo --prompt "Build feature" -e DATABASE_URL=postgres://... -e API_KEY=sk-xxx --max-iterations 10 --completion-promise "TASK_COMPLETE"
         \\  marathon status abc123
         \\  marathon cancel abc123
         \\  marathon usage
@@ -106,11 +110,46 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     var create_pr = false;
     var pr_title: ?[]const u8 = null;
     var pr_body: ?[]const u8 = null;
+    var max_iterations: ?u32 = null;
+    var completion_promise: ?[]const u8 = null;
+
+    var env_vars_list: std.ArrayListUnmanaged(protocol.EnvVar) = .empty;
+    defer env_vars_list.deinit(allocator);
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "--repo")) {
+        if (std.mem.eql(u8, arg, "-e") or std.mem.eql(u8, arg, "--env")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: -e requires KEY=VALUE\n", .{});
+                return;
+            }
+            const env_arg = args[i];
+            if (std.mem.indexOfScalar(u8, env_arg, '=')) |eq_pos| {
+                try env_vars_list.append(allocator, .{
+                    .key = env_arg[0..eq_pos],
+                    .value = env_arg[eq_pos + 1 ..],
+                });
+            } else {
+                std.debug.print("Error: -e requires KEY=VALUE format, got: {s}\n", .{env_arg});
+                return;
+            }
+        } else if (std.mem.eql(u8, arg, "--max-iterations")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --max-iterations requires a value\n", .{});
+                return;
+            }
+            max_iterations = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--completion-promise")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --completion-promise requires a value\n", .{});
+                return;
+            }
+            completion_promise = args[i];
+        } else if (std.mem.eql(u8, arg, "--repo")) {
             i += 1;
             if (i >= args.len) {
                 std.debug.print("Error: --repo requires a value\n", .{});
@@ -186,6 +225,9 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         .create_pr = create_pr,
         .pr_title = pr_title,
         .pr_body = pr_body,
+        .env_vars = env_vars_list.items,
+        .max_iterations = max_iterations,
+        .completion_promise = completion_promise,
     };
 
     var raw_response = client.callWithHeader(.submit_task, request) catch |err| {

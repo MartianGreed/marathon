@@ -3,6 +3,7 @@ const common = @import("common");
 const types = common.types;
 const protocol = common.protocol;
 const api_interceptor = @import("api_interceptor.zig");
+const signal_parser = @import("signal_parser.zig");
 
 pub const ClaudeWrapper = struct {
     allocator: std.mem.Allocator,
@@ -209,6 +210,11 @@ pub const ClaudeWrapper = struct {
         try env.put("ANTHROPIC_API_KEY", task.anthropic_api_key);
         try env.put("GITHUB_TOKEN", task.github_token);
 
+        // Client-provided environment variables
+        for (task.env_vars) |env_var| {
+            try env.put(env_var.key, env_var.value);
+        }
+
         return env;
     }
 
@@ -256,6 +262,7 @@ pub const TaskInfo = struct {
     pr_body: ?[]const u8,
     max_iterations: ?u32,
     completion_promise: ?[]const u8,
+    env_vars: []const types.EnvVar = &[_]types.EnvVar{},
 };
 
 pub const RunResult = struct {

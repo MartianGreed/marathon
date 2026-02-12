@@ -8,15 +8,15 @@ const api_interceptor = @import("api_interceptor.zig");
 const repo_setup = @import("repo_setup.zig");
 const prompt_wrapper = @import("prompt_wrapper.zig");
 const cleanup = @import("cleanup.zig");
+const signal_parser = @import("signal_parser.zig");
+const memory = @import("memory.zig");
 
 const DEFAULT_MAX_ITERATIONS: u32 = 50;
 
 pub fn main() !void {
     // Redirect stderr to log file for persistent logging
-    // OpenRC's output_log/error_log may not capture all output
     if (std.fs.createFileAbsolute("/var/log/marathon-agent-debug.log", .{ .truncate = true })) |log_file| {
         const log_fd = log_file.handle;
-        // dup2 the log file to stderr (fd 2)
         std.posix.dup2(log_fd, 2) catch {};
         std.posix.close(log_fd);
     } else |_| {}
@@ -27,7 +27,7 @@ pub fn main() !void {
 
     const config = try common.config.VmAgentConfig.fromEnv(allocator);
 
-    std.log.info("Marathon VM Agent starting...", .{});
+    std.log.info("Marathon VM Agent starting (ralph loop mode)...", .{});
     std.log.info("  Vsock port: {d}", .{config.vsock_port});
     std.log.info("  Work dir: {s}", .{config.work_dir});
     std.log.info("  Claude Code path: {s}", .{config.claude_code_path});
@@ -54,7 +54,7 @@ pub fn main() !void {
     const prompt_wrap = prompt_wrapper.PromptWrapper.init();
     var cleaner = cleanup.Cleanup.initWithStrategy(cleanup.CleanupStrategy.fromString(config.cleanup_strategy));
 
-    // Wait for network to be ready (init scripts may not have finished)
+    // Wait for network to be ready
     waitForNetwork(allocator);
 
     var task: claude_wrapper.TaskInfo = undefined;
@@ -75,7 +75,7 @@ pub fn main() !void {
         };
         break;
     }
-    std.log.info("Received task, starting execution", .{});
+    std.log.info("Received task, starting ralph loop execution", .{});
 
     var setup = repo_setup.RepoSetup.init(allocator, config.work_dir, task.github_token);
     setup.clone(task.repo_url, task.branch) catch |err| {
@@ -92,23 +92,27 @@ pub fn main() !void {
     std.log.info("Repository setup complete", .{});
 
     const repo_name = extractRepoName(task.repo_url);
-    const wrapped_prompt = try prompt_wrap.wrap(allocator, task.prompt, repo_name, task.branch);
-    defer allocator.free(wrapped_prompt);
-
-    var modified_task = task;
-    modified_task.prompt = wrapped_prompt;
+    const base_prompt = try prompt_wrap.wrap(allocator, task.prompt, repo_name, task.branch);
+    defer allocator.free(base_prompt);
 
     wrapper.setOutputCallback(outputCallback, @ptrCast(&client));
+
+    // Initialize memory manager for cross-iteration persistence
+    var mem_mgr = memory.MemoryManager.init(allocator, config.work_dir);
 
     const max_iterations = task.max_iterations orelse DEFAULT_MAX_ITERATIONS;
     var iteration: u32 = 0;
     var cumulative_metrics = types.UsageMetrics{};
+    var last_output: []const u8 = "";
+    var last_output_owned = false;
 
     defer {
+        if (last_output_owned) allocator.free(@constCast(last_output));
         cleaner.execute(config.work_dir);
         std.log.info("Cleanup complete", .{});
     }
 
+    // === RALPH LOOP ===
     while (iteration < max_iterations) : (iteration += 1) {
         if (try client.checkCancel()) {
             std.log.info("Task cancelled by user", .{});
@@ -116,12 +120,29 @@ pub fn main() !void {
             return;
         }
 
-        std.log.info("Starting iteration {d}/{d}", .{ iteration + 1, max_iterations });
-
+        std.log.info("Ralph loop iteration {d}/{d}", .{ iteration + 1, max_iterations });
         try client.sendProgress(iteration + 1, max_iterations, "running");
 
+        // Build prompt: first iteration uses base prompt, subsequent iterations get memory context
+        var current_prompt: []const u8 = undefined;
+        var prompt_owned = false;
+
+        if (iteration == 0) {
+            current_prompt = base_prompt;
+        } else {
+            const context_prefix = try mem_mgr.buildContextPrefix(iteration + 1, last_output);
+            defer allocator.free(context_prefix);
+
+            current_prompt = try std.fmt.allocPrint(allocator, "{s}{s}", .{ context_prefix, base_prompt });
+            prompt_owned = true;
+        }
+        defer if (prompt_owned) allocator.free(@constCast(current_prompt));
+
+        var modified_task = task;
+        modified_task.prompt = current_prompt;
+
         const result = wrapper.run(modified_task) catch |err| {
-            std.log.err("Execution failed: {s}", .{@errorName(err)});
+            std.log.err("Execution failed at iteration {d}: {s}", .{ iteration + 1, @errorName(err) });
             try client.sendError("execution_failed", @errorName(err));
             return;
         };
@@ -132,34 +153,102 @@ pub fn main() !void {
 
         cumulative_metrics.add(result.metrics);
 
-        if (task.completion_promise != null) {
-            if (result.output_contains_promise) {
-                std.log.info("Completion promise found at iteration {d}", .{iteration + 1});
-                const final_result = claude_wrapper.RunResult{
-                    .exit_code = result.exit_code,
-                    .pr_url = result.pr_url,
-                    .metrics = cumulative_metrics,
-                    .output_contains_promise = true,
-                    .stdout = result.stdout,
-                    .stderr = result.stderr,
-                };
-                try client.sendComplete(final_result, iteration + 1);
-                return;
-            }
-            std.log.info("Iteration {d}/{d} - no completion promise found, continuing", .{ iteration + 1, max_iterations });
-        } else {
+        // Log iteration to .marathon/iterations.log for traceability
+        mem_mgr.logIteration(iteration + 1, result.exit_code, result.stdout);
+
+        // Update last_output for next iteration's context
+        if (last_output_owned) allocator.free(@constCast(last_output));
+        last_output = try allocator.dupe(u8, result.stdout);
+        last_output_owned = true;
+
+        // Parse signals from output (ralph-loop style)
+        const signals = signal_parser.parseSignals(result.stdout, task.completion_promise);
+
+        // Check for PR creation — this is the primary "productive output"
+        if (signals.pr_created) {
+            std.log.info("PR created at iteration {d}: {s}", .{ iteration + 1, signals.pr_url orelse "unknown" });
+            const final_result = claude_wrapper.RunResult{
+                .exit_code = result.exit_code,
+                .pr_url = signals.pr_url,
+                .metrics = cumulative_metrics,
+                .output_contains_promise = true,
+                .stdout = result.stdout,
+                .stderr = result.stderr,
+            };
+            try client.sendComplete(final_result, iteration + 1);
+            return;
+        }
+
+        // Check completion promise
+        if (signals.has_completion_promise) {
+            std.log.info("Completion promise found at iteration {d}", .{iteration + 1});
+            const final_result = claude_wrapper.RunResult{
+                .exit_code = result.exit_code,
+                .pr_url = result.pr_url,
+                .metrics = cumulative_metrics,
+                .output_contains_promise = true,
+                .stdout = result.stdout,
+                .stderr = result.stderr,
+            };
+            try client.sendComplete(final_result, iteration + 1);
+            return;
+        }
+
+        // Check clarification request — pause and report
+        if (signals.needs_clarification) {
+            std.log.info("Clarification requested at iteration {d}: {s}", .{
+                iteration + 1,
+                signals.clarification_question orelse "no question",
+            });
+            const err_msg = try std.fmt.allocPrint(allocator, "Clarification needed: {s}", .{
+                signals.clarification_question orelse "Agent needs more information",
+            });
+            defer allocator.free(err_msg);
+            try client.sendError("needs_clarification", err_msg);
+            return;
+        }
+
+        // No completion signal — single iteration mode (no completion_promise set)
+        if (task.completion_promise == null and max_iterations == 1) {
             std.log.info("Single iteration mode, task complete", .{});
             try client.sendComplete(result, iteration + 1);
             return;
         }
+
+        // Default ralph loop: if no completion_promise is set, use PR detection + exit code
+        if (task.completion_promise == null) {
+            if (result.exit_code == 0) {
+                // Check if there's a PR URL in the output even without explicit promise
+                if (result.pr_url) |pr_url| {
+                    std.log.info("Task completed with PR at iteration {d}: {s}", .{ iteration + 1, pr_url });
+                    const final_result = claude_wrapper.RunResult{
+                        .exit_code = result.exit_code,
+                        .pr_url = result.pr_url,
+                        .metrics = cumulative_metrics,
+                        .output_contains_promise = false,
+                        .stdout = result.stdout,
+                        .stderr = result.stderr,
+                    };
+                    try client.sendComplete(final_result, iteration + 1);
+                    return;
+                }
+                // Exit 0 without PR — agent thinks it's done
+                std.log.info("Agent exited cleanly at iteration {d}, completing", .{iteration + 1});
+                try client.sendComplete(result, iteration + 1);
+                return;
+            }
+            // Non-zero exit — agent crashed or errored, continue loop
+            std.log.warn("Agent exited with code {d} at iteration {d}, retrying", .{ result.exit_code, iteration + 1 });
+        }
+
+        std.log.info("Iteration {d}/{d} complete, continuing ralph loop", .{ iteration + 1, max_iterations });
     }
 
-    std.log.warn("Max iterations ({d}) reached without completion promise", .{max_iterations});
+    std.log.warn("Max iterations ({d}) reached without completion", .{max_iterations});
     try client.sendError("max_iterations", "Reached iteration limit without completion");
 }
 
 fn waitForNetwork(allocator: std.mem.Allocator) void {
-    // Wait up to 30s for network connectivity (DNS resolution)
     var attempt: u32 = 0;
     while (attempt < 15) : (attempt += 1) {
         const result = std.process.Child.run(.{
@@ -233,4 +322,6 @@ test "vm agent" {
     _ = repo_setup;
     _ = prompt_wrapper;
     _ = cleanup;
+    _ = signal_parser;
+    _ = memory;
 }
