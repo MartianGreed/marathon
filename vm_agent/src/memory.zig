@@ -67,12 +67,13 @@ pub const MemoryManager = struct {
         const max_summary = @min(output_summary.len, 2048);
         const summary = output_summary[0..max_summary];
 
-        var writer = file.writer();
-        writer.print("\n--- Iteration {d} (exit_code={d}) ---\n{s}\n", .{
+        const header = std.fmt.allocPrint(self.allocator, "\n--- Iteration {d} (exit_code={d}) ---\n{s}\n", .{
             iteration,
             exit_code,
             summary,
-        }) catch {};
+        }) catch return;
+        defer self.allocator.free(header);
+        file.writeAll(header) catch {};
     }
 
     /// Build context prefix for the next iteration's prompt.
