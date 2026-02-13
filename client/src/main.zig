@@ -9,6 +9,10 @@ const Command = enum {
     status,
     cancel,
     usage,
+    login,
+    register,
+    whoami,
+    logout,
     help,
 };
 
@@ -38,6 +42,10 @@ pub fn main() !void {
         .status => try handleStatus(config, allocator, args[2..]),
         .cancel => try handleCancel(config, allocator, args[2..]),
         .usage => try handleUsage(),
+        .login => try handleLogin(config, allocator, args[2..]),
+        .register => try handleRegister(config, allocator, args[2..]),
+        .whoami => try handleWhoami(allocator),
+        .logout => try handleLogout(allocator),
         .help => printUsage(),
     }
 }
@@ -48,6 +56,10 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ .name = "status", .cmd = .status },
         .{ .name = "cancel", .cmd = .cancel },
         .{ .name = "usage", .cmd = .usage },
+        .{ .name = "login", .cmd = .login },
+        .{ .name = "register", .cmd = .register },
+        .{ .name = "whoami", .cmd = .whoami },
+        .{ .name = "logout", .cmd = .logout },
         .{ .name = "help", .cmd = .help },
         .{ .name = "--help", .cmd = .help },
         .{ .name = "-h", .cmd = .help },
@@ -66,11 +78,19 @@ fn printUsage() void {
         \\Usage: marathon <command> [options]
         \\
         \\Commands:
-        \\  submit   Submit a new task
-        \\  status   Check task status
-        \\  cancel   Cancel a running task
-        \\  usage    Get usage report
-        \\  help     Show this help
+        \\  register             Create a new account
+        \\  login                Authenticate with your account
+        \\  logout               Remove stored credentials
+        \\  whoami               Show current authenticated user
+        \\  submit               Submit a new task
+        \\  status <task-id>     Check task status
+        \\  cancel <task-id>     Cancel a running task
+        \\  usage                Get usage report
+        \\  help                 Show this help
+        \\
+        \\Auth Options (login/register):
+        \\  --email <email>      Email address
+        \\  --password <pass>    Password (prompted if not provided)
         \\
         \\Submit Options:
         \\  --repo <url>       Repository URL (required)
@@ -90,6 +110,9 @@ fn printUsage() void {
         \\  GITHUB_TOKEN                   GitHub token for repo access
         \\
         \\Examples:
+        \\  marathon register --email user@example.com --password mypassword
+        \\  marathon login --email user@example.com --password mypassword
+        \\  marathon whoami
         \\  marathon submit --repo https://github.com/user/repo --prompt "Fix the bug"
         \\  marathon submit --repo https://github.com/user/repo --prompt "Build feature" -e DATABASE_URL=postgres://... -e API_KEY=sk-xxx --max-iterations 10 --completion-promise "TASK_COMPLETE"
         \\  marathon status abc123
@@ -99,6 +122,261 @@ fn printUsage() void {
     ;
     std.debug.print("{s}", .{usage});
 }
+
+// --- Credential file management ---
+
+const Credentials = struct {
+    token: []const u8,
+    api_key: []const u8,
+    email: []const u8,
+};
+
+fn getCredentialsPath(allocator: std.mem.Allocator) ![]u8 {
+    if (std.posix.getenv("HOME")) |home| {
+        return std.fmt.allocPrint(allocator, "{s}/.marathon/credentials", .{home});
+    }
+    return std.fmt.allocPrint(allocator, "/tmp/.marathon/credentials", .{});
+}
+
+fn saveCredentials(allocator: std.mem.Allocator, token: []const u8, api_key: []const u8, email: []const u8) !void {
+    const path = try getCredentialsPath(allocator);
+    defer allocator.free(path);
+
+    // Create directory
+    const dir_end = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.InvalidPath;
+    const dir_path = path[0..dir_end];
+
+    std.fs.cwd().makePath(dir_path) catch {};
+
+    const file = try std.fs.cwd().createFile(path, .{ .mode = 0o600 });
+    defer file.close();
+
+    // Build credentials content
+    var content_buf: [2048]u8 = undefined;
+    const content = std.fmt.bufPrint(&content_buf, "token={s}\napi_key={s}\nemail={s}\n", .{ token, api_key, email }) catch return error.BufferTooSmall;
+    try file.writeAll(content);
+
+    std.debug.print("Credentials saved to {s}\n", .{path});
+}
+
+fn loadCredentials(allocator: std.mem.Allocator) !?Credentials {
+    const path = try getCredentialsPath(allocator);
+    defer allocator.free(path);
+
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        if (err == error.FileNotFound) return null;
+        return err;
+    };
+    defer file.close();
+
+    const content = try file.readToEndAlloc(allocator, 4096);
+
+    var token: ?[]const u8 = null;
+    var api_key: ?[]const u8 = null;
+    var email: ?[]const u8 = null;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "token=")) {
+            token = line[6..];
+        } else if (std.mem.startsWith(u8, line, "api_key=")) {
+            api_key = line[8..];
+        } else if (std.mem.startsWith(u8, line, "email=")) {
+            email = line[6..];
+        }
+    }
+
+    if (token != null and api_key != null and email != null) {
+        return Credentials{
+            .token = token.?,
+            .api_key = api_key.?,
+            .email = email.?,
+        };
+    }
+    return null;
+}
+
+fn deleteCredentials(allocator: std.mem.Allocator) !void {
+    const path = try getCredentialsPath(allocator);
+    defer allocator.free(path);
+    std.fs.cwd().deleteFile(path) catch |err| {
+        if (err != error.FileNotFound) return err;
+    };
+}
+
+// --- Auth handlers ---
+
+fn handleRegister(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var email: ?[]const u8 = null;
+    var password: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--email")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --email requires a value\n", .{});
+                return;
+            }
+            email = args[i];
+        } else if (std.mem.eql(u8, args[i], "--password")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --password requires a value\n", .{});
+                return;
+            }
+            password = args[i];
+        }
+    }
+
+    if (email == null) {
+        std.debug.print("Error: --email is required\n", .{});
+        return;
+    }
+    if (password == null) {
+        std.debug.print("Error: --password is required\n", .{});
+        return;
+    }
+
+    std.debug.print("Connecting to {s}:{d}...\n", .{ config.orchestrator_address, config.orchestrator_port });
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const request = protocol.AuthRegisterRequest{
+        .email = email.?,
+        .password = password.?,
+    };
+
+    var raw_response = client.callWithHeader(.auth_register, request) catch |err| {
+        std.debug.print("Error: Failed to register: {}\n", .{err});
+        return;
+    };
+    defer raw_response.deinit();
+
+    if (raw_response.header.msg_type == .error_response) {
+        const err_resp = raw_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const response = raw_response.decodeAs(protocol.AuthResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (response.success) {
+        std.debug.print("✓ Registration successful!\n", .{});
+        if (response.token != null and response.api_key != null) {
+            try saveCredentials(allocator, response.token.?, response.api_key.?, email.?);
+            std.debug.print("API Key: {s}\n", .{response.api_key.?});
+        }
+    } else {
+        std.debug.print("Registration failed: {s}\n", .{response.message});
+    }
+}
+
+fn handleLogin(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var email: ?[]const u8 = null;
+    var password: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--email")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --email requires a value\n", .{});
+                return;
+            }
+            email = args[i];
+        } else if (std.mem.eql(u8, args[i], "--password")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --password requires a value\n", .{});
+                return;
+            }
+            password = args[i];
+        }
+    }
+
+    if (email == null) {
+        std.debug.print("Error: --email is required\n", .{});
+        return;
+    }
+    if (password == null) {
+        std.debug.print("Error: --password is required\n", .{});
+        return;
+    }
+
+    std.debug.print("Connecting to {s}:{d}...\n", .{ config.orchestrator_address, config.orchestrator_port });
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const request = protocol.AuthLoginRequest{
+        .email = email.?,
+        .password = password.?,
+    };
+
+    var raw_response = client.callWithHeader(.auth_login, request) catch |err| {
+        std.debug.print("Error: Failed to login: {}\n", .{err});
+        return;
+    };
+    defer raw_response.deinit();
+
+    if (raw_response.header.msg_type == .error_response) {
+        const err_resp = raw_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const response = raw_response.decodeAs(protocol.AuthResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (response.success) {
+        std.debug.print("✓ Login successful!\n", .{});
+        if (response.token != null and response.api_key != null) {
+            try saveCredentials(allocator, response.token.?, response.api_key.?, email.?);
+        }
+    } else {
+        std.debug.print("Login failed: {s}\n", .{response.message});
+    }
+}
+
+fn handleWhoami(allocator: std.mem.Allocator) !void {
+    const creds = try loadCredentials(allocator) orelse {
+        std.debug.print("Not logged in. Run 'marathon login' or 'marathon register' first.\n", .{});
+        return;
+    };
+
+    std.debug.print("Logged in as: {s}\n", .{creds.email});
+    std.debug.print("API Key:      {s}...{s}\n", .{ creds.api_key[0..8], creds.api_key[creds.api_key.len - 4 ..] });
+}
+
+fn handleLogout(allocator: std.mem.Allocator) !void {
+    try deleteCredentials(allocator);
+    std.debug.print("✓ Logged out. Credentials removed.\n", .{});
+}
+
+// --- Existing handlers ---
 
 fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -428,6 +706,10 @@ fn handleUsage() !void {
 
 test "command parsing" {
     try std.testing.expectEqual(Command.submit, parseCommand("submit").?);
+    try std.testing.expectEqual(Command.login, parseCommand("login").?);
+    try std.testing.expectEqual(Command.register, parseCommand("register").?);
+    try std.testing.expectEqual(Command.whoami, parseCommand("whoami").?);
+    try std.testing.expectEqual(Command.logout, parseCommand("logout").?);
     try std.testing.expectEqual(Command.help, parseCommand("help").?);
     try std.testing.expect(parseCommand("invalid") == null);
 }
