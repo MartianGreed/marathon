@@ -11,6 +11,7 @@ const registry = @import("../registry/registry.zig");
 const metering = @import("../metering/metering.zig");
 const auth = @import("../auth/auth.zig");
 const db = @import("../db/root.zig");
+const user_repo = @import("../db/repository/user.zig");
 
 fn validateRepoUrl(url: []const u8) bool {
     if (url.len < 10 or url.len > 2048) return false;
@@ -73,6 +74,7 @@ pub const Server = struct {
     node_auth_key: ?[]const u8,
     pending_tasks: std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)),
     anthropic_api_key: []const u8,
+    user_repo: ?*user_repo.UserRepository,
     /// Buffered task output events from node operators, keyed by task_id.
     /// Consumed by streamTaskEvents for real-time streaming to clients.
     task_events_mutex: std.Thread.Mutex = .{},
@@ -101,6 +103,7 @@ pub const Server = struct {
             .node_auth_key = node_auth_key,
             .pending_tasks = std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)).init(allocator),
             .anthropic_api_key = anthropic_api_key,
+            .user_repo = null,
             .task_event_buffers = std.AutoHashMap(types.TaskId, std.ArrayListUnmanaged(protocol.TaskEvent)).init(allocator),
         };
     }
@@ -114,6 +117,10 @@ pub const Server = struct {
         self.task_repo = task_repo;
         self.node_repo = node_repo;
         self.usage_repo = usage_repo;
+    }
+
+    pub fn setUserRepository(self: *Server, repo: *user_repo.UserRepository) void {
+        self.user_repo = repo;
     }
 
     pub fn deinit(self: *Server) void {
@@ -245,6 +252,14 @@ pub const Server = struct {
                 const request = try conn.readPayload(protocol.GetTaskEventsRequest, header);
                 try handler.handleGetTaskEvents(conn, request.task_id, header.request_id);
             },
+            .auth_register => {
+                const request = try conn.readPayload(protocol.AuthRegisterRequest, header);
+                try self.handleAuthRegister(conn, request, header.request_id);
+            },
+            .auth_login => {
+                const request = try conn.readPayload(protocol.AuthLoginRequest, header);
+                try self.handleAuthLogin(conn, request, header.request_id);
+            },
             else => {
                 log.warn("unsupported message type: {}", .{header.msg_type});
                 try conn.writeMessage(.error_response, header.request_id, protocol.ErrorResponse{
@@ -370,6 +385,122 @@ pub const Server = struct {
         if (status.availableSlots() > 0) {
             self.tryScheduleTasks();
         }
+    }
+
+    fn handleAuthRegister(self: *Server, conn: *grpc.Connection, request: protocol.AuthRegisterRequest, request_id: u32) !void {
+        log.info("auth_register: email={s}", .{request.email});
+
+        const repo = self.user_repo orelse {
+            try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
+                .success = false,
+                .token = null,
+                .api_key = null,
+                .message = "User registration not available (no database)",
+            });
+            return;
+        };
+
+        if (try repo.findByEmail(request.email)) |_| {
+            try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
+                .success = false,
+                .token = null,
+                .api_key = null,
+                .message = "Email already registered",
+            });
+            return;
+        }
+
+        const password_hash = try auth.PasswordHash.hash(self.allocator, request.password);
+        defer self.allocator.free(password_hash);
+
+        var user_id: [16]u8 = undefined;
+        std.crypto.random.bytes(&user_id);
+
+        const api_key = try auth.Authenticator.generateApiKey(self.allocator);
+        defer self.allocator.free(api_key);
+
+        const now = std.time.milliTimestamp();
+
+        const new_user = user_repo.User{
+            .id = user_id,
+            .email = request.email,
+            .password_hash = password_hash,
+            .github_id = null,
+            .api_key = api_key,
+            .created_at = now,
+            .updated_at = now,
+        };
+
+        repo.create(&new_user) catch {
+            try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
+                .success = false,
+                .token = null,
+                .api_key = null,
+                .message = "Failed to create user",
+            });
+            return;
+        };
+
+        try self.auth.registerApiKey(api_key, user_id);
+
+        const token = try self.auth.createToken(self.allocator, user_id, request.email);
+        defer self.allocator.free(token);
+
+        log.info("user registered: email={s}", .{request.email});
+
+        try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
+            .success = true,
+            .token = token,
+            .api_key = api_key,
+            .message = "Registration successful",
+        });
+    }
+
+    fn handleAuthLogin(self: *Server, conn: *grpc.Connection, request: protocol.AuthLoginRequest, request_id: u32) !void {
+        log.info("auth_login: email={s}", .{request.email});
+
+        const repo = self.user_repo orelse {
+            try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
+                .success = false,
+                .token = null,
+                .api_key = null,
+                .message = "Authentication not available (no database)",
+            });
+            return;
+        };
+
+        var found_user = (try repo.findByEmail(request.email)) orelse {
+            try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
+                .success = false,
+                .token = null,
+                .api_key = null,
+                .message = "Invalid email or password",
+            });
+            return;
+        };
+        defer found_user.deinit(self.allocator);
+
+        if (!auth.PasswordHash.verify(request.password, found_user.password_hash)) {
+            try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
+                .success = false,
+                .token = null,
+                .api_key = null,
+                .message = "Invalid email or password",
+            });
+            return;
+        }
+
+        const token = try self.auth.createToken(self.allocator, found_user.id, found_user.email);
+        defer self.allocator.free(token);
+
+        log.info("user logged in: email={s}", .{request.email});
+
+        try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
+            .success = true,
+            .token = token,
+            .api_key = found_user.api_key,
+            .message = "Login successful",
+        });
     }
 
     fn tryScheduleTasks(self: *Server) void {

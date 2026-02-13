@@ -31,6 +31,11 @@ pub const MessageType = enum(u8) {
     vsock_start = 0x35,
     vsock_cancel = 0x36,
     vsock_progress = 0x37,
+
+    // Auth messages
+    auth_register = 0x40,
+    auth_login = 0x41,
+    auth_response = 0x42,
 };
 
 pub const Header = extern struct {
@@ -486,6 +491,24 @@ pub const TaskSummary = struct {
 
 pub const ErrorResponse = struct {
     code: []const u8,
+    message: []const u8,
+};
+
+// Auth protocol messages
+pub const AuthRegisterRequest = struct {
+    email: []const u8,
+    password: []const u8,
+};
+
+pub const AuthLoginRequest = struct {
+    email: []const u8,
+    password: []const u8,
+};
+
+pub const AuthResponse = struct {
+    success: bool,
+    token: ?[]const u8,
+    api_key: ?[]const u8,
     message: []const u8,
 };
 
