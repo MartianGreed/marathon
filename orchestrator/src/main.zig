@@ -27,6 +27,7 @@ pub fn main() !void {
     var task_repo = db.TaskRepository.init(allocator, db_pool);
     var node_repo = db.NodeRepository.init(allocator, db_pool);
     var usage_repo = db.UsageRepository.init(allocator, db_pool);
+    var user_repo = db.UserRepository.init(allocator, db_pool);
 
     std.log.info("database connected and migrations applied", .{});
 
@@ -39,7 +40,10 @@ pub fn main() !void {
     var meter = metering.Metering.init(allocator);
     defer meter.deinit();
 
-    var authenticator = auth.Authenticator.init(allocator, config.anthropic_api_key);
+    var authenticator = if (config.jwt_secret) |secret|
+        auth.Authenticator.initWithSecret(allocator, config.anthropic_api_key, secret)
+    else
+        auth.Authenticator.init(allocator, config.anthropic_api_key);
     defer authenticator.deinit();
 
     var server = grpc_server.Server.init(
@@ -54,6 +58,7 @@ pub fn main() !void {
     defer server.deinit();
 
     server.setRepositories(&task_repo, &node_repo, &usage_repo);
+    server.setUserRepository(&user_repo);
 
     try server.listen(config.listen_address, config.listen_port);
     std.log.info("Orchestrator ready and listening", .{});
@@ -90,7 +95,10 @@ fn runWithoutDb(allocator: std.mem.Allocator, config: common.config.Orchestrator
     var meter = metering.Metering.init(allocator);
     defer meter.deinit();
 
-    var authenticator = auth.Authenticator.init(allocator, config.anthropic_api_key);
+    var authenticator = if (config.jwt_secret) |secret|
+        auth.Authenticator.initWithSecret(allocator, config.anthropic_api_key, secret)
+    else
+        auth.Authenticator.init(allocator, config.anthropic_api_key);
     defer authenticator.deinit();
 
     var server = grpc_server.Server.init(

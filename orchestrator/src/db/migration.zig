@@ -24,6 +24,17 @@ pub const migrations = [_]Migration{
         \\DROP TABLE IF EXISTS schema_migrations;
         ,
     },
+    .{
+        .version = 2,
+        .description = "users and authentication",
+        .up = @embedFile("migrations/002_users.sql"),
+        .down =
+        \\ALTER TABLE usage_records DROP COLUMN IF EXISTS user_id;
+        \\ALTER TABLE tasks DROP COLUMN IF EXISTS user_id;
+        \\DROP TABLE IF EXISTS user_tokens;
+        \\DROP TABLE IF EXISTS users;
+        ,
+    },
 };
 
 pub const MigrationRunner = struct {

@@ -16,6 +16,7 @@ pub const MigrationRunner = migration.MigrationRunner;
 pub const TaskRepository = repository.TaskRepository;
 pub const NodeRepository = repository.NodeRepository;
 pub const UsageRepository = repository.UsageRepository;
+pub const UserRepository = repository.UserRepository;
 
 pub const DbError = errors.DbError;
 pub const Param = types.Param;

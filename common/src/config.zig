@@ -87,6 +87,8 @@ pub const OrchestratorConfig = struct {
 
     node_auth_key: ?[]const u8 = null,
 
+    jwt_secret: ?[]const u8 = null,
+
     pub fn fromEnv(allocator: std.mem.Allocator) !OrchestratorConfig {
         var config = OrchestratorConfig{};
 
@@ -112,6 +114,10 @@ pub const OrchestratorConfig = struct {
 
         if (std.posix.getenv("MARATHON_NODE_AUTH_KEY")) |v| {
             config.node_auth_key = try allocator.dupe(u8, v);
+        }
+
+        if (std.posix.getenv("MARATHON_JWT_SECRET")) |v| {
+            config.jwt_secret = try allocator.dupe(u8, v);
         }
 
         return config;

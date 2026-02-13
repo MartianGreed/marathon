@@ -1,4 +1,6 @@
 zig-out/
+node_modules/
+web/dist/
 .zig-cache/
 zig-cache/
 *.o
