@@ -7,10 +7,12 @@ pub const MessageType = enum(u8) {
     cancel_task = 0x03,
     get_usage = 0x04,
     list_tasks = 0x05,
+    get_task_events = 0x06,
 
     task_event = 0x10,
     task_response = 0x11,
     usage_response = 0x12,
+    task_events_response = 0x13,
     error_response = 0x1f,
 
     execute_task = 0x20,
@@ -19,6 +21,7 @@ pub const MessageType = enum(u8) {
     node_status = 0x23,
     node_command = 0x24,
     report_task_result = 0x25,
+    report_task_output = 0x26,
 
     vsock_ready = 0x30,
     vsock_output = 0x31,
@@ -306,6 +309,15 @@ pub const TaskResultReport = struct {
     pr_url: ?[]const u8,
 };
 
+/// Output event forwarded from node operator to orchestrator.
+/// Included in heartbeat payload so the orchestrator can stream them to clients.
+pub const TaskOutputEvent = struct {
+    task_id: types.TaskId,
+    output_type: types.OutputType,
+    timestamp: i64,
+    data: []const u8,
+};
+
 pub const HeartbeatPayload = struct {
     node_id: types.NodeId,
     timestamp: i64,
@@ -320,6 +332,7 @@ pub const HeartbeatPayload = struct {
     healthy: bool,
     draining: bool,
     completed_tasks: []const TaskResultReport,
+    pending_output: []const TaskOutputEvent,
 };
 
 pub const CommandType = enum(u8) {
@@ -391,6 +404,20 @@ pub const VsockProgressPayload = struct {
 
 pub const GetTaskRequest = struct {
     task_id: types.TaskId,
+};
+
+/// Request buffered events + current state for a task (used by -f/follow mode).
+pub const GetTaskEventsRequest = struct {
+    task_id: types.TaskId,
+};
+
+/// Response with current task state + any buffered output events since last poll.
+pub const TaskEventsResponse = struct {
+    task_id: types.TaskId,
+    state: types.TaskState,
+    events: []const TaskEvent,
+    error_message: ?[]const u8,
+    pr_url: ?[]const u8,
 };
 
 pub const TaskResponse = struct {

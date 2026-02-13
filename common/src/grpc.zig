@@ -419,6 +419,31 @@ pub const Client = struct {
         };
     }
 
+    /// Read a single response from the connection without sending a request.
+    /// Used for streaming mode where the server pushes multiple responses.
+    pub fn readResponse(self: *Client) !RawResponse {
+        if (self.stream == null) return error.NotConnected;
+
+        var header_buf: [@sizeOf(protocol.Header)]u8 align(@alignOf(protocol.Header)) = undefined;
+        try self.readExactBytes(&header_buf);
+
+        const header: *const protocol.Header = @ptrCast(@alignCast(&header_buf));
+        if (!std.mem.eql(u8, &header.magic, &.{ 'M', 'R', 'T', 'N' })) {
+            return error.InvalidMagic;
+        }
+
+        const payload_data = try self.allocator.alloc(u8, header.payload_len);
+        errdefer self.allocator.free(payload_data);
+
+        try self.readExactBytes(payload_data);
+
+        return .{
+            .header = header.*,
+            .payload_data = payload_data,
+            .allocator = self.allocator,
+        };
+    }
+
     pub fn streamCall(
         self: *Client,
         msg_type: protocol.MessageType,

@@ -77,7 +77,11 @@ pub const HeartbeatClient = struct {
                 }
             };
 
-            common.compat.sleep(self.interval_ms * std.time.ns_per_ms);
+            // Use faster heartbeat (1s) when there are active tasks for real-time output streaming.
+            // Fall back to normal interval (5s) when idle.
+            const has_active_tasks = self.vm_pool.activeCount() > 0;
+            const sleep_ms = if (has_active_tasks) @min(self.interval_ms, 1000) else self.interval_ms;
+            common.compat.sleep(sleep_ms * std.time.ns_per_ms);
         }
     }
 
@@ -105,6 +109,9 @@ pub const HeartbeatClient = struct {
         const completed_tasks = self.executor.drainResults();
         defer self.allocator.free(completed_tasks);
 
+        const pending_output = self.executor.drainOutput();
+        defer self.allocator.free(pending_output);
+
         const payload = protocol.HeartbeatPayload{
             .node_id = self.node_id,
             .timestamp = timestamp,
@@ -119,6 +126,7 @@ pub const HeartbeatClient = struct {
             .healthy = status.healthy,
             .draining = status.draining,
             .completed_tasks = completed_tasks,
+            .pending_output = pending_output,
         };
 
         var raw = try self.client.callWithHeader(.heartbeat_request, payload);

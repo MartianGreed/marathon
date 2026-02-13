@@ -82,6 +82,7 @@ fn printUsage() void {
         \\  -e KEY=VALUE       Environment variable for the agent (repeatable)
         \\  --max-iterations N Max ralph loop iterations (default: 50)
         \\  --completion-promise <text>  String that signals task completion
+        \\  -f, --follow       Stream task events in real-time until completion
         \\
         \\Environment Variables:
         \\  MARATHON_ORCHESTRATOR_ADDRESS  Orchestrator address
@@ -112,6 +113,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     var pr_body: ?[]const u8 = null;
     var max_iterations: ?u32 = null;
     var completion_promise: ?[]const u8 = null;
+    var follow = false;
 
     var env_vars_list: std.ArrayListUnmanaged(protocol.EnvVar) = .empty;
     defer env_vars_list.deinit(allocator);
@@ -172,6 +174,8 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
             prompt = args[i];
         } else if (std.mem.eql(u8, arg, "--pr")) {
             create_pr = true;
+        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--follow")) {
+            follow = true;
         } else if (std.mem.eql(u8, arg, "--pr-title")) {
             i += 1;
             if (i >= args.len) {
@@ -252,7 +256,98 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     };
 
     const task_id_str = types.formatId(event.task_id);
-    std.debug.print("{s}\n", .{&task_id_str});
+
+    if (!follow) {
+        std.debug.print("{s}\n", .{&task_id_str});
+        return;
+    }
+
+    // Follow mode: poll for task events until terminal state
+    std.debug.print("⏳ Task submitted: {s}\n", .{&task_id_str});
+    std.debug.print("📋 State: {s}\n", .{@tagName(event.state)});
+
+    // Close the submit connection and poll with get_task + get_task_events
+    client.close();
+    var poll_client = grpc.Client.init(allocator);
+    defer poll_client.close();
+
+    poll_client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("⚠️  Failed to connect for follow mode: {}\n", .{err});
+        return;
+    };
+
+    var last_state: types.TaskState = event.state;
+
+    while (true) {
+        // Poll task status + events
+        var status_resp = poll_client.callWithHeader(.get_task_events, protocol.GetTaskEventsRequest{
+            .task_id = event.task_id,
+        }) catch |err| {
+            // Fall back to simple status poll
+            var simple_resp = poll_client.callWithHeader(.get_task, protocol.GetTaskRequest{
+                .task_id = event.task_id,
+            }) catch {
+                std.debug.print("⚠️  Connection lost: {}\n", .{err});
+                break;
+            };
+            defer simple_resp.deinit();
+
+            if (simple_resp.header.msg_type == .task_response) {
+                const r = simple_resp.decodeAs(protocol.TaskResponse) catch continue;
+                if (r.state != last_state) {
+                    last_state = r.state;
+                    printStateChange(r.state);
+                }
+                if (r.state.isTerminal()) {
+                    if (r.error_message) |msg| std.debug.print("   Error: {s}\n", .{msg});
+                    if (r.pr_url) |url| std.debug.print("   PR: {s}\n", .{url});
+                    break;
+                }
+            }
+            common.compat.sleep(2 * std.time.ns_per_s);
+            continue;
+        };
+        defer status_resp.deinit();
+
+        if (status_resp.header.msg_type == .task_events_response) {
+            const events_resp = status_resp.decodeAs(protocol.TaskEventsResponse) catch {
+                common.compat.sleep(2 * std.time.ns_per_s);
+                continue;
+            };
+
+            if (events_resp.state != last_state) {
+                last_state = events_resp.state;
+                printStateChange(events_resp.state);
+            }
+
+            for (events_resp.events) |evt| {
+                if (evt.data.len > 0) {
+                    std.debug.print("📋 {s}\n", .{evt.data});
+                }
+            }
+
+            if (events_resp.state.isTerminal()) {
+                if (events_resp.error_message) |msg| std.debug.print("   Error: {s}\n", .{msg});
+                if (events_resp.pr_url) |url| std.debug.print("   PR: {s}\n", .{url});
+                break;
+            }
+        }
+
+        common.compat.sleep(2 * std.time.ns_per_s);
+    }
+}
+
+fn printStateChange(state: types.TaskState) void {
+    const icon: []const u8 = switch (state) {
+        .queued => "⏳",
+        .starting => "🖥️ ",
+        .running => "🔥",
+        .completed => "✅",
+        .failed => "❌",
+        .cancelled => "🚫",
+        .unspecified => "❓",
+    };
+    std.debug.print("{s} State: {s}\n", .{ icon, @tagName(state) });
 }
 
 fn handleStatus(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {

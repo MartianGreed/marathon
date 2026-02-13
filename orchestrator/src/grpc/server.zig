@@ -73,6 +73,10 @@ pub const Server = struct {
     node_auth_key: ?[]const u8,
     pending_tasks: std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)),
     anthropic_api_key: []const u8,
+    /// Buffered task output events from node operators, keyed by task_id.
+    /// Consumed by streamTaskEvents for real-time streaming to clients.
+    task_events_mutex: std.Thread.Mutex = .{},
+    task_event_buffers: std.AutoHashMap(types.TaskId, std.ArrayListUnmanaged(protocol.TaskEvent)),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -97,6 +101,7 @@ pub const Server = struct {
             .node_auth_key = node_auth_key,
             .pending_tasks = std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)).init(allocator),
             .anthropic_api_key = anthropic_api_key,
+            .task_event_buffers = std.AutoHashMap(types.TaskId, std.ArrayListUnmanaged(protocol.TaskEvent)).init(allocator),
         };
     }
 
@@ -167,6 +172,7 @@ pub const Server = struct {
             .metering = self.metering,
             .auth = self.auth,
             .task_repo = self.task_repo,
+            .server = self,
         };
 
         while (true) {
@@ -235,6 +241,10 @@ pub const Server = struct {
                 const request = try conn.readPayload(protocol.ListTasksRequest, header);
                 try handler.handleListTasks(conn, request, client_id, header.request_id);
             },
+            .get_task_events => {
+                const request = try conn.readPayload(protocol.GetTaskEventsRequest, header);
+                try handler.handleGetTaskEvents(conn, request.task_id, header.request_id);
+            },
             else => {
                 log.warn("unsupported message type: {}", .{header.msg_type});
                 try conn.writeMessage(.error_response, header.request_id, protocol.ErrorResponse{
@@ -298,6 +308,15 @@ pub const Server = struct {
                 &types.formatId(report.task_id),
                 report.success,
             });
+        }
+
+        // Buffer any output events from the node for streaming to clients
+        if (payload.pending_output.len > 0) {
+            log.info("received {d} output events from node_id={s}", .{
+                payload.pending_output.len,
+                &types.formatId(payload.node_id),
+            });
+            self.bufferTaskOutput(payload.pending_output);
         }
 
         if (status.availableSlots() > 0) {
@@ -376,6 +395,41 @@ pub const Server = struct {
         }
     }
 
+    /// Push output events into the per-task event buffer for streaming to clients.
+    fn bufferTaskOutput(self: *Server, events: []const protocol.TaskOutputEvent) void {
+        self.task_events_mutex.lock();
+        defer self.task_events_mutex.unlock();
+
+        for (events) |event| {
+            const entry = self.task_event_buffers.getOrPut(event.task_id) catch continue;
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .empty;
+            }
+            // Cap per-task buffer at 500 events
+            if (entry.value_ptr.items.len >= 500) {
+                _ = entry.value_ptr.orderedRemove(0);
+            }
+            entry.value_ptr.append(self.allocator, .{
+                .task_id = event.task_id,
+                .state = .running,
+                .timestamp = event.timestamp,
+                .event_type = .output,
+                .data = self.allocator.dupe(u8, event.data) catch continue,
+            }) catch continue;
+        }
+    }
+
+    /// Drain buffered events for a specific task. Returns owned slice.
+    fn drainTaskEvents(self: *Server, task_id: types.TaskId) []protocol.TaskEvent {
+        self.task_events_mutex.lock();
+        defer self.task_events_mutex.unlock();
+
+        if (self.task_event_buffers.getPtr(task_id)) |buf| {
+            return buf.toOwnedSlice(self.allocator) catch return &[_]protocol.TaskEvent{};
+        }
+        return &[_]protocol.TaskEvent{};
+    }
+
     fn validateNodeAuth(self: *Server, payload: protocol.HeartbeatPayload) bool {
         const key = self.node_auth_key orelse return true;
 
@@ -403,6 +457,7 @@ pub const RequestHandler = struct {
     metering: *metering.Metering,
     auth: *auth.Authenticator,
     task_repo: ?*db.TaskRepository,
+    server: *Server,
 
     pub fn handleSubmitTask(
         self: *RequestHandler,
@@ -511,6 +566,16 @@ pub const RequestHandler = struct {
                 if (state.isTerminal()) break;
             }
 
+            // Send any buffered output events from the node operator
+            const buffered = self.server.drainTaskEvents(task_id);
+            defer self.server.allocator.free(buffered);
+            for (buffered) |event| {
+                conn.writeMessage(.task_event, request_id, event) catch |err| {
+                    log.warn("failed to stream output event: {}", .{err});
+                    break;
+                };
+            }
+
             common.compat.sleep(1 * std.time.ns_per_s);
         }
     }
@@ -550,6 +615,37 @@ pub const RequestHandler = struct {
         };
 
         try conn.writeMessage(.task_response, request_id, response);
+    }
+
+    pub fn handleGetTaskEvents(
+        self: *RequestHandler,
+        conn: *grpc.Connection,
+        task_id: types.TaskId,
+        request_id: u32,
+    ) !void {
+        const snapshot = self.scheduler.getTask(task_id) orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "NOT_FOUND",
+                .message = "Task not found",
+            });
+            return;
+        };
+
+        const task = snapshot.task;
+
+        // Drain any buffered output events for this task
+        const events = self.server.drainTaskEvents(task_id);
+        defer self.server.allocator.free(events);
+
+        const response = protocol.TaskEventsResponse{
+            .task_id = task.id,
+            .state = task.state,
+            .events = events,
+            .error_message = task.error_message,
+            .pr_url = task.pr_url,
+        };
+
+        try conn.writeMessage(.task_events_response, request_id, response);
     }
 
     pub fn handleCancelTask(
