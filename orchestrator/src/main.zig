@@ -6,7 +6,9 @@ const registry = @import("registry/registry.zig");
 const metering = @import("metering/metering.zig");
 const auth = @import("auth/auth.zig");
 const grpc_server = @import("grpc/server.zig");
+const http_server = @import("http/server.zig");
 const db = @import("db/root.zig");
+const analytics = @import("analytics/analytics.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -16,7 +18,8 @@ pub fn main() !void {
     const config = try common.config.OrchestratorConfig.fromEnv(allocator);
 
     std.log.info("Marathon Orchestrator starting...", .{});
-    std.log.info("Listen: {s}:{d}", .{ config.listen_address, config.listen_port });
+    std.log.info("gRPC Listen: {s}:{d}", .{ config.listen_address, config.listen_port });
+    std.log.info("HTTP Listen: {s}:{d}", .{ config.listen_address, config.listen_port + 1 });
 
     const db_pool = initDatabase(allocator, config.postgres_url) catch |err| {
         std.log.warn("database init failed: {} - running without persistence", .{err});
@@ -46,7 +49,7 @@ pub fn main() !void {
         auth.Authenticator.init(allocator, config.anthropic_api_key);
     defer authenticator.deinit();
 
-    var server = grpc_server.Server.init(
+    var grpc_srv = grpc_server.Server.init(
         allocator,
         &task_scheduler,
         &node_registry,
@@ -55,15 +58,40 @@ pub fn main() !void {
         config.node_auth_key,
         config.anthropic_api_key,
     );
-    defer server.deinit();
+    defer grpc_srv.deinit();
 
-    server.setRepositories(&task_repo, &node_repo, &usage_repo);
-    server.setUserRepository(&user_repo);
+    grpc_srv.setRepositories(&task_repo, &node_repo, &usage_repo);
+    grpc_srv.setUserRepository(&user_repo);
 
-    try server.listen(config.listen_address, config.listen_port);
-    std.log.info("Orchestrator ready and listening", .{});
+    // Initialize HTTP server
+    var http_srv = http_server.HttpServer.init(
+        allocator,
+        &grpc_srv,
+        db_pool,
+        &authenticator,
+    ) catch |err| {
+        std.log.err("Failed to initialize HTTP server: {}", .{err});
+        return;
+    };
+    defer http_srv.deinit();
 
-    try server.run();
+    try grpc_srv.listen(config.listen_address, config.listen_port);
+    try http_srv.listen(config.listen_address, config.listen_port + 1);
+    
+    std.log.info("Orchestrator ready and listening (gRPC + HTTP)", .{});
+
+    // Start HTTP server in a separate thread
+    const http_thread = try std.Thread.spawn(.{}, runHttpServer, .{&http_srv});
+    http_thread.detach();
+
+    // Run gRPC server in main thread
+    try grpc_srv.run();
+}
+
+fn runHttpServer(http_srv: *http_server.HttpServer) void {
+    http_srv.run() catch |err| {
+        std.log.err("HTTP server error: {}", .{err});
+    };
 }
 
 fn initDatabase(allocator: std.mem.Allocator, postgres_url: []const u8) !*db.Pool {
@@ -101,7 +129,7 @@ fn runWithoutDb(allocator: std.mem.Allocator, config: common.config.Orchestrator
         auth.Authenticator.init(allocator, config.anthropic_api_key);
     defer authenticator.deinit();
 
-    var server = grpc_server.Server.init(
+    var grpc_srv = grpc_server.Server.init(
         allocator,
         &task_scheduler,
         &node_registry,
@@ -110,12 +138,12 @@ fn runWithoutDb(allocator: std.mem.Allocator, config: common.config.Orchestrator
         config.node_auth_key,
         config.anthropic_api_key,
     );
-    defer server.deinit();
+    defer grpc_srv.deinit();
 
-    try server.listen(config.listen_address, config.listen_port);
+    try grpc_srv.listen(config.listen_address, config.listen_port);
     std.log.info("Orchestrator ready and listening (no persistence)", .{});
 
-    try server.run();
+    try grpc_srv.run();
 }
 
 test {
@@ -124,4 +152,6 @@ test {
     _ = metering;
     _ = auth;
     _ = db;
+    _ = analytics;
+    _ = http_server;
 }
