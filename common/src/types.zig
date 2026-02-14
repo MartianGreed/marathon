@@ -1,9 +1,201 @@
 const std = @import("std");
 
+// Existing ID types
 pub const TaskId = [32]u8;
 pub const NodeId = [16]u8;
 pub const VmId = [16]u8;
 pub const ClientId = [16]u8;
+
+// New collaboration ID types
+pub const UserId = struct {
+    bytes: [16]u8,
+
+    pub fn init() UserId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return UserId{ .bytes = id };
+    }
+
+    pub fn format(self: UserId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !UserId {
+        const bytes = try parseId([16]u8, hex);
+        return UserId{ .bytes = bytes };
+    }
+};
+
+pub const TeamId = struct {
+    bytes: [16]u8,
+
+    pub fn init() TeamId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return TeamId{ .bytes = id };
+    }
+
+    pub fn format(self: TeamId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !TeamId {
+        const bytes = try parseId([16]u8, hex);
+        return TeamId{ .bytes = bytes };
+    }
+};
+
+pub const WorkspaceId = struct {
+    bytes: [16]u8,
+
+    pub fn init() WorkspaceId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return WorkspaceId{ .bytes = id };
+    }
+
+    pub fn format(self: WorkspaceId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !WorkspaceId {
+        const bytes = try parseId([16]u8, hex);
+        return WorkspaceId{ .bytes = bytes };
+    }
+};
+
+pub const TaskAssignmentId = struct {
+    bytes: [16]u8,
+
+    pub fn init() TaskAssignmentId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return TaskAssignmentId{ .bytes = id };
+    }
+
+    pub fn format(self: TaskAssignmentId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !TaskAssignmentId {
+        const bytes = try parseId([16]u8, hex);
+        return TaskAssignmentId{ .bytes = bytes };
+    }
+};
+
+pub const CommentId = struct {
+    bytes: [16]u8,
+
+    pub fn init() CommentId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return CommentId{ .bytes = id };
+    }
+
+    pub fn format(self: CommentId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !CommentId {
+        const bytes = try parseId([16]u8, hex);
+        return CommentId{ .bytes = bytes };
+    }
+};
+
+pub const MemberId = struct {
+    bytes: [16]u8,
+
+    pub fn init() MemberId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return MemberId{ .bytes = id };
+    }
+
+    pub fn format(self: MemberId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !MemberId {
+        const bytes = try parseId([16]u8, hex);
+        return MemberId{ .bytes = bytes };
+    }
+};
+
+pub const TerminalSessionId = struct {
+    bytes: [16]u8,
+
+    pub fn init() TerminalSessionId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return TerminalSessionId{ .bytes = id };
+    }
+
+    pub fn format(self: TerminalSessionId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !TerminalSessionId {
+        const bytes = try parseId([16]u8, hex);
+        return TerminalSessionId{ .bytes = bytes };
+    }
+};
+
+pub const MessageId = struct {
+    bytes: [16]u8,
+
+    pub fn init() MessageId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return MessageId{ .bytes = id };
+    }
+
+    pub fn format(self: MessageId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !MessageId {
+        const bytes = try parseId([16]u8, hex);
+        return MessageId{ .bytes = bytes };
+    }
+};
+
+pub const TemplateId = struct {
+    bytes: [16]u8,
+
+    pub fn init() TemplateId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return TemplateId{ .bytes = id };
+    }
+
+    pub fn format(self: TemplateId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !TemplateId {
+        const bytes = try parseId([16]u8, hex);
+        return TemplateId{ .bytes = bytes };
+    }
+};
+
+pub const NotificationId = struct {
+    bytes: [16]u8,
+
+    pub fn init() NotificationId {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        return NotificationId{ .bytes = id };
+    }
+
+    pub fn format(self: NotificationId) [32]u8 {
+        return formatId(self.bytes);
+    }
+
+    pub fn fromString(hex: []const u8) !NotificationId {
+        const bytes = try parseId([16]u8, hex);
+        return NotificationId{ .bytes = bytes };
+    }
+};
 
 pub const EnvVar = struct {
     key: []const u8,
@@ -82,6 +274,11 @@ pub const Task = struct {
     pr_body: ?[]const u8,
     github_token: ?[]const u8,
 
+    // Team collaboration fields
+    user_id: ?UserId,
+    team_id: ?TeamId,
+    workspace_id: ?WorkspaceId,
+
     env_vars: []const EnvVar = &[_]EnvVar{},
     max_iterations: ?u32 = null,
     completion_promise: ?[]const u8 = null,
@@ -127,6 +324,9 @@ pub const Task = struct {
             .pr_title = null,
             .pr_body = null,
             .github_token = null,
+            .user_id = null,
+            .team_id = null,
+            .workspace_id = null,
         };
     }
 };
@@ -240,4 +440,16 @@ test "id formatting" {
     const id = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     const formatted = formatId(id);
     try std.testing.expectEqualStrings("deadbeef", &formatted);
+}
+
+test "user id generation" {
+    const id1 = UserId.init();
+    const id2 = UserId.init();
+    
+    // IDs should be different
+    try std.testing.expect(!std.mem.eql(u8, &id1.bytes, &id2.bytes));
+    
+    // Formatting should work
+    const formatted = id1.format();
+    try std.testing.expectEqual(@as(usize, 32), formatted.len);
 }
