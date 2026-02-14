@@ -35,7 +35,7 @@ WORKDIR /app
 
 COPY --from=builder /build/zig-out/bin/marathon-orchestrator /usr/local/bin/
 
-EXPOSE 8080 9090
+EXPOSE 8080 9090 9091
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD nc -z localhost 8080 || exit 1
