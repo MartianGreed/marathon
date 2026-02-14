@@ -1,6 +1,6 @@
 import { logout, getEmail } from '../lib/api';
 
-type Page = 'login' | 'register' | 'dashboard' | 'usage';
+type Page = 'login' | 'register' | 'dashboard' | 'usage' | 'analytics';
 
 interface NavbarProps {
   currentPage: Page;
@@ -29,6 +29,9 @@ export function Navbar({ currentPage, onNavigate, onLogout }: NavbarProps) {
           <div className="flex items-center gap-1">
             <NavLink active={currentPage === 'dashboard'} onClick={() => onNavigate('dashboard')}>
               Tasks
+            </NavLink>
+            <NavLink active={currentPage === 'analytics'} onClick={() => onNavigate('analytics')}>
+              Analytics
             </NavLink>
             <NavLink active={currentPage === 'usage'} onClick={() => onNavigate('usage')}>
               Usage
