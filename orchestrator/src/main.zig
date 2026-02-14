@@ -6,6 +6,7 @@ const registry = @import("registry/registry.zig");
 const metering = @import("metering/metering.zig");
 const auth = @import("auth/auth.zig");
 const grpc_server = @import("grpc/server.zig");
+const http_server = @import("http/server.zig");
 const db = @import("db/root.zig");
 
 pub fn main() !void {
@@ -61,7 +62,20 @@ pub fn main() !void {
     server.setUserRepository(&user_repo);
 
     try server.listen(config.listen_address, config.listen_port);
-    std.log.info("Orchestrator ready and listening", .{});
+    std.log.info("Orchestrator gRPC ready and listening on port {d}", .{config.listen_port});
+
+    // Start HTTP API server on port 9091
+    const http_port: u16 = 9091;
+    var http = http_server.HttpServer.init(allocator, &authenticator);
+    defer http.deinit();
+    http.setUserRepository(&user_repo);
+    http.setScheduler(&task_scheduler);
+    http.setMetering(&meter);
+    try http.listen(config.listen_address, http_port);
+    std.log.info("HTTP API server listening on port {d}", .{http_port});
+
+    const http_thread = try std.Thread.spawn(.{}, http_server.HttpServer.run, .{&http});
+    http_thread.detach();
 
     try server.run();
 }
@@ -113,7 +127,19 @@ fn runWithoutDb(allocator: std.mem.Allocator, config: common.config.Orchestrator
     defer server.deinit();
 
     try server.listen(config.listen_address, config.listen_port);
-    std.log.info("Orchestrator ready and listening (no persistence)", .{});
+    std.log.info("Orchestrator gRPC ready and listening (no persistence) on port {d}", .{config.listen_port});
+
+    // Start HTTP API server on port 9091
+    const http_port: u16 = 9091;
+    var http = http_server.HttpServer.init(allocator, &authenticator);
+    defer http.deinit();
+    http.setScheduler(&task_scheduler);
+    http.setMetering(&meter);
+    try http.listen(config.listen_address, http_port);
+    std.log.info("HTTP API server listening on port {d}", .{http_port});
+
+    const http_thread = try std.Thread.spawn(.{}, http_server.HttpServer.run, .{&http});
+    http_thread.detach();
 
     try server.run();
 }
@@ -124,4 +150,5 @@ test {
     _ = metering;
     _ = auth;
     _ = db;
+    _ = http_server;
 }

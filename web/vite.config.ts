@@ -7,9 +7,9 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      '/auth': 'http://localhost:8081',
-      '/tasks': 'http://localhost:8081',
-      '/usage': 'http://localhost:8081',
+      '/auth': process.env.VITE_API_URL || 'http://localhost:9091',
+      '/tasks': process.env.VITE_API_URL || 'http://localhost:9091',
+      '/usage': process.env.VITE_API_URL || 'http://localhost:9091',
     },
   },
 })

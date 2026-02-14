@@ -7,6 +7,7 @@ services:
     dns: 127.0.0.11
     ports:
       - "8443:8080"
+      - "9091:9091"
     restart: unless-stopped
     environment:
       MARATHON_ANTHROPIC_API_KEY: ${MARATHON_ANTHROPIC_API_KEY}
@@ -54,6 +55,19 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  web:
+    container_name: marathon-web
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    ports:
+      - "3000:80"
+    restart: unless-stopped
+    depends_on:
+      - orchestrator
+    networks:
+      - marathon-internal
 
   etcd:
     restart: unless-stopped
