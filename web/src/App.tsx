@@ -4,11 +4,12 @@ import { isAuthenticated } from './lib/api';
 import { LoginPage } from './pages/Login';
 import { RegisterPage } from './pages/Register';
 import { DashboardPage } from './pages/Dashboard';
+import { IntegrationsPage } from './pages/Integrations';
 import { Navbar } from './components/Navbar';
 
 const queryClient = new QueryClient();
 
-type Page = 'login' | 'register' | 'dashboard' | 'usage';
+type Page = 'login' | 'register' | 'dashboard' | 'integrations' | 'usage';
 
 function AppContent() {
   const [page, setPage] = useState<Page>(isAuthenticated() ? 'dashboard' : 'login');
@@ -37,6 +38,7 @@ function AppContent() {
         {page === 'login' && <LoginPage onAuth={onAuth} onSwitch={() => setPage('register')} />}
         {page === 'register' && <RegisterPage onAuth={onAuth} onSwitch={() => setPage('login')} />}
         {page === 'dashboard' && <DashboardPage />}
+        {page === 'integrations' && <IntegrationsPage />}
       </main>
     </div>
   );

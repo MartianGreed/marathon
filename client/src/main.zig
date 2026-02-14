@@ -3,6 +3,7 @@ const common = @import("common");
 const types = common.types;
 const protocol = common.protocol;
 const grpc = common.grpc;
+const integration_commands = @import("integration_commands.zig");
 
 const Command = enum {
     submit,
@@ -14,6 +15,10 @@ const Command = enum {
     whoami,
     logout,
     help,
+    integration,
+    github,
+    docker,
+    aws,
 };
 
 pub fn main() !void {
@@ -47,6 +52,22 @@ pub fn main() !void {
         .whoami => try handleWhoami(allocator),
         .logout => try handleLogout(allocator),
         .help => printUsage(),
+        .integration => {
+            var integration_cmds = integration_commands.IntegrationCommands.init(allocator, &config);
+            try integration_cmds.handleIntegrationCommand(args[2..]);
+        },
+        .github => {
+            var integration_cmds = integration_commands.IntegrationCommands.init(allocator, &config);
+            try integration_cmds.handleGitHubCommand(args[2..]);
+        },
+        .docker => {
+            var integration_cmds = integration_commands.IntegrationCommands.init(allocator, &config);
+            try integration_cmds.handleDockerCommand(args[2..]);
+        },
+        .aws => {
+            var integration_cmds = integration_commands.IntegrationCommands.init(allocator, &config);
+            try integration_cmds.handleAWSCommand(args[2..]);
+        },
     }
 }
 
@@ -63,6 +84,10 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ .name = "help", .cmd = .help },
         .{ .name = "--help", .cmd = .help },
         .{ .name = "-h", .cmd = .help },
+        .{ .name = "integration", .cmd = .integration },
+        .{ .name = "github", .cmd = .github },
+        .{ .name = "docker", .cmd = .docker },
+        .{ .name = "aws", .cmd = .aws },
     };
 
     for (commands) |c| {
@@ -87,6 +112,12 @@ fn printUsage() void {
         \\  cancel <task-id>     Cancel a running task
         \\  usage                Get usage report
         \\  help                 Show this help
+        \\
+        \\Integration Commands:
+        \\  integration          Manage service integrations
+        \\  github               GitHub integration commands
+        \\  docker               Docker integration commands
+        \\  aws                  AWS integration commands
         \\
         \\Auth Options (login/register):
         \\  --email <email>      Email address
@@ -118,6 +149,13 @@ fn printUsage() void {
         \\  marathon status abc123
         \\  marathon cancel abc123
         \\  marathon usage
+        \\
+        \\Integration Examples:
+        \\  marathon integration list
+        \\  marathon integration connect github
+        \\  marathon github clone --integration-id github-1 --repo owner/repo --dest ./repo
+        \\  marathon docker build --integration-id docker-1 --image myapp:latest
+        \\  marathon aws deploy --integration-id aws-1 --service lambda
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -711,5 +749,9 @@ test "command parsing" {
     try std.testing.expectEqual(Command.whoami, parseCommand("whoami").?);
     try std.testing.expectEqual(Command.logout, parseCommand("logout").?);
     try std.testing.expectEqual(Command.help, parseCommand("help").?);
+    try std.testing.expectEqual(Command.integration, parseCommand("integration").?);
+    try std.testing.expectEqual(Command.github, parseCommand("github").?);
+    try std.testing.expectEqual(Command.docker, parseCommand("docker").?);
+    try std.testing.expectEqual(Command.aws, parseCommand("aws").?);
     try std.testing.expect(parseCommand("invalid") == null);
 }
