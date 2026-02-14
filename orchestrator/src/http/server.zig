@@ -223,15 +223,15 @@ pub const HttpServer = struct {
         defer self.allocator.free(result.tasks);
 
         // Build JSON array
-        var json = std.ArrayList(u8).init(self.allocator);
-        defer json.deinit();
+        var json: std.ArrayListUnmanaged(u8) = .empty;
+        defer json.deinit(self.allocator);
 
-        try json.appendSlice("[");
+        try json.appendSlice(self.allocator, "[");
         for (result.tasks, 0..) |task, i| {
-            if (i > 0) try json.appendSlice(",");
-            try appendTaskJson(&json, &task);
+            if (i > 0) try json.appendSlice(self.allocator, ",");
+            try appendTaskJson(self.allocator, &json, &task);
         }
-        try json.appendSlice("]");
+        try json.appendSlice(self.allocator, "]");
 
         return sendJson(stream, 200, json.items);
     }
@@ -248,10 +248,10 @@ pub const HttpServer = struct {
 
         const snapshot = sched.getTask(task_id) orelse return sendJsonError(stream, 404, "Task not found");
 
-        var json = std.ArrayList(u8).init(self.allocator);
-        defer json.deinit();
+        var json: std.ArrayListUnmanaged(u8) = .empty;
+        defer json.deinit(self.allocator);
 
-        try appendTaskJson(&json, snapshot.task);
+        try appendTaskJson(self.allocator, &json, snapshot.task);
         return sendJson(stream, 200, json.items);
     }
 
@@ -275,7 +275,7 @@ pub const HttpServer = struct {
         return sendJson(stream, 200, resp);
     }
 
-    fn appendTaskJson(json: *std.ArrayList(u8), task: *const types.Task) !void {
+    fn appendTaskJson(allocator: std.mem.Allocator, json: *std.ArrayListUnmanaged(u8), task: *const types.Task) !void {
         const id_hex = std.fmt.bytesToHex(task.id, .lower);
         var buf: [2048]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{{\"id\":\"{s}\",\"state\":\"{s}\",\"repo_url\":\"{s}\",\"branch\":\"{s}\",\"prompt\":\"{s}\",\"created_at\":{d}", .{
@@ -286,27 +286,27 @@ pub const HttpServer = struct {
             task.prompt,
             task.created_at,
         }) catch return;
-        try json.appendSlice(s);
+        try json.appendSlice(allocator, s);
 
         if (task.started_at) |v| {
             var b2: [64]u8 = undefined;
             const s2 = std.fmt.bufPrint(&b2, ",\"started_at\":{d}", .{v}) catch return;
-            try json.appendSlice(s2);
+            try json.appendSlice(allocator, s2);
         }
         if (task.completed_at) |v| {
             var b2: [64]u8 = undefined;
             const s2 = std.fmt.bufPrint(&b2, ",\"completed_at\":{d}", .{v}) catch return;
-            try json.appendSlice(s2);
+            try json.appendSlice(allocator, s2);
         }
         if (task.error_message) |msg| {
-            try json.appendSlice(",\"error_message\":\"");
-            try json.appendSlice(msg);
-            try json.appendSlice("\"");
+            try json.appendSlice(allocator, ",\"error_message\":\"");
+            try json.appendSlice(allocator, msg);
+            try json.appendSlice(allocator, "\"");
         }
         if (task.pr_url) |url| {
-            try json.appendSlice(",\"pr_url\":\"");
-            try json.appendSlice(url);
-            try json.appendSlice("\"");
+            try json.appendSlice(allocator, ",\"pr_url\":\"");
+            try json.appendSlice(allocator, url);
+            try json.appendSlice(allocator, "\"");
         }
 
         var usage_buf: [256]u8 = undefined;
@@ -316,9 +316,9 @@ pub const HttpServer = struct {
             task.usage.compute_time_ms,
             task.usage.tool_calls,
         }) catch return;
-        try json.appendSlice(usage_s);
+        try json.appendSlice(allocator, usage_s);
 
-        try json.appendSlice("}");
+        try json.appendSlice(allocator, "}");
     }
 };
 
