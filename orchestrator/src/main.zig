@@ -7,6 +7,7 @@ const metering = @import("metering/metering.zig");
 const auth = @import("auth/auth.zig");
 const grpc_server = @import("grpc/server.zig");
 const db = @import("db/root.zig");
+const workspace = @import("workspace/workspace.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -28,6 +29,9 @@ pub fn main() !void {
     var node_repo = db.NodeRepository.init(allocator, db_pool);
     var usage_repo = db.UsageRepository.init(allocator, db_pool);
     var user_repo = db.UserRepository.init(allocator, db_pool);
+    var workspace_repo = db.WorkspaceRepository.init(allocator, db_pool);
+
+    var workspace_service = workspace.WorkspaceService.init(allocator, &workspace_repo);
 
     std.log.info("database connected and migrations applied", .{});
 
@@ -59,6 +63,7 @@ pub fn main() !void {
 
     server.setRepositories(&task_repo, &node_repo, &usage_repo);
     server.setUserRepository(&user_repo);
+    server.setWorkspaceService(&workspace_service);
 
     try server.listen(config.listen_address, config.listen_port);
     std.log.info("Orchestrator ready and listening", .{});
@@ -124,4 +129,5 @@ test {
     _ = metering;
     _ = auth;
     _ = db;
+    _ = workspace;
 }

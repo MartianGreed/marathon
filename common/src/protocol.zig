@@ -36,6 +36,19 @@ pub const MessageType = enum(u8) {
     auth_register = 0x40,
     auth_login = 0x41,
     auth_response = 0x42,
+
+    // Workspace messages
+    workspace_create = 0x50,
+    workspace_list = 0x51,
+    workspace_get = 0x52,
+    workspace_update = 0x53,
+    workspace_delete = 0x54,
+    workspace_switch = 0x55,
+    workspace_current = 0x56,
+    workspace_templates = 0x57,
+    workspace_response = 0x58,
+    workspace_list_response = 0x59,
+    workspace_templates_response = 0x5a,
 };
 
 pub const Header = extern struct {
@@ -272,6 +285,7 @@ pub const SubmitTaskRequest = struct {
     env_vars: []const EnvVar = &[_]EnvVar{},
     max_iterations: ?u32 = null,
     completion_promise: ?[]const u8 = null,
+    workspace_id: ?types.WorkspaceId = null,
 };
 
 pub const ExecuteTaskRequest = struct {
@@ -510,6 +524,61 @@ pub const AuthResponse = struct {
     token: ?[]const u8,
     api_key: ?[]const u8,
     message: []const u8,
+};
+
+// Workspace protocol messages
+pub const WorkspaceCreateRequest = struct {
+    name: []const u8,
+    description: ?[]const u8,
+    template: ?[]const u8,
+    settings: ?[]const u8, // JSON string
+};
+
+pub const WorkspaceUpdateRequest = struct {
+    workspace_id: types.WorkspaceId,
+    name: ?[]const u8,
+    description: ?[]const u8,
+    settings: ?[]const u8, // JSON string
+};
+
+pub const WorkspaceDeleteRequest = struct {
+    workspace_id: types.WorkspaceId,
+};
+
+pub const WorkspaceGetRequest = struct {
+    workspace_id: ?types.WorkspaceId, // null for current workspace
+    name: ?[]const u8, // alternative lookup by name
+};
+
+pub const WorkspaceListRequest = struct {
+    limit: u32,
+    offset: u32,
+};
+
+pub const WorkspaceSwitchRequest = struct {
+    workspace_id: ?types.WorkspaceId,
+    name: ?[]const u8, // alternative lookup by name
+};
+
+pub const WorkspaceCurrentRequest = struct {};
+
+pub const WorkspaceTemplatesRequest = struct {};
+
+pub const WorkspaceResponse = struct {
+    success: bool,
+    workspace: ?types.Workspace,
+    env_vars: []const EnvVar,
+    message: []const u8,
+};
+
+pub const WorkspaceListResponse = struct {
+    workspaces: []const types.WorkspaceSummary,
+    total_count: u32,
+    current_workspace_id: ?types.WorkspaceId,
+};
+
+pub const WorkspaceTemplatesResponse = struct {
+    templates: []const types.WorkspaceTemplate,
 };
 
 pub fn freeDecoded(comptime T: type, allocator: std.mem.Allocator, value: T) void {
@@ -821,4 +890,31 @@ test "VsockErrorPayload roundtrip encoding" {
 
     try std.testing.expectEqualStrings(original.code, decoded.code);
     try std.testing.expectEqualStrings(original.message, decoded.message);
+}
+
+test "WorkspaceCreateRequest roundtrip encoding" {
+    const allocator = std.testing.allocator;
+
+    const original = WorkspaceCreateRequest{
+        .name = "my-workspace",
+        .description = "A test workspace",
+        .template = "web-app",
+        .settings = "{}",
+    };
+
+    const encoded = try encodePayload(WorkspaceCreateRequest, allocator, original);
+    defer allocator.free(encoded);
+
+    const decoded = try decodePayload(WorkspaceCreateRequest, allocator, encoded);
+    defer {
+        allocator.free(decoded.name);
+        if (decoded.description) |d| allocator.free(d);
+        if (decoded.template) |t| allocator.free(t);
+        if (decoded.settings) |s| allocator.free(s);
+    }
+
+    try std.testing.expectEqualStrings(original.name, decoded.name);
+    try std.testing.expectEqualStrings(original.description.?, decoded.description.?);
+    try std.testing.expectEqualStrings(original.template.?, decoded.template.?);
+    try std.testing.expectEqualStrings(original.settings.?, decoded.settings.?);
 }

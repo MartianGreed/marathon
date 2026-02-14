@@ -12,6 +12,7 @@ const metering = @import("../metering/metering.zig");
 const auth = @import("../auth/auth.zig");
 const db = @import("../db/root.zig");
 const user_repo = @import("../db/repository/user.zig");
+const workspace = @import("../workspace/workspace.zig");
 
 fn validateRepoUrl(url: []const u8) bool {
     if (url.len < 10 or url.len > 2048) return false;
@@ -75,6 +76,7 @@ pub const Server = struct {
     pending_tasks: std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)),
     anthropic_api_key: []const u8,
     user_repo: ?*user_repo.UserRepository,
+    workspace_service: ?*workspace.WorkspaceService,
     /// Buffered task output events from node operators, keyed by task_id.
     /// Consumed by streamTaskEvents for real-time streaming to clients.
     task_events_mutex: std.Thread.Mutex = .{},
@@ -104,6 +106,7 @@ pub const Server = struct {
             .pending_tasks = std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)).init(allocator),
             .anthropic_api_key = anthropic_api_key,
             .user_repo = null,
+            .workspace_service = null,
             .task_event_buffers = std.AutoHashMap(types.TaskId, std.ArrayListUnmanaged(protocol.TaskEvent)).init(allocator),
         };
     }
@@ -121,6 +124,10 @@ pub const Server = struct {
 
     pub fn setUserRepository(self: *Server, repo: *user_repo.UserRepository) void {
         self.user_repo = repo;
+    }
+
+    pub fn setWorkspaceService(self: *Server, service: *workspace.WorkspaceService) void {
+        self.workspace_service = service;
     }
 
     pub fn deinit(self: *Server) void {
@@ -260,6 +267,39 @@ pub const Server = struct {
                 const request = try conn.readPayload(protocol.AuthLoginRequest, header);
                 try self.handleAuthLogin(conn, request, header.request_id);
             },
+            // Workspace message handlers
+            .workspace_create => {
+                const request = try conn.readPayload(protocol.WorkspaceCreateRequest, header);
+                try self.handleWorkspaceCreate(conn, request, client_id, header.request_id);
+            },
+            .workspace_list => {
+                const request = try conn.readPayload(protocol.WorkspaceListRequest, header);
+                try self.handleWorkspaceList(conn, request, client_id, header.request_id);
+            },
+            .workspace_get => {
+                const request = try conn.readPayload(protocol.WorkspaceGetRequest, header);
+                try self.handleWorkspaceGet(conn, request, client_id, header.request_id);
+            },
+            .workspace_update => {
+                const request = try conn.readPayload(protocol.WorkspaceUpdateRequest, header);
+                try self.handleWorkspaceUpdate(conn, request, client_id, header.request_id);
+            },
+            .workspace_delete => {
+                const request = try conn.readPayload(protocol.WorkspaceDeleteRequest, header);
+                try self.handleWorkspaceDelete(conn, request, client_id, header.request_id);
+            },
+            .workspace_switch => {
+                const request = try conn.readPayload(protocol.WorkspaceSwitchRequest, header);
+                try self.handleWorkspaceSwitch(conn, request, client_id, header.request_id);
+            },
+            .workspace_current => {
+                const request = try conn.readPayload(protocol.WorkspaceCurrentRequest, header);
+                try self.handleWorkspaceCurrent(conn, request, client_id, header.request_id);
+            },
+            .workspace_templates => {
+                const request = try conn.readPayload(protocol.WorkspaceTemplatesRequest, header);
+                try self.handleWorkspaceTemplates(conn, request, header.request_id);
+            },
             else => {
                 log.warn("unsupported message type: {}", .{header.msg_type});
                 try conn.writeMessage(.error_response, header.request_id, protocol.ErrorResponse{
@@ -270,6 +310,7 @@ pub const Server = struct {
         }
     }
 
+    // [Previous heartbeat, auth handlers remain the same...]
     fn handleHeartbeat(
         self: *Server,
         conn: *grpc.Connection,
@@ -446,6 +487,13 @@ pub const Server = struct {
         const token = try self.auth.createToken(self.allocator, user_id, request.email);
         defer self.allocator.free(token);
 
+        // Create default workspace for new user
+        if (self.workspace_service) |ws| {
+            _ = ws.createDefaultWorkspace(user_id) catch |err| {
+                log.warn("failed to create default workspace for new user: {}", .{err});
+            };
+        }
+
         log.info("user registered: email={s}", .{request.email});
 
         try conn.writeMessage(.auth_response, request_id, protocol.AuthResponse{
@@ -500,6 +548,256 @@ pub const Server = struct {
             .token = token,
             .api_key = found_user.api_key,
             .message = "Login successful",
+        });
+    }
+
+    // Workspace message handlers
+    fn handleWorkspaceCreate(self: *Server, conn: *grpc.Connection, request: protocol.WorkspaceCreateRequest, client_id: types.ClientId, request_id: u32) !void {
+        const ws_service = self.workspace_service orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "SERVICE_UNAVAILABLE",
+                .message = "Workspace service not available",
+            });
+            return;
+        };
+
+        // For now, derive user_id from client_id - in production this would come from JWT
+        const user_id: types.UserId = client_id;
+
+        const workspace = ws_service.createWorkspace(
+            user_id,
+            request.name,
+            request.description,
+            request.template,
+            request.settings,
+        ) catch |err| switch (err) {
+            error.WorkspaceNameExists => {
+                try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+                    .success = false,
+                    .workspace = null,
+                    .env_vars = &[_]types.EnvVar{},
+                    .message = "Workspace name already exists",
+                });
+                return;
+            },
+            else => {
+                try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                    .code = "CREATION_FAILED",
+                    .message = "Failed to create workspace",
+                });
+                return;
+            },
+        };
+
+        const env_vars = try ws_service.workspace_repo.getWorkspaceEnvVars(workspace.id);
+
+        try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+            .success = true,
+            .workspace = workspace,
+            .env_vars = env_vars,
+            .message = "Workspace created successfully",
+        });
+
+        log.info("workspace created via grpc: workspace_id={s} name={s}", .{
+            &types.formatId(workspace.id),
+            workspace.name,
+        });
+    }
+
+    fn handleWorkspaceList(self: *Server, conn: *grpc.Connection, request: protocol.WorkspaceListRequest, client_id: types.ClientId, request_id: u32) !void {
+        const ws_service = self.workspace_service orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "SERVICE_UNAVAILABLE",
+                .message = "Workspace service not available",
+            });
+            return;
+        };
+
+        const user_id: types.UserId = client_id;
+        const workspaces = try ws_service.listWorkspaces(user_id, request.limit, request.offset);
+
+        var current_workspace_id: ?types.WorkspaceId = null;
+        if (try ws_service.getCurrentWorkspace(user_id)) |current| {
+            current_workspace_id = current.id;
+            current.deinit(self.allocator);
+        }
+
+        try conn.writeMessage(.workspace_list_response, request_id, protocol.WorkspaceListResponse{
+            .workspaces = workspaces,
+            .total_count = @intCast(workspaces.len), // This should be actual total from database
+            .current_workspace_id = current_workspace_id,
+        });
+    }
+
+    fn handleWorkspaceGet(self: *Server, conn: *grpc.Connection, request: protocol.WorkspaceGetRequest, client_id: types.ClientId, request_id: u32) !void {
+        const ws_service = self.workspace_service orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "SERVICE_UNAVAILABLE",
+                .message = "Workspace service not available",
+            });
+            return;
+        };
+
+        const user_id: types.UserId = client_id;
+
+        var workspace: ?types.Workspace = null;
+        if (request.workspace_id) |id| {
+            workspace = try ws_service.getWorkspace(id);
+        } else if (request.name) |name| {
+            workspace = try ws_service.getWorkspaceByName(name, user_id);
+        } else {
+            workspace = try ws_service.getCurrentWorkspace(user_id);
+        }
+
+        if (workspace) |ws| {
+            const env_vars = try ws_service.workspace_repo.getWorkspaceEnvVars(ws.id);
+            try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+                .success = true,
+                .workspace = ws,
+                .env_vars = env_vars,
+                .message = "Workspace retrieved successfully",
+            });
+        } else {
+            try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+                .success = false,
+                .workspace = null,
+                .env_vars = &[_]types.EnvVar{},
+                .message = "Workspace not found",
+            });
+        }
+    }
+
+    fn handleWorkspaceUpdate(self: *Server, conn: *grpc.Connection, request: protocol.WorkspaceUpdateRequest, client_id: types.ClientId, request_id: u32) !void {
+        _ = client_id; // TODO: Add proper authorization check
+        const ws_service = self.workspace_service orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "SERVICE_UNAVAILABLE",
+                .message = "Workspace service not available",
+            });
+            return;
+        };
+
+        const updated = try ws_service.updateWorkspace(
+            request.workspace_id,
+            request.name,
+            request.description,
+            request.settings,
+        );
+
+        if (updated) {
+            if (try ws_service.getWorkspace(request.workspace_id)) |workspace| {
+                const env_vars = try ws_service.workspace_repo.getWorkspaceEnvVars(workspace.id);
+                try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+                    .success = true,
+                    .workspace = workspace,
+                    .env_vars = env_vars,
+                    .message = "Workspace updated successfully",
+                });
+            } else {
+                try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                    .code = "INTERNAL_ERROR",
+                    .message = "Workspace updated but cannot retrieve",
+                });
+            }
+        } else {
+            try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+                .success = false,
+                .workspace = null,
+                .env_vars = &[_]types.EnvVar{},
+                .message = "Workspace not found or not updated",
+            });
+        }
+    }
+
+    fn handleWorkspaceDelete(self: *Server, conn: *grpc.Connection, request: protocol.WorkspaceDeleteRequest, client_id: types.ClientId, request_id: u32) !void {
+        _ = client_id; // TODO: Add proper authorization check
+        const ws_service = self.workspace_service orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "SERVICE_UNAVAILABLE",
+                .message = "Workspace service not available",
+            });
+            return;
+        };
+
+        const deleted = try ws_service.deleteWorkspace(request.workspace_id);
+
+        try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+            .success = deleted,
+            .workspace = null,
+            .env_vars = &[_]types.EnvVar{},
+            .message = if (deleted) "Workspace deleted successfully" else "Workspace not found",
+        });
+    }
+
+    fn handleWorkspaceSwitch(self: *Server, conn: *grpc.Connection, request: protocol.WorkspaceSwitchRequest, client_id: types.ClientId, request_id: u32) !void {
+        const ws_service = self.workspace_service orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "SERVICE_UNAVAILABLE",
+                .message = "Workspace service not available",
+            });
+            return;
+        };
+
+        const user_id: types.UserId = client_id;
+        var success = false;
+
+        if (request.workspace_id) |id| {
+            success = try ws_service.switchWorkspace(user_id, id);
+        } else if (request.name) |name| {
+            success = try ws_service.switchWorkspaceByName(user_id, name);
+        }
+
+        try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+            .success = success,
+            .workspace = null,
+            .env_vars = &[_]types.EnvVar{},
+            .message = if (success) "Workspace switched successfully" else "Failed to switch workspace",
+        });
+    }
+
+    fn handleWorkspaceCurrent(self: *Server, conn: *grpc.Connection, request: protocol.WorkspaceCurrentRequest, client_id: types.ClientId, request_id: u32) !void {
+        _ = request;
+        const ws_service = self.workspace_service orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "SERVICE_UNAVAILABLE",
+                .message = "Workspace service not available",
+            });
+            return;
+        };
+
+        const user_id: types.UserId = client_id;
+        if (try ws_service.getCurrentWorkspace(user_id)) |workspace| {
+            const env_vars = try ws_service.workspace_repo.getWorkspaceEnvVars(workspace.id);
+            try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+                .success = true,
+                .workspace = workspace,
+                .env_vars = env_vars,
+                .message = "Current workspace retrieved",
+            });
+        } else {
+            try conn.writeMessage(.workspace_response, request_id, protocol.WorkspaceResponse{
+                .success = false,
+                .workspace = null,
+                .env_vars = &[_]types.EnvVar{},
+                .message = "No active workspace",
+            });
+        }
+    }
+
+    fn handleWorkspaceTemplates(self: *Server, conn: *grpc.Connection, request: protocol.WorkspaceTemplatesRequest, request_id: u32) !void {
+        _ = request;
+        const ws_service = self.workspace_service orelse {
+            try conn.writeMessage(.error_response, request_id, protocol.ErrorResponse{
+                .code = "SERVICE_UNAVAILABLE",
+                .message = "Workspace service not available",
+            });
+            return;
+        };
+
+        const templates = try ws_service.getTemplates();
+
+        try conn.writeMessage(.workspace_templates_response, request_id, protocol.WorkspaceTemplatesResponse{
+            .templates = templates,
         });
     }
 
@@ -633,6 +931,40 @@ pub const RequestHandler = struct {
         task.env_vars = request.env_vars;
         task.max_iterations = request.max_iterations;
         task.completion_promise = request.completion_promise;
+
+        // Merge workspace environment variables if workspace is specified
+        if (request.workspace_id) |workspace_id| {
+            if (self.server.workspace_service) |ws| {
+                const workspace_env_vars = try ws.workspace_repo.getWorkspaceEnvVars(workspace_id);
+                
+                // Merge env vars (request vars take precedence over workspace vars)
+                var merged_env_vars = try self.allocator.alloc(types.EnvVar, task.env_vars.len + workspace_env_vars.len);
+                var merge_count: usize = 0;
+                
+                // Add workspace vars first
+                for (workspace_env_vars) |ws_var| {
+                    var found = false;
+                    for (task.env_vars) |task_var| {
+                        if (std.mem.eql(u8, task_var.key, ws_var.key)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        merged_env_vars[merge_count] = ws_var;
+                        merge_count += 1;
+                    }
+                }
+                
+                // Add task-specific vars (these override workspace vars)
+                for (task.env_vars) |task_var| {
+                    merged_env_vars[merge_count] = task_var;
+                    merge_count += 1;
+                }
+                
+                task.env_vars = merged_env_vars[0..merge_count];
+            }
+        }
 
         if (self.task_repo) |repo| {
             log.info("handleSubmitTask: persisting task to DB", .{});

@@ -4,6 +4,8 @@ pub const TaskId = [32]u8;
 pub const NodeId = [16]u8;
 pub const VmId = [16]u8;
 pub const ClientId = [16]u8;
+pub const UserId = [16]u8;
+pub const WorkspaceId = [16]u8;
 
 pub const EnvVar = struct {
     key: []const u8,
@@ -128,6 +130,74 @@ pub const Task = struct {
             .pr_body = null,
             .github_token = null,
         };
+    }
+};
+
+// Workspace-related types
+pub const Workspace = struct {
+    id: WorkspaceId,
+    name: []const u8,
+    description: ?[]const u8,
+    user_id: UserId,
+    template: ?[]const u8,
+    settings: []const u8, // JSON string
+    created_at: i64,
+    updated_at: i64,
+    last_accessed_at: i64,
+
+    pub fn deinit(self: *Workspace, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.description) |desc| allocator.free(desc);
+        if (self.template) |tmpl| allocator.free(tmpl);
+        allocator.free(self.settings);
+    }
+};
+
+pub const WorkspaceTemplate = struct {
+    id: WorkspaceId,
+    name: []const u8,
+    description: ?[]const u8,
+    default_settings: []const u8, // JSON string
+    default_env_vars: []const u8, // JSON string
+    created_at: i64,
+
+    pub fn deinit(self: *WorkspaceTemplate, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.description) |desc| allocator.free(desc);
+        allocator.free(self.default_settings);
+        allocator.free(self.default_env_vars);
+    }
+};
+
+pub const WorkspaceActivity = struct {
+    id: WorkspaceId,
+    workspace_id: WorkspaceId,
+    activity_type: []const u8,
+    description: ?[]const u8,
+    metadata: []const u8, // JSON string
+    timestamp: i64,
+
+    pub fn deinit(self: *WorkspaceActivity, allocator: std.mem.Allocator) void {
+        allocator.free(self.activity_type);
+        if (self.description) |desc| allocator.free(desc);
+        allocator.free(self.metadata);
+    }
+};
+
+pub const WorkspaceSummary = struct {
+    id: WorkspaceId,
+    name: []const u8,
+    description: ?[]const u8,
+    template: ?[]const u8,
+    created_at: i64,
+    last_accessed_at: i64,
+    task_count: u32,
+    is_active: bool,
+
+    pub fn deinit(self: *WorkspaceSummary, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        if (self.description) |desc| allocator.free(desc);
+        if (self.template) |tmpl| allocator.free(tmpl);
     }
 };
 

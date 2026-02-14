@@ -14,6 +14,18 @@ const Command = enum {
     whoami,
     logout,
     help,
+    // Workspace commands
+    workspace,
+};
+
+const WorkspaceSubcommand = enum {
+    create,
+    list,
+    switch,
+    delete,
+    current,
+    info,
+    help,
 };
 
 pub fn main() !void {
@@ -46,6 +58,7 @@ pub fn main() !void {
         .register => try handleRegister(config, allocator, args[2..]),
         .whoami => try handleWhoami(allocator),
         .logout => try handleLogout(allocator),
+        .workspace => try handleWorkspace(config, allocator, args[2..]),
         .help => printUsage(),
     }
 }
@@ -60,12 +73,32 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ .name = "register", .cmd = .register },
         .{ .name = "whoami", .cmd = .whoami },
         .{ .name = "logout", .cmd = .logout },
+        .{ .name = "workspace", .cmd = .workspace },
         .{ .name = "help", .cmd = .help },
         .{ .name = "--help", .cmd = .help },
         .{ .name = "-h", .cmd = .help },
     };
 
     for (commands) |c| {
+        if (std.mem.eql(u8, arg, c.name)) return c.cmd;
+    }
+    return null;
+}
+
+fn parseWorkspaceSubcommand(arg: []const u8) ?WorkspaceSubcommand {
+    const subcommands = [_]struct { name: []const u8, cmd: WorkspaceSubcommand }{
+        .{ .name = "create", .cmd = .create },
+        .{ .name = "list", .cmd = .list },
+        .{ .name = "switch", .cmd = .switch },
+        .{ .name = "delete", .cmd = .delete },
+        .{ .name = "current", .cmd = .current },
+        .{ .name = "info", .cmd = .info },
+        .{ .name = "help", .cmd = .help },
+        .{ .name = "--help", .cmd = .help },
+        .{ .name = "-h", .cmd = .help },
+    };
+
+    for (subcommands) |c| {
         if (std.mem.eql(u8, arg, c.name)) return c.cmd;
     }
     return null;
@@ -86,6 +119,7 @@ fn printUsage() void {
         \\  status <task-id>     Check task status
         \\  cancel <task-id>     Cancel a running task
         \\  usage                Get usage report
+        \\  workspace            Manage workspaces
         \\  help                 Show this help
         \\
         \\Auth Options (login/register):
@@ -96,6 +130,7 @@ fn printUsage() void {
         \\  --repo <url>       Repository URL (required)
         \\  --branch <name>    Branch name (default: main)
         \\  --prompt <text>    Task prompt (required)
+        \\  --workspace <name> Use specific workspace (default: current active)
         \\  --pr               Create a PR on completion
         \\  --pr-title <text>  PR title
         \\  --pr-body <text>   PR body
@@ -103,6 +138,19 @@ fn printUsage() void {
         \\  --max-iterations N Max ralph loop iterations (default: 50)
         \\  --completion-promise <text>  String that signals task completion
         \\  -f, --follow       Stream task events in real-time until completion
+        \\
+        \\Workspace Commands:
+        \\  marathon workspace create <name> [options]  Create a new workspace
+        \\  marathon workspace list                     List all workspaces
+        \\  marathon workspace switch <name>            Switch to a workspace
+        \\  marathon workspace delete <name>            Delete a workspace
+        \\  marathon workspace current                  Show current workspace
+        \\  marathon workspace info [name]              Show workspace details
+        \\
+        \\Workspace Create Options:
+        \\  --template <name>     Use workspace template (default, web-app, python-ml, rust-backend)
+        \\  --description <text>  Workspace description
+        \\  --settings <json>     JSON settings (overrides template defaults)
         \\
         \\Environment Variables:
         \\  MARATHON_ORCHESTRATOR_ADDRESS  Orchestrator address
@@ -113,11 +161,47 @@ fn printUsage() void {
         \\  marathon register --email user@example.com --password mypassword
         \\  marathon login --email user@example.com --password mypassword
         \\  marathon whoami
+        \\  marathon workspace create my-project --template web-app --description "My web project"
+        \\  marathon workspace list
+        \\  marathon workspace switch my-project
+        \\  marathon workspace current
         \\  marathon submit --repo https://github.com/user/repo --prompt "Fix the bug"
-        \\  marathon submit --repo https://github.com/user/repo --prompt "Build feature" -e DATABASE_URL=postgres://... -e API_KEY=sk-xxx --max-iterations 10 --completion-promise "TASK_COMPLETE"
+        \\  marathon submit --repo https://github.com/user/repo --prompt "Build feature" --workspace my-project -e DATABASE_URL=postgres://... -e API_KEY=sk-xxx --max-iterations 10 --completion-promise "TASK_COMPLETE"
         \\  marathon status abc123
         \\  marathon cancel abc123
         \\  marathon usage
+        \\
+    ;
+    std.debug.print("{s}", .{usage});
+}
+
+fn printWorkspaceUsage() void {
+    const usage =
+        \\Marathon Workspace Management
+        \\
+        \\Usage: marathon workspace <subcommand> [options]
+        \\
+        \\Subcommands:
+        \\  create <name>        Create a new workspace
+        \\  list                 List all workspaces
+        \\  switch <name>        Switch to a workspace
+        \\  delete <name>        Delete a workspace
+        \\  current              Show current active workspace
+        \\  info [name]          Show workspace details (current if no name)
+        \\  help                 Show this help
+        \\
+        \\Create Options:
+        \\  --template <name>     Template to use (default, web-app, python-ml, rust-backend)
+        \\  --description <text>  Workspace description
+        \\  --settings <json>     JSON settings (overrides template defaults)
+        \\
+        \\Examples:
+        \\  marathon workspace create my-project --template web-app --description "My web application"
+        \\  marathon workspace list
+        \\  marathon workspace switch my-project
+        \\  marathon workspace current
+        \\  marathon workspace info my-project
+        \\  marathon workspace delete old-project
         \\
     ;
     std.debug.print("{s}", .{usage});
@@ -376,7 +460,459 @@ fn handleLogout(allocator: std.mem.Allocator) !void {
     std.debug.print("✓ Logged out. Credentials removed.\n", .{});
 }
 
-// --- Existing handlers ---
+// --- Workspace handlers ---
+
+fn handleWorkspace(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 0) {
+        printWorkspaceUsage();
+        return;
+    }
+
+    const subcommand = parseWorkspaceSubcommand(args[0]) orelse {
+        std.debug.print("Unknown workspace subcommand: {s}\n", .{args[0]});
+        printWorkspaceUsage();
+        return;
+    };
+
+    switch (subcommand) {
+        .create => try handleWorkspaceCreate(config, allocator, args[1..]),
+        .list => try handleWorkspaceList(config, allocator, args[1..]),
+        .switch => try handleWorkspaceSwitch(config, allocator, args[1..]),
+        .delete => try handleWorkspaceDelete(config, allocator, args[1..]),
+        .current => try handleWorkspaceCurrent(config, allocator, args[1..]),
+        .info => try handleWorkspaceInfo(config, allocator, args[1..]),
+        .help => printWorkspaceUsage(),
+    }
+}
+
+fn handleWorkspaceCreate(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 0) {
+        std.debug.print("Error: workspace name required\n", .{});
+        return;
+    }
+
+    const name = args[0];
+    var template: ?[]const u8 = null;
+    var description: ?[]const u8 = null;
+    var settings: ?[]const u8 = null;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--template")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --template requires a value\n", .{});
+                return;
+            }
+            template = args[i];
+        } else if (std.mem.eql(u8, args[i], "--description")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --description requires a value\n", .{});
+                return;
+            }
+            description = args[i];
+        } else if (std.mem.eql(u8, args[i], "--settings")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --settings requires a value\n", .{});
+                return;
+            }
+            settings = args[i];
+        }
+    }
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const request = protocol.WorkspaceCreateRequest{
+        .name = name,
+        .description = description,
+        .template = template,
+        .settings = settings,
+    };
+
+    var raw_response = client.callWithHeader(.workspace_create, request) catch |err| {
+        std.debug.print("Error: Failed to create workspace: {}\n", .{err});
+        return;
+    };
+    defer raw_response.deinit();
+
+    if (raw_response.header.msg_type == .error_response) {
+        const err_resp = raw_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const response = raw_response.decodeAs(protocol.WorkspaceResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (response.success) {
+        if (response.workspace) |ws| {
+            std.debug.print("✓ Workspace created: {s}\n", .{ws.name});
+            if (ws.description) |desc| {
+                std.debug.print("  Description: {s}\n", .{desc});
+            }
+            if (ws.template) |tmpl| {
+                std.debug.print("  Template: {s}\n", .{tmpl});
+            }
+            std.debug.print("  ID: {s}\n", .{&types.formatId(ws.id)});
+
+            if (response.env_vars.len > 0) {
+                std.debug.print("  Environment Variables:\n");
+                for (response.env_vars) |env_var| {
+                    std.debug.print("    {s}={s}\n", .{ env_var.key, env_var.value });
+                }
+            }
+        } else {
+            std.debug.print("✓ Workspace created successfully\n", .{});
+        }
+    } else {
+        std.debug.print("Failed to create workspace: {s}\n", .{response.message});
+    }
+}
+
+fn handleWorkspaceList(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    _ = args;
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const request = protocol.WorkspaceListRequest{
+        .limit = 50,
+        .offset = 0,
+    };
+
+    var raw_response = client.callWithHeader(.workspace_list, request) catch |err| {
+        std.debug.print("Error: Failed to list workspaces: {}\n", .{err});
+        return;
+    };
+    defer raw_response.deinit();
+
+    if (raw_response.header.msg_type == .error_response) {
+        const err_resp = raw_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const response = raw_response.decodeAs(protocol.WorkspaceListResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (response.workspaces.len == 0) {
+        std.debug.print("No workspaces found.\n", .{});
+        return;
+    }
+
+    std.debug.print("Workspaces:\n");
+    for (response.workspaces) |ws| {
+        const active_indicator = if (ws.is_active) " (active)" else "";
+        std.debug.print("  {s}{s}\n", .{ ws.name, active_indicator });
+        if (ws.description) |desc| {
+            std.debug.print("    Description: {s}\n", .{desc});
+        }
+        if (ws.template) |tmpl| {
+            std.debug.print("    Template: {s}\n", .{tmpl});
+        }
+        std.debug.print("    Tasks: {d}\n", .{ws.task_count});
+        std.debug.print("    Created: {d}\n", .{ws.created_at});
+        std.debug.print("    Last accessed: {d}\n", .{ws.last_accessed_at});
+        std.debug.print("    ID: {s}\n", .{&types.formatId(ws.id)});
+        std.debug.print("\n");
+    }
+}
+
+fn handleWorkspaceSwitch(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 0) {
+        std.debug.print("Error: workspace name required\n", .{});
+        return;
+    }
+
+    const name = args[0];
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const request = protocol.WorkspaceSwitchRequest{
+        .workspace_id = null,
+        .name = name,
+    };
+
+    var raw_response = client.callWithHeader(.workspace_switch, request) catch |err| {
+        std.debug.print("Error: Failed to switch workspace: {}\n", .{err});
+        return;
+    };
+    defer raw_response.deinit();
+
+    if (raw_response.header.msg_type == .error_response) {
+        const err_resp = raw_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const response = raw_response.decodeAs(protocol.WorkspaceResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (response.success) {
+        std.debug.print("✓ Switched to workspace: {s}\n", .{name});
+    } else {
+        std.debug.print("Failed to switch workspace: {s}\n", .{response.message});
+    }
+}
+
+fn handleWorkspaceDelete(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    if (args.len == 0) {
+        std.debug.print("Error: workspace name required\n", .{});
+        return;
+    }
+
+    const name = args[0];
+
+    // First get the workspace ID by name
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const get_request = protocol.WorkspaceGetRequest{
+        .workspace_id = null,
+        .name = name,
+    };
+
+    var get_response = client.callWithHeader(.workspace_get, get_request) catch |err| {
+        std.debug.print("Error: Failed to get workspace: {}\n", .{err});
+        return;
+    };
+    defer get_response.deinit();
+
+    if (get_response.header.msg_type == .error_response) {
+        std.debug.print("Error: Workspace not found: {s}\n", .{name});
+        return;
+    }
+
+    const workspace_response = get_response.decodeAs(protocol.WorkspaceResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (!workspace_response.success or workspace_response.workspace == null) {
+        std.debug.print("Error: Workspace not found: {s}\n", .{name});
+        return;
+    }
+
+    const workspace_id = workspace_response.workspace.?.id;
+
+    // Confirm deletion
+    std.debug.print("Are you sure you want to delete workspace '{s}'? [y/N]: ", .{name});
+    const stdin = std.io.getStdIn().reader();
+    var buf: [10]u8 = undefined;
+    if (try stdin.readUntilDelimiterOrEof(&buf, '\n')) |input| {
+        if (input.len == 0 or !(std.mem.eql(u8, input, "y") or std.mem.eql(u8, input, "Y") or std.mem.eql(u8, input, "yes"))) {
+            std.debug.print("Deletion cancelled.\n", .{});
+            return;
+        }
+    } else {
+        std.debug.print("Deletion cancelled.\n", .{});
+        return;
+    }
+
+    const delete_request = protocol.WorkspaceDeleteRequest{
+        .workspace_id = workspace_id,
+    };
+
+    var delete_response = client.callWithHeader(.workspace_delete, delete_request) catch |err| {
+        std.debug.print("Error: Failed to delete workspace: {}\n", .{err});
+        return;
+    };
+    defer delete_response.deinit();
+
+    if (delete_response.header.msg_type == .error_response) {
+        const err_resp = delete_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const response = delete_response.decodeAs(protocol.WorkspaceResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (response.success) {
+        std.debug.print("✓ Workspace deleted: {s}\n", .{name});
+    } else {
+        std.debug.print("Failed to delete workspace: {s}\n", .{response.message});
+    }
+}
+
+fn handleWorkspaceCurrent(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    _ = args;
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const request = protocol.WorkspaceCurrentRequest{};
+
+    var raw_response = client.callWithHeader(.workspace_current, request) catch |err| {
+        std.debug.print("Error: Failed to get current workspace: {}\n", .{err});
+        return;
+    };
+    defer raw_response.deinit();
+
+    if (raw_response.header.msg_type == .error_response) {
+        const err_resp = raw_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const response = raw_response.decodeAs(protocol.WorkspaceResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (response.success and response.workspace != null) {
+        const ws = response.workspace.?;
+        std.debug.print("Current workspace: {s}\n", .{ws.name});
+        if (ws.description) |desc| {
+            std.debug.print("  Description: {s}\n", .{desc});
+        }
+        if (ws.template) |tmpl| {
+            std.debug.print("  Template: {s}\n", .{tmpl});
+        }
+        std.debug.print("  ID: {s}\n", .{&types.formatId(ws.id)});
+        std.debug.print("  Created: {d}\n", .{ws.created_at});
+        std.debug.print("  Last accessed: {d}\n", .{ws.last_accessed_at});
+
+        if (response.env_vars.len > 0) {
+            std.debug.print("  Environment Variables:\n");
+            for (response.env_vars) |env_var| {
+                std.debug.print("    {s}={s}\n", .{ env_var.key, env_var.value });
+            }
+        }
+    } else {
+        std.debug.print("No active workspace. Create one with 'marathon workspace create <name>'.\n", .{});
+    }
+}
+
+fn handleWorkspaceInfo(config: common.config.ClientConfig, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    var name: ?[]const u8 = null;
+    if (args.len > 0) {
+        name = args[0];
+    }
+
+    var client = grpc.Client.init(allocator);
+    defer client.close();
+
+    client.connect(config.orchestrator_address, config.orchestrator_port, config.tls_enabled, config.tls_ca_path) catch |err| {
+        std.debug.print("Error: Failed to connect to orchestrator: {}\n", .{err});
+        return;
+    };
+
+    const request = protocol.WorkspaceGetRequest{
+        .workspace_id = null,
+        .name = name,
+    };
+
+    var raw_response = client.callWithHeader(.workspace_get, request) catch |err| {
+        std.debug.print("Error: Failed to get workspace: {}\n", .{err});
+        return;
+    };
+    defer raw_response.deinit();
+
+    if (raw_response.header.msg_type == .error_response) {
+        const err_resp = raw_response.decodeAs(protocol.ErrorResponse) catch {
+            std.debug.print("Error: Server returned an error (could not decode)\n", .{});
+            return;
+        };
+        std.debug.print("Error: {s} — {s}\n", .{ err_resp.code, err_resp.message });
+        return;
+    }
+
+    const response = raw_response.decodeAs(protocol.WorkspaceResponse) catch |err| {
+        std.debug.print("Error: Failed to decode response: {}\n", .{err});
+        return;
+    };
+
+    if (response.success and response.workspace != null) {
+        const ws = response.workspace.?;
+        const workspace_type = if (name) |_| "Workspace" else "Current workspace";
+        std.debug.print("{s}: {s}\n", .{ workspace_type, ws.name });
+        if (ws.description) |desc| {
+            std.debug.print("  Description: {s}\n", .{desc});
+        }
+        if (ws.template) |tmpl| {
+            std.debug.print("  Template: {s}\n", .{tmpl});
+        }
+        std.debug.print("  ID: {s}\n", .{&types.formatId(ws.id)});
+        std.debug.print("  Created: {d}\n", .{ws.created_at});
+        std.debug.print("  Updated: {d}\n", .{ws.updated_at});
+        std.debug.print("  Last accessed: {d}\n", .{ws.last_accessed_at});
+
+        if (!std.mem.eql(u8, ws.settings, "{}")) {
+            std.debug.print("  Settings: {s}\n", .{ws.settings});
+        }
+
+        if (response.env_vars.len > 0) {
+            std.debug.print("  Environment Variables:\n");
+            for (response.env_vars) |env_var| {
+                std.debug.print("    {s}={s}\n", .{ env_var.key, env_var.value });
+            }
+        }
+    } else {
+        const not_found_msg = if (name) |n| 
+            std.fmt.allocPrint(allocator, "Workspace not found: {s}", .{n}) catch "Workspace not found" 
+        else 
+            "No active workspace";
+        std.debug.print("{s}\n", .{not_found_msg});
+        if (name == null) {
+            std.debug.print("Create one with 'marathon workspace create <name>'.\n", .{});
+        }
+    }
+}
+
+// --- Existing handlers (same as before) ---
 
 fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -386,6 +922,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     var repo: ?[]const u8 = null;
     var branch: []const u8 = "main";
     var prompt: ?[]const u8 = null;
+    var workspace_name: ?[]const u8 = null;
     var create_pr = false;
     var pr_title: ?[]const u8 = null;
     var pr_body: ?[]const u8 = null;
@@ -450,6 +987,13 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
                 return;
             }
             prompt = args[i];
+        } else if (std.mem.eql(u8, arg, "--workspace")) {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: --workspace requires a value\n", .{});
+                return;
+            }
+            workspace_name = args[i];
         } else if (std.mem.eql(u8, arg, "--pr")) {
             create_pr = true;
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--follow")) {
@@ -497,6 +1041,39 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     };
 
     std.debug.print("[client] Connected, TLS enabled: {}\n", .{config.tls_enabled});
+
+    // Get workspace ID if workspace name is specified
+    var workspace_id: ?types.WorkspaceId = null;
+    if (workspace_name) |ws_name| {
+        const get_request = protocol.WorkspaceGetRequest{
+            .workspace_id = null,
+            .name = ws_name,
+        };
+
+        var ws_response = client.callWithHeader(.workspace_get, get_request) catch |err| {
+            std.debug.print("Error: Failed to get workspace '{s}': {}\n", .{ ws_name, err });
+            return;
+        };
+        defer ws_response.deinit();
+
+        if (ws_response.header.msg_type == .workspace_response) {
+            const ws_result = ws_response.decodeAs(protocol.WorkspaceResponse) catch {
+                std.debug.print("Error: Failed to decode workspace response\n", .{});
+                return;
+            };
+            if (ws_result.success and ws_result.workspace != null) {
+                workspace_id = ws_result.workspace.?.id;
+                std.debug.print("Using workspace: {s}\n", .{ws_name});
+            } else {
+                std.debug.print("Error: Workspace not found: {s}\n", .{ws_name});
+                return;
+            }
+        } else {
+            std.debug.print("Error: Failed to find workspace: {s}\n", .{ws_name});
+            return;
+        }
+    }
+
     std.debug.print("Submitting task...\n", .{});
 
     const request = protocol.SubmitTaskRequest{
@@ -510,6 +1087,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         .env_vars = env_vars_list.items,
         .max_iterations = max_iterations,
         .completion_promise = completion_promise,
+        .workspace_id = workspace_id,
     };
 
     var raw_response = client.callWithHeader(.submit_task, request) catch |err| {
@@ -710,6 +1288,15 @@ test "command parsing" {
     try std.testing.expectEqual(Command.register, parseCommand("register").?);
     try std.testing.expectEqual(Command.whoami, parseCommand("whoami").?);
     try std.testing.expectEqual(Command.logout, parseCommand("logout").?);
+    try std.testing.expectEqual(Command.workspace, parseCommand("workspace").?);
     try std.testing.expectEqual(Command.help, parseCommand("help").?);
     try std.testing.expect(parseCommand("invalid") == null);
+}
+
+test "workspace subcommand parsing" {
+    try std.testing.expectEqual(WorkspaceSubcommand.create, parseWorkspaceSubcommand("create").?);
+    try std.testing.expectEqual(WorkspaceSubcommand.list, parseWorkspaceSubcommand("list").?);
+    try std.testing.expectEqual(WorkspaceSubcommand.switch, parseWorkspaceSubcommand("switch").?);
+    try std.testing.expectEqual(WorkspaceSubcommand.current, parseWorkspaceSubcommand("current").?);
+    try std.testing.expect(parseWorkspaceSubcommand("invalid") == null);
 }

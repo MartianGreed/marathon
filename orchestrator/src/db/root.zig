@@ -17,6 +17,7 @@ pub const TaskRepository = repository.TaskRepository;
 pub const NodeRepository = repository.NodeRepository;
 pub const UsageRepository = repository.UsageRepository;
 pub const UserRepository = repository.UserRepository;
+pub const WorkspaceRepository = repository.WorkspaceRepository;
 
 pub const DbError = errors.DbError;
 pub const Param = types.Param;

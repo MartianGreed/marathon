@@ -1,6 +1,7 @@
 import { logout, getEmail } from '../lib/api';
+import { WorkspaceSelector } from './WorkspaceSelector';
 
-type Page = 'login' | 'register' | 'dashboard' | 'usage';
+type Page = 'login' | 'register' | 'dashboard' | 'usage' | 'workspaces';
 
 interface NavbarProps {
   currentPage: Page;
@@ -30,12 +31,21 @@ export function Navbar({ currentPage, onNavigate, onLogout }: NavbarProps) {
             <NavLink active={currentPage === 'dashboard'} onClick={() => onNavigate('dashboard')}>
               Tasks
             </NavLink>
+            <NavLink active={currentPage === 'workspaces'} onClick={() => onNavigate('workspaces')}>
+              Workspaces
+            </NavLink>
             <NavLink active={currentPage === 'usage'} onClick={() => onNavigate('usage')}>
               Usage
             </NavLink>
           </div>
         </div>
+        
         <div className="flex items-center gap-4">
+          {/* Workspace Selector */}
+          <div className="hidden md:block">
+            <WorkspaceSelector className="w-48" />
+          </div>
+          
           <span className="text-sm" style={{ color: 'var(--text-secondary)' }}>{email}</span>
           <button onClick={handleLogout}
             className="text-sm px-3 py-1.5 rounded-md border transition-colors hover:border-red-500 hover:text-red-400"
