@@ -4,6 +4,10 @@ const types = common.types;
 const protocol = common.protocol;
 const grpc = common.grpc;
 
+// Import plugin system (when available)
+const plugin_core = @import("../../src/plugins/core/root.zig");
+const PluginCLI = @import("../../src/plugins/cli/plugin_cli.zig").PluginCLI;
+
 const Command = enum {
     submit,
     status,
@@ -13,6 +17,7 @@ const Command = enum {
     register,
     whoami,
     logout,
+    plugin,
     help,
 };
 
@@ -46,6 +51,7 @@ pub fn main() !void {
         .register => try handleRegister(config, allocator, args[2..]),
         .whoami => try handleWhoami(allocator),
         .logout => try handleLogout(allocator),
+        .plugin => try handlePlugin(allocator, args[2..]),
         .help => printUsage(),
     }
 }
@@ -60,6 +66,7 @@ fn parseCommand(arg: []const u8) ?Command {
         .{ .name = "register", .cmd = .register },
         .{ .name = "whoami", .cmd = .whoami },
         .{ .name = "logout", .cmd = .logout },
+        .{ .name = "plugin", .cmd = .plugin },
         .{ .name = "help", .cmd = .help },
         .{ .name = "--help", .cmd = .help },
         .{ .name = "-h", .cmd = .help },
@@ -86,6 +93,7 @@ fn printUsage() void {
         \\  status <task-id>     Check task status
         \\  cancel <task-id>     Cancel a running task
         \\  usage                Get usage report
+        \\  plugin               Manage plugins
         \\  help                 Show this help
         \\
         \\Auth Options (login/register):
@@ -104,6 +112,15 @@ fn printUsage() void {
         \\  --completion-promise <text>  String that signals task completion
         \\  -f, --follow       Stream task events in real-time until completion
         \\
+        \\Plugin Commands:
+        \\  marathon plugin list                    List all plugins
+        \\  marathon plugin install <name|path>     Install a plugin
+        \\  marathon plugin uninstall <name>        Uninstall a plugin
+        \\  marathon plugin enable <name>           Enable a plugin
+        \\  marathon plugin disable <name>          Disable a plugin
+        \\  marathon plugin info <name>             Show plugin information
+        \\  marathon plugin run <name> <command>    Execute a plugin command
+        \\
         \\Environment Variables:
         \\  MARATHON_ORCHESTRATOR_ADDRESS  Orchestrator address
         \\  MARATHON_ORCHESTRATOR_PORT     Orchestrator port
@@ -114,13 +131,42 @@ fn printUsage() void {
         \\  marathon login --email user@example.com --password mypassword
         \\  marathon whoami
         \\  marathon submit --repo https://github.com/user/repo --prompt "Fix the bug"
-        \\  marathon submit --repo https://github.com/user/repo --prompt "Build feature" -e DATABASE_URL=postgres://... -e API_KEY=sk-xxx --max-iterations 10 --completion-promise "TASK_COMPLETE"
+        \\  marathon plugin list
+        \\  marathon plugin install hello-world
+        \\  marathon plugin run hello-world hello
         \\  marathon status abc123
         \\  marathon cancel abc123
         \\  marathon usage
         \\
     ;
     std.debug.print("{s}", .{usage});
+}
+
+// --- Plugin Management ---
+
+fn handlePlugin(allocator: std.mem.Allocator, args: []const []const u8) !void {
+    // Initialize plugin system
+    const plugin_config = plugin_core.PluginManager.Config{
+        .enable_sandboxing = false, // Disabled for now due to complexity
+        .allow_dangerous_permissions = false,
+        .plugin_install_dir = "src/plugins/installed",
+    };
+    
+    var plugin_manager = plugin_core.PluginManager.init(allocator, plugin_config) catch |err| {
+        std.debug.print("Error: Failed to initialize plugin system: {}\n", .{err});
+        return;
+    };
+    defer plugin_manager.deinit();
+    
+    // Initialize plugin system (discover plugins)
+    plugin_manager.initialize() catch |err| {
+        std.debug.print("Warning: Plugin system initialization failed: {}\n", .{err});
+        // Continue anyway, some commands might still work
+    };
+    
+    // Handle plugin CLI commands
+    var plugin_cli = PluginCLI.init(allocator, &plugin_manager);
+    try plugin_cli.handlePluginCommand(args);
 }
 
 // --- Credential file management ---
@@ -710,6 +756,7 @@ test "command parsing" {
     try std.testing.expectEqual(Command.register, parseCommand("register").?);
     try std.testing.expectEqual(Command.whoami, parseCommand("whoami").?);
     try std.testing.expectEqual(Command.logout, parseCommand("logout").?);
+    try std.testing.expectEqual(Command.plugin, parseCommand("plugin").?);
     try std.testing.expectEqual(Command.help, parseCommand("help").?);
     try std.testing.expect(parseCommand("invalid") == null);
 }

@@ -11,6 +11,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Plugin system module
+    const plugin_mod = b.createModule(.{
+        .root_source_file = b.path("src/plugins/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "common", .module = common_mod },
+        },
+    });
+
     // Orchestrator
     const orchestrator = b.addExecutable(.{
         .name = "marathon-orchestrator",
@@ -69,7 +79,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(vm_agent);
 
-    // Client CLI
+    // Client CLI (with plugin support)
     const client = b.addExecutable(.{
         .name = "marathon",
         .root_module = b.createModule(.{
@@ -78,6 +88,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "common", .module = common_mod },
+                .{ .name = "plugins", .module = plugin_mod },
             },
         }),
     });
@@ -91,6 +102,15 @@ pub fn build(b: *std.Build) void {
     const run_client_step = b.step("run-client", "Run the CLI client");
     run_client_step.dependOn(&run_client.step);
 
+    // Plugin examples
+    const hello_world_plugin = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/plugins/examples/hello-world/plugin.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    
     // Tests
     const test_step = b.step("test", "Run all tests");
 
@@ -103,6 +123,35 @@ pub fn build(b: *std.Build) void {
     });
     const run_common_tests = b.addRunArtifact(common_tests);
     test_step.dependOn(&run_common_tests.step);
+
+    // Plugin system tests
+    const plugin_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/plugins/core/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "common", .module = common_mod },
+            },
+        }),
+    });
+    const run_plugin_tests = b.addRunArtifact(plugin_tests);
+    test_step.dependOn(&run_plugin_tests.step);
+
+    // Plugin system comprehensive tests
+    const plugin_system_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/plugins/tests/plugin_system_test.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_plugin_system_tests = b.addRunArtifact(plugin_system_tests);
+    test_step.dependOn(&run_plugin_system_tests.step);
+
+    // Hello world plugin tests
+    const run_hello_world_tests = b.addRunArtifact(hello_world_plugin);
+    test_step.dependOn(&run_hello_world_tests.step);
 
     const orchestrator_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -150,9 +199,23 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "common", .module = common_mod },
+                .{ .name = "plugins", .module = plugin_mod },
             },
         }),
     });
     const run_client_tests = b.addRunArtifact(client_tests);
     test_step.dependOn(&run_client_tests.step);
+
+    // Plugin-specific test commands
+    const plugin_test_step = b.step("test-plugins", "Run plugin system tests only");
+    plugin_test_step.dependOn(&run_plugin_tests.step);
+    plugin_test_step.dependOn(&run_plugin_system_tests.step);
+    plugin_test_step.dependOn(&run_hello_world_tests.step);
+
+    // Plugin CLI test command
+    const plugin_cli_step = b.step("plugin-demo", "Run plugin CLI demo");
+    const plugin_demo = b.addRunArtifact(client);
+    plugin_demo.addArgs(&.{ "plugin", "list" });
+    plugin_demo.step.dependOn(b.getInstallStep());
+    plugin_cli_step.dependOn(&plugin_demo.step);
 }
