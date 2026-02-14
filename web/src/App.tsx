@@ -4,11 +4,12 @@ import { isAuthenticated } from './lib/api';
 import { LoginPage } from './pages/Login';
 import { RegisterPage } from './pages/Register';
 import { DashboardPage } from './pages/Dashboard';
+import { WorkspaceDashboard } from './pages/WorkspaceDashboard';
 import { Navbar } from './components/Navbar';
 
 const queryClient = new QueryClient();
 
-type Page = 'login' | 'register' | 'dashboard' | 'usage';
+type Page = 'login' | 'register' | 'dashboard' | 'usage' | 'workspaces';
 
 function AppContent() {
   const [page, setPage] = useState<Page>(isAuthenticated() ? 'dashboard' : 'login');
@@ -37,6 +38,15 @@ function AppContent() {
         {page === 'login' && <LoginPage onAuth={onAuth} onSwitch={() => setPage('register')} />}
         {page === 'register' && <RegisterPage onAuth={onAuth} onSwitch={() => setPage('login')} />}
         {page === 'dashboard' && <DashboardPage />}
+        {page === 'workspaces' && <WorkspaceDashboard />}
+        {page === 'usage' && (
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+            <h1 className="text-3xl font-bold text-gray-900 mb-8">Usage Report</h1>
+            <div className="bg-white rounded-lg border p-6 text-center text-gray-500">
+              Usage reporting coming soon...
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );

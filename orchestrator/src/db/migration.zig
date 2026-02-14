@@ -35,6 +35,19 @@ pub const migrations = [_]Migration{
         \\DROP TABLE IF EXISTS users;
         ,
     },
+    .{
+        .version = 3,
+        .description = "workspace management",
+        .up = @embedFile("migrations/003_workspaces.sql"),
+        .down =
+        \\ALTER TABLE tasks DROP COLUMN IF EXISTS workspace_id;
+        \\DROP TABLE IF EXISTS workspace_activity;
+        \\DROP TABLE IF EXISTS workspace_templates;
+        \\DROP TABLE IF EXISTS workspace_env_vars;
+        \\DROP TABLE IF EXISTS user_active_workspaces;
+        \\DROP TABLE IF EXISTS workspaces;
+        ,
+    },
 };
 
 pub const MigrationRunner = struct {
