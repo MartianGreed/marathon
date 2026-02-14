@@ -1,0 +1,40 @@
+{
+  "name": "hello-world",
+  "version": "1.0.0",
+  "description": "A simple hello world plugin that demonstrates the Marathon plugin API",
+  "author": "Marathon Team",
+  "license": "MIT",
+  "api_version": "1.0.0",
+  "marathon_version": ">=0.1.0",
+  "main_file": "plugin.zig",
+  "permissions": [
+    "task_read"
+  ],
+  "hooks": [
+    "post_task_execute",
+    "cli_command"
+  ],
+  "commands": [
+    "hello",
+    "greet"
+  ],
+  "dependencies": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "greeting": {
+        "type": "string",
+        "default": "Hello"
+      },
+      "name": {
+        "type": "string", 
+        "default": "World"
+      }
+    }
+  },
+  "metadata": {
+    "category": "example",
+    "tags": ["demo", "tutorial", "hello-world"],
+    "documentation": "https://github.com/MartianGreed/marathon/docs/plugins/hello-world.md"
+  }
+}
