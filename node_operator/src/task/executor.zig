@@ -91,6 +91,8 @@ pub const TaskExecutor = struct {
             .max_iterations = request.max_iterations,
             .completion_promise = request.completion_promise,
             .env_vars = request.env_vars,
+            .use_codex = request.use_codex,
+            .openai_api_key = request.openai_api_key,
         };
 
         const report: protocol.TaskResultReport = if (runner.run(vsock_payload)) |result| .{

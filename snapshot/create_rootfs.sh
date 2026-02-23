@@ -38,6 +38,9 @@ if [ ! -x "$ROOTFS_DIR/bin/busybox" ]; then
     cp /etc/resolv.conf "$ROOTFS_DIR/etc/resolv.conf"
     chroot "$ROOTFS_DIR" npm install -g @anthropic-ai/claude-code
 
+    echo "Installing OpenAI Codex CLI..."
+    chroot "$ROOTFS_DIR" npm install -g @openai/codex
+
     echo "Installing jj (Jujutsu VCS)..."
     JJ_VERSION="0.23.0"
     wget -q "https://github.com/martinvonz/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-x86_64-unknown-linux-musl.tar.gz" -O "$TMPDIR_ROOTFS/jj.tar.gz"

@@ -43,6 +43,7 @@ pub fn main() !void {
     var wrapper = claude_wrapper.ClaudeWrapper.init(
         allocator,
         config.claude_code_path,
+        config.codex_path,
         config.work_dir,
         &interceptor,
     );

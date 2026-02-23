@@ -81,6 +81,7 @@ pub const OrchestratorConfig = struct {
     postgres_url: []const u8 = "postgresql://marathon:marathon@localhost:5432/marathon",
 
     anthropic_api_key: []const u8 = "",
+    openai_api_key: []const u8 = "",
 
     tls_cert_path: ?[]const u8 = null,
     tls_key_path: ?[]const u8 = null,
@@ -102,6 +103,10 @@ pub const OrchestratorConfig = struct {
 
         if (std.posix.getenv("MARATHON_ANTHROPIC_API_KEY")) |v| {
             config.anthropic_api_key = try allocator.dupe(u8, v);
+        }
+
+        if (std.posix.getenv("MARATHON_OPENAI_API_KEY")) |v| {
+            config.openai_api_key = try allocator.dupe(u8, v);
         }
 
         if (std.posix.getenv("MARATHON_REDIS_URL")) |v| {
@@ -220,6 +225,7 @@ pub const NodeOperatorConfig = struct {
 pub const VmAgentConfig = struct {
     vsock_port: u32 = 9999,
     claude_code_path: []const u8 = "/usr/local/bin/claude",
+    codex_path: []const u8 = "/usr/local/bin/codex",
     work_dir: []const u8 = "/workspace",
     prompt_template: []const u8 = "{prompt}",
     cleanup_strategy: []const u8 = "full",
@@ -233,6 +239,10 @@ pub const VmAgentConfig = struct {
 
         if (std.posix.getenv("MARATHON_CLAUDE_CODE_PATH")) |v| {
             config.claude_code_path = try allocator.dupe(u8, v);
+        }
+
+        if (std.posix.getenv("MARATHON_CODEX_PATH")) |v| {
+            config.codex_path = try allocator.dupe(u8, v);
         }
 
         if (std.posix.getenv("MARATHON_WORK_DIR")) |v| {

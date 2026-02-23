@@ -8,6 +8,7 @@ const signal_parser = @import("signal_parser.zig");
 pub const ClaudeWrapper = struct {
     allocator: std.mem.Allocator,
     claude_code_path: []const u8,
+    codex_path: []const u8,
     work_dir: []const u8,
     interceptor: *api_interceptor.ApiInterceptor,
     process: ?std.process.Child,
@@ -23,12 +24,14 @@ pub const ClaudeWrapper = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         claude_code_path: []const u8,
+        codex_path: []const u8,
         work_dir: []const u8,
         interceptor: *api_interceptor.ApiInterceptor,
     ) ClaudeWrapper {
         return .{
             .allocator = allocator,
             .claude_code_path = claude_code_path,
+            .codex_path = codex_path,
             .work_dir = work_dir,
             .interceptor = interceptor,
             .process = null,
@@ -60,15 +63,24 @@ pub const ClaudeWrapper = struct {
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         defer argv.deinit(self.allocator);
 
-        try argv.append(self.allocator, self.claude_code_path);
-
-        // Only add claude-specific arguments if we're actually using claude
-        if (!std.mem.endsWith(u8, self.claude_code_path, "/env")) {
-            try argv.append(self.allocator, "--print");
-            try argv.append(self.allocator, "--dangerously-skip-permissions");
-            try argv.append(self.allocator, "--output-format");
-            try argv.append(self.allocator, "json");
-            try argv.append(self.allocator, task.prompt);
+        if (task.use_codex) {
+            // Use OpenAI Codex CLI
+            try argv.append(self.allocator, self.codex_path);
+            if (!std.mem.endsWith(u8, self.codex_path, "/env")) {
+                try argv.append(self.allocator, "exec");
+                try argv.append(self.allocator, "--full-auto");
+                try argv.append(self.allocator, task.prompt);
+            }
+        } else {
+            // Use Claude Code CLI (existing behavior)
+            try argv.append(self.allocator, self.claude_code_path);
+            if (!std.mem.endsWith(u8, self.claude_code_path, "/env")) {
+                try argv.append(self.allocator, "--print");
+                try argv.append(self.allocator, "--dangerously-skip-permissions");
+                try argv.append(self.allocator, "--output-format");
+                try argv.append(self.allocator, "json");
+                try argv.append(self.allocator, task.prompt);
+            }
         }
 
         var child = std.process.Child.init(argv.items, self.allocator);
@@ -207,7 +219,11 @@ pub const ClaudeWrapper = struct {
         try env.put("SHELL", "/bin/bash");
 
         // Task-specific variables
-        try env.put("ANTHROPIC_API_KEY", task.anthropic_api_key);
+        if (task.use_codex) {
+            try env.put("OPENAI_API_KEY", task.openai_api_key);
+        } else {
+            try env.put("ANTHROPIC_API_KEY", task.anthropic_api_key);
+        }
         try env.put("GITHUB_TOKEN", task.github_token);
 
         // Client-provided environment variables
@@ -263,6 +279,8 @@ pub const TaskInfo = struct {
     max_iterations: ?u32,
     completion_promise: ?[]const u8,
     env_vars: []const types.EnvVar = &[_]types.EnvVar{},
+    use_codex: bool = false,
+    openai_api_key: []const u8 = "",
 };
 
 pub const RunResult = struct {
@@ -279,7 +297,7 @@ test "claude wrapper init" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 }
 
@@ -288,7 +306,7 @@ test "parseJsonMetrics extracts all token fields" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output =
@@ -307,7 +325,7 @@ test "parseJsonMetrics handles missing usage" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output =
@@ -326,7 +344,7 @@ test "parseJsonMetrics handles invalid JSON" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const metrics = wrapper.parseJsonMetrics("not valid json {{{");
@@ -339,7 +357,7 @@ test "parseJsonMetrics handles partial usage fields" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output =
@@ -357,7 +375,7 @@ test "checkCompletionPromise returns true when found" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "Task completed successfully. TASK_COMPLETE: All done!";
@@ -370,7 +388,7 @@ test "checkCompletionPromise returns false when missing" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "Task is still running, not complete yet.";
@@ -383,7 +401,7 @@ test "checkCompletionPromise returns false when null promise" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "TASK_COMPLETE: All done!";
@@ -396,7 +414,7 @@ test "checkCompletionPromise finds promise at start" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "DONE: Task finished";
@@ -409,7 +427,7 @@ test "extractPrUrl finds github PR URL" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "Created PR: https://github.com/owner/repo/pull/123\nDone.";
@@ -424,7 +442,7 @@ test "extractPrUrl returns null for non-PR github URLs" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "See issue: https://github.com/owner/repo/issues/456";
@@ -438,7 +456,7 @@ test "extractPrUrl returns null when no URL" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "No URLs in this output at all.";
@@ -452,7 +470,7 @@ test "extractPrUrl handles URL at end of output" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "Done! https://github.com/foo/bar/pull/42";
@@ -467,7 +485,7 @@ test "extractPrUrl ignores gitlab URLs" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const output = "Check: https://gitlab.com/owner/repo/pull/789";
@@ -481,7 +499,7 @@ test "buildEnvMap includes required env vars" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const task = TaskInfo{
@@ -512,7 +530,7 @@ test "buildEnvMap includes all required environment variables" {
     var interceptor = api_interceptor.ApiInterceptor.init(allocator);
     defer interceptor.deinit();
 
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/workspace", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/local/bin/claude", "/usr/local/bin/codex", "/workspace", &interceptor);
     defer wrapper.deinit();
 
     const task = TaskInfo{
@@ -548,7 +566,7 @@ test "run method spawns process with correct environment variables" {
     defer interceptor.deinit();
 
     // Use /usr/bin/env instead of claude for testing
-    var wrapper = ClaudeWrapper.init(allocator, "/usr/bin/env", "/tmp", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/usr/bin/env", "/usr/local/bin/codex", "/tmp", &interceptor);
     defer wrapper.deinit();
 
     const task = TaskInfo{
@@ -588,7 +606,7 @@ test "run method handles process failure" {
     defer interceptor.deinit();
 
     // Use a command that will fail
-    var wrapper = ClaudeWrapper.init(allocator, "/bin/false", "/tmp", &interceptor);
+    var wrapper = ClaudeWrapper.init(allocator, "/bin/false", "/usr/local/bin/codex", "/tmp", &interceptor);
     defer wrapper.deinit();
 
     const task = TaskInfo{

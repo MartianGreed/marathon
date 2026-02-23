@@ -272,6 +272,7 @@ pub const SubmitTaskRequest = struct {
     env_vars: []const EnvVar = &[_]EnvVar{},
     max_iterations: ?u32 = null,
     completion_promise: ?[]const u8 = null,
+    use_codex: bool = false,
 };
 
 pub const ExecuteTaskRequest = struct {
@@ -289,6 +290,8 @@ pub const ExecuteTaskRequest = struct {
     env_vars: []const EnvVar = &[_]EnvVar{},
     max_iterations: ?u32 = null,
     completion_promise: ?[]const u8 = null,
+    use_codex: bool = false,
+    openai_api_key: []const u8 = "",
 };
 
 pub const TaskEvent = struct {
@@ -373,6 +376,8 @@ pub const VsockStartPayload = struct {
     max_iterations: ?u32,
     completion_promise: ?[]const u8,
     env_vars: []const EnvVar = &[_]EnvVar{},
+    use_codex: bool = false,
+    openai_api_key: []const u8 = "",
 };
 
 pub const VsockOutputPayload = struct {

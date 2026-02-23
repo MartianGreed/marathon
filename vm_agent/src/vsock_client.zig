@@ -78,6 +78,8 @@ const LinuxVsockClient = struct {
             .max_iterations = msg.payload.max_iterations,
             .completion_promise = msg.payload.completion_promise,
             .env_vars = msg.payload.env_vars,
+            .use_codex = msg.payload.use_codex,
+            .openai_api_key = msg.payload.openai_api_key,
         };
     }
 
