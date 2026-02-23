@@ -54,6 +54,7 @@ pub fn main() !void {
         &authenticator,
         config.node_auth_key,
         config.anthropic_api_key,
+        config.openai_api_key,
     );
     defer server.deinit();
 
@@ -109,6 +110,7 @@ fn runWithoutDb(allocator: std.mem.Allocator, config: common.config.Orchestrator
         &authenticator,
         config.node_auth_key,
         config.anthropic_api_key,
+        config.openai_api_key,
     );
     defer server.deinit();
 

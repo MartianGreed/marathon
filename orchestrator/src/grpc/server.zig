@@ -74,6 +74,7 @@ pub const Server = struct {
     node_auth_key: ?[]const u8,
     pending_tasks: std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)),
     anthropic_api_key: []const u8,
+    openai_api_key: []const u8,
     user_repo: ?*user_repo.UserRepository,
     /// Buffered task output events from node operators, keyed by task_id.
     /// Consumed by streamTaskEvents for real-time streaming to clients.
@@ -88,6 +89,7 @@ pub const Server = struct {
         authenticator: *auth.Authenticator,
         node_auth_key: ?[]const u8,
         anthropic_api_key: []const u8,
+        openai_api_key: []const u8,
     ) Server {
         return .{
             .allocator = allocator,
@@ -103,6 +105,7 @@ pub const Server = struct {
             .node_auth_key = node_auth_key,
             .pending_tasks = std.AutoHashMap(types.NodeId, std.ArrayListUnmanaged(*types.Task)).init(allocator),
             .anthropic_api_key = anthropic_api_key,
+            .openai_api_key = openai_api_key,
             .user_repo = null,
             .task_event_buffers = std.AutoHashMap(types.TaskId, std.ArrayListUnmanaged(protocol.TaskEvent)).init(allocator),
         };
@@ -361,6 +364,8 @@ pub const Server = struct {
                         .env_vars = task.env_vars,
                         .max_iterations = task.max_iterations,
                         .completion_promise = task.completion_promise,
+                        .use_codex = task.use_codex,
+                        .openai_api_key = self.openai_api_key,
                     },
                 }) catch {
                     log.err("failed to build command for task_id={s}", .{&types.formatId(task.id)});
@@ -633,6 +638,7 @@ pub const RequestHandler = struct {
         task.env_vars = request.env_vars;
         task.max_iterations = request.max_iterations;
         task.completion_promise = request.completion_promise;
+        task.use_codex = request.use_codex;
 
         if (self.task_repo) |repo| {
             log.info("handleSubmitTask: persisting task to DB", .{});

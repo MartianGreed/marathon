@@ -102,6 +102,7 @@ fn printUsage() void {
         \\  -e KEY=VALUE       Environment variable for the agent (repeatable)
         \\  --max-iterations N Max ralph loop iterations (default: 50)
         \\  --completion-promise <text>  String that signals task completion
+        \\  --codex            Use OpenAI Codex CLI instead of Claude Code
         \\  -f, --follow       Stream task events in real-time until completion
         \\
         \\Environment Variables:
@@ -392,6 +393,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
     var max_iterations: ?u32 = null;
     var completion_promise: ?[]const u8 = null;
     var follow = false;
+    var use_codex = false;
 
     var env_vars_list: std.ArrayListUnmanaged(protocol.EnvVar) = .empty;
     defer env_vars_list.deinit(allocator);
@@ -452,6 +454,8 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
             prompt = args[i];
         } else if (std.mem.eql(u8, arg, "--pr")) {
             create_pr = true;
+        } else if (std.mem.eql(u8, arg, "--codex")) {
+            use_codex = true;
         } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--follow")) {
             follow = true;
         } else if (std.mem.eql(u8, arg, "--pr-title")) {
@@ -510,6 +514,7 @@ fn handleSubmit(config: common.config.ClientConfig, args: []const []const u8) !v
         .env_vars = env_vars_list.items,
         .max_iterations = max_iterations,
         .completion_promise = completion_promise,
+        .use_codex = use_codex,
     };
 
     var raw_response = client.callWithHeader(.submit_task, request) catch |err| {

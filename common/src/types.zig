@@ -85,6 +85,7 @@ pub const Task = struct {
     env_vars: []const EnvVar = &[_]EnvVar{},
     max_iterations: ?u32 = null,
     completion_promise: ?[]const u8 = null,
+    use_codex: bool = false,
 
     pub fn deinit(self: *Task) void {
         self.allocator.free(self.repo_url);
