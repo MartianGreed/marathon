@@ -7,4 +7,6 @@ pub mod network;
 pub mod pool;
 
 pub use firecracker::{Vm, VmConfig, VmError, VmState};
-pub use pool::{FirecrackerLauncher, PoolConfig, PoolError, VmLauncher, VmLease, VmPool};
+pub use pool::{
+    BootSlot, Claim, FirecrackerLauncher, PoolConfig, PoolError, VmLauncher, VmLease, VmPool,
+};

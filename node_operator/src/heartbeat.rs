@@ -296,7 +296,9 @@ impl HeartbeatClient {
         pb::NodeStatus {
             hostname: self.hostname.clone(),
             total_vm_slots: pool.config().total_vm_slots,
-            active_vms: u32::try_from(pool.active_count()).unwrap_or(u32::MAX),
+            // Running plus booting VMs: every slot a new task cannot use. A
+            // claimed task is counted from accept time (see `VmPool::claim`).
+            active_vms: pool.occupied_count(),
             warm_vms: u32::try_from(pool.warm_count()).unwrap_or(u32::MAX),
             cpu_usage: info.cpu_usage,
             memory_usage: info.memory_usage,
@@ -811,6 +813,83 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!c.is_running());
+    }
+
+    /// Boots never finish: the slot stays "booting".
+    struct HangingLauncher;
+
+    impl crate::vm::VmLauncher for HangingLauncher {
+        fn launch<'a>(
+            &'a self,
+            _vm: &'a mut crate::vm::Vm,
+        ) -> futures::future::BoxFuture<'a, Result<(), crate::vm::VmError>> {
+            Box::pin(std::future::pending())
+        }
+        fn create(&self) -> crate::vm::Vm {
+            crate::vm::Vm::in_dir(&std::env::temp_dir())
+        }
+    }
+
+    // C-R8-01: while a task's VM boots, the status counts its slot, so the
+    // orchestrator (which frees its reservation once the task id shows
+    // up) never sees that capacity as free; and a second task finds no
+    // slot instead of being accepted.
+    #[tokio::test]
+    async fn booting_task_slot_is_reported_occupied() {
+        let pool = Arc::new(crate::vm::VmPool::new(
+            Arc::new(HangingLauncher),
+            crate::vm::PoolConfig {
+                total_vm_slots: 1,
+                warm_pool_target: 0,
+            },
+        ));
+        let executor = TaskExecutor::new(pool.clone(), ExecutorSettings::default());
+        let config = NodeOperatorConfig {
+            total_vm_slots: 1,
+            ..NodeOperatorConfig::default()
+        };
+        let c = HeartbeatClient::new(
+            &config,
+            executor.clone(),
+            HeartbeatSettings::from_config(&config),
+        );
+        let a = common::TaskId::random();
+        executor
+            .execute_task(pb::ExecuteTask {
+                task_id: a.to_hex(),
+                ..Default::default()
+            })
+            .unwrap();
+        // Before the task has run at all, and while it boots.
+        for _ in 0..3 {
+            let s = c.collect_status();
+            assert_eq!(s.active_task_ids, vec![a.to_hex()]);
+            assert_eq!(s.active_vms, 1, "the booting slot is reported free");
+            assert_eq!(s.warm_vms, 0);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let b = common::TaskId::random();
+        let rejected = executor.execute_task(pb::ExecuteTask {
+            task_id: b.to_hex(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            rejected,
+            Err(crate::task::executor::ExecuteError::NoCapacity(_))
+        ));
+        let results = executor.drain_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].task_id, b.to_hex());
+        // Cancelling A frees its slot.
+        assert!(executor.cancel_task(&a.to_hex()));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while c.collect_status().active_vms != 0 || !executor.active_task_ids().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled boot did not free its slot");
+        assert_eq!(pool.starting_count(), 0);
     }
 
     #[test]

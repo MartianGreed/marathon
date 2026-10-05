@@ -9,6 +9,7 @@
 //! a fake in tests.
 
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -131,12 +132,14 @@ impl PoolState {
     }
 }
 
-/// Stop treating the slot as booting when dropped.
-struct StartingSlot<'a> {
-    pool: &'a VmPool,
+/// A slot reserved for a VM that is booting; released when dropped. `P`
+/// is how the slot refers to its pool: borrowed inside the pool, owned
+/// (`Arc`) when a task carries it from accept time to boot.
+struct StartingSlot<P: Deref<Target = VmPool>> {
+    pool: P,
 }
 
-impl Drop for StartingSlot<'_> {
+impl<P: Deref<Target = VmPool>> Drop for StartingSlot<P> {
     fn drop(&mut self) {
         {
             let mut s = self.pool.lock();
@@ -145,6 +148,19 @@ impl Drop for StartingSlot<'_> {
         self.pool.boots_done.notify_waiters();
     }
 }
+
+/// Capacity a task claimed when it was accepted: a warm VM, or a slot to
+/// boot one in. Claiming at accept time means the node's reported
+/// occupancy includes the task before its VM exists, so the orchestrator
+/// never sees that capacity as free. Dropping a `Claim::Slot` releases the
+/// slot; a `Claim::Warm` lease is returned with [`VmPool::release`].
+pub enum Claim {
+    Warm(VmLease),
+    Slot(BootSlot),
+}
+
+/// A booting slot owned by a task until its VM is up.
+pub struct BootSlot(StartingSlot<Arc<VmPool>>);
 
 /// The node's VMs.
 pub struct VmPool {
@@ -214,19 +230,91 @@ impl VmPool {
             .set(i64::try_from(state.active.len()).unwrap_or(i64::MAX));
     }
 
-    /// Reserve a slot for a VM about to boot, if one is free and `admit`
-    /// accepts the current state.
-    fn reserve(&self, admit: impl FnOnce(&PoolState) -> bool) -> Option<StartingSlot<'_>> {
+    /// Count a slot as booting if one is free and `admit` accepts the
+    /// current state.
+    fn try_start(&self, admit: impl FnOnce(&PoolState) -> bool) -> bool {
         let mut s = self.lock();
         if s.closing || s.occupied() >= self.config.total_vm_slots || !admit(&s) {
-            return None;
+            return false;
         }
         s.starting += 1;
-        Some(StartingSlot { pool: self })
+        true
+    }
+
+    /// Reserve a slot for a VM about to boot, if one is free and `admit`
+    /// accepts the current state.
+    fn reserve(&self, admit: impl FnOnce(&PoolState) -> bool) -> Option<StartingSlot<&VmPool>> {
+        self.try_start(admit).then_some(StartingSlot { pool: self })
+    }
+
+    /// Slots currently booting (warm-pool boots and claimed task slots).
+    pub fn starting_count(&self) -> u32 {
+        self.lock().starting
+    }
+
+    /// Slots not available to a new task: running VMs plus booting ones.
+    /// This is what the node reports as `active_vms`.
+    pub fn occupied_count(&self) -> u32 {
+        let s = self.lock();
+        u32::try_from(s.active.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(s.starting)
+    }
+
+    /// Claim capacity for a task now: a warm VM if there is one, else a
+    /// slot to boot one in.
+    pub fn claim(self: &Arc<Self>) -> Result<Claim, PoolError> {
+        if let Some(lease) = self.acquire() {
+            return Ok(Claim::Warm(lease));
+        }
+        if self.try_start(|_| true) {
+            return Ok(Claim::Slot(BootSlot(StartingSlot { pool: self.clone() })));
+        }
+        metrics::global().vm_ops.inc("acquire", "no_slots");
+        Err(PoolError::NoSlots(self.config.total_vm_slots))
+    }
+
+    /// Turn a claim into a running VM, booting one for a slot claim.
+    pub async fn start_claimed(&self, claim: Claim) -> Result<VmLease, PoolError> {
+        match claim {
+            Claim::Warm(lease) => Ok(lease),
+            Claim::Slot(BootSlot(slot)) => self.boot_active(slot).await,
+        }
+    }
+
+    /// Boot a VM in `slot` and keep it as active (leased).
+    async fn boot_active<P: Deref<Target = VmPool>>(
+        &self,
+        slot: StartingSlot<P>,
+    ) -> Result<VmLease, PoolError> {
+        tracing::info!(
+            operation = "acquire_vm",
+            "no warm VMs available, creating on-demand"
+        );
+        let vm = self.boot(&slot).await.map_err(|e| {
+            tracing::error!(operation = "acquire_vm", error = %e, "failed to start on-demand VM");
+            metrics::global().vm_ops.inc("acquire", "launch_failed");
+            PoolError::LaunchFailed(e.to_string())
+        })?;
+        metrics::global().vm_ops.inc("acquire", "on_demand");
+        let lease = VmLease::of(&vm);
+        let kept = self.keep(vm, Into::Active);
+        // Drop the booting slot only after the VM is counted as active, so
+        // the slot count never dips below the real number of VMs.
+        if let Some(mut vm) = kept {
+            vm.stop().await;
+            drop(slot);
+            return Err(PoolError::ShuttingDown);
+        }
+        drop(slot);
+        Ok(lease)
     }
 
     /// Boot one VM in a reserved slot.
-    async fn boot(&self, _slot: &StartingSlot<'_>) -> Result<Vm, VmError> {
+    async fn boot<P: Deref<Target = VmPool>>(
+        &self,
+        _slot: &StartingSlot<P>,
+    ) -> Result<Vm, VmError> {
         let mut vm = self.launcher.create();
         vm.track_copy_jobs(self.copy_jobs.clone());
         let launched = tokio::select! {
@@ -304,27 +392,7 @@ impl VmPool {
             metrics::global().vm_ops.inc("acquire", "no_slots");
             return Err(PoolError::NoSlots(self.config.total_vm_slots));
         };
-        tracing::info!(
-            operation = "acquire_vm",
-            "no warm VMs available, creating on-demand"
-        );
-        let vm = self.boot(&slot).await.map_err(|e| {
-            tracing::error!(operation = "acquire_vm", error = %e, "failed to start on-demand VM");
-            metrics::global().vm_ops.inc("acquire", "launch_failed");
-            PoolError::LaunchFailed(e.to_string())
-        })?;
-        metrics::global().vm_ops.inc("acquire", "on_demand");
-        let lease = VmLease::of(&vm);
-        let kept = self.keep(vm, Into::Active);
-        // Drop the booting slot only after the VM is counted as active, so
-        // the slot count never dips below the real number of VMs.
-        if let Some(mut vm) = kept {
-            vm.stop().await;
-            drop(slot);
-            return Err(PoolError::ShuttingDown);
-        }
-        drop(slot);
-        Ok(lease)
+        self.boot_active(slot).await
     }
 
     /// Put a warm VM in the pool directly (custom launchers and tests).
@@ -823,6 +891,53 @@ mod tests {
             .expect("shutdown did not finish after the slot was released")
             .unwrap();
         holder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn claim_prefers_warm_then_slot_then_fails() {
+        let p = Arc::new(pool(false, 2, 0));
+        let vm = ready_vm();
+        let warm_id = vm.id;
+        p.insert_warm(vm);
+        let Ok(Claim::Warm(lease)) = p.claim() else {
+            panic!("expected the warm VM");
+        };
+        assert_eq!(lease.vm_id, warm_id);
+        assert_eq!(p.occupied_count(), 1);
+        let Ok(Claim::Slot(slot)) = p.claim() else {
+            panic!("expected a booting slot");
+        };
+        assert_eq!(p.starting_count(), 1);
+        assert_eq!(p.occupied_count(), 2);
+        assert!(matches!(p.claim(), Err(PoolError::NoSlots(2))));
+        drop(slot);
+        assert_eq!(p.starting_count(), 0);
+        assert_eq!(p.occupied_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn start_claimed_boots_a_slot_into_an_active_vm() {
+        let p = Arc::new(pool(false, 1, 0));
+        let claim = p.claim().unwrap();
+        assert!(matches!(claim, Claim::Slot(_)));
+        let lease = p.start_claimed(claim).await.unwrap();
+        assert_eq!(p.active_count(), 1);
+        assert_eq!(p.starting_count(), 0);
+        assert_eq!(p.occupied_count(), 1);
+        p.release(lease.vm_id).await;
+        assert_eq!(p.occupied_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_claimed_boot_frees_its_slot() {
+        let p = Arc::new(pool(true, 1, 0));
+        let claim = p.claim().unwrap();
+        assert!(matches!(
+            p.start_claimed(claim).await,
+            Err(PoolError::LaunchFailed(_))
+        ));
+        assert_eq!(p.occupied_count(), 0);
+        assert!(p.claim().is_ok());
     }
 
     #[test]

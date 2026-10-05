@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::metrics;
 use crate::task::output_buffer::OutputBuffer;
 use crate::trace::TraceContext;
-use crate::vm::VmPool;
+use crate::vm::{Claim, VmPool};
 use crate::vsock::handler::{CANCELLED_BEFORE_START, RunnerSettings, TaskRunner};
 
 /// Error text for a task rejected because the node is draining.
@@ -50,6 +50,8 @@ pub enum ExecuteError {
     AlreadyRunning(TaskId),
     #[error("node is draining")]
     Draining,
+    #[error("{0}")]
+    NoCapacity(String),
 }
 
 /// The node's task runner.
@@ -210,20 +212,34 @@ impl TaskExecutor {
             return Err(ExecuteError::Draining);
         }
         let token = CancellationToken::new();
-        {
+        let claim = {
             let mut running = lock(&self.running);
             if running.contains_key(&task_id) {
                 tracing::warn!(operation = "execute_task", node_id = %node_id, task_id = %task_id, "duplicate execute ignored: task already running");
                 m.tasks.inc("execute_task", "duplicate");
                 return Err(ExecuteError::AlreadyRunning(task_id));
             }
+            // Claim the VM capacity now, before the task is visible in the
+            // heartbeat: the reported occupancy then already includes it,
+            // so the orchestrator cannot hand this slot to another task.
+            let claim = match self.pool.claim() {
+                Ok(claim) => claim,
+                Err(e) => {
+                    tracing::error!(operation = "execute_task", node_id = %node_id, task_id = %task_id, error = %e, "no VM capacity for task");
+                    m.tasks_rejected.inc();
+                    m.tasks.inc("execute_task", "no_capacity");
+                    self.push_result(failed_result(task_id.to_hex(), e.to_string()));
+                    return Err(ExecuteError::NoCapacity(e.to_string()));
+                }
+            };
             running.insert(task_id, token.clone());
-        }
+            claim
+        };
         tracing::info!(operation = "execute_task", node_id = %node_id, task_id = %task_id, trace_id = %trace.trace_id(), "received task");
         m.tasks_started.inc();
         m.tasks.inc("execute_task", "accepted");
         let this = self.clone();
-        tokio::spawn(async move { this.run_task(task_id, req, token, trace).await });
+        tokio::spawn(async move { this.run_task(task_id, req, claim, token, trace).await });
         Ok(())
     }
 
@@ -254,6 +270,7 @@ impl TaskExecutor {
         self: Arc<Self>,
         task_id: TaskId,
         req: pb::ExecuteTask,
+        claim: Claim,
         token: CancellationToken,
         trace: TraceContext,
     ) {
@@ -263,9 +280,12 @@ impl TaskExecutor {
         let started = Instant::now();
         tracing::info!(parent: op.span(), trace_id = %trace.trace_id(), span_id = %trace.span_id(), "task starting");
 
-        // A cancel while the VM boots drops the boot (the VM is torn down).
+        // A cancel while the VM boots drops the boot (the VM is torn down
+        // and the slot freed). A warm claim resolves at once, so it always
+        // comes back as a lease and is released below.
         let acquired = tokio::select! {
-            r = self.pool.acquire_or_create() => Some(r),
+            biased;
+            r = self.pool.start_claimed(claim) => Some(r),
             () = token.cancelled() => None,
         };
         let (report, used_vm) = match acquired {
