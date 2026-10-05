@@ -76,13 +76,8 @@ pub type PlatformListener = TcpListener;
 mod tests {
     use super::*;
 
-    async fn assert_unsupported_transport() {
-        assert_eq!(
-            bind_test_transport(None).await.unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
-    }
-
+    // Zig's send/receive stub tests do not apply: framing is shared over any
+    // stream and is covered by the agent conversation tests.
     #[test]
     fn vsock_client_type_selection() {
         fn selected<T: Listener>() {}
@@ -91,46 +86,9 @@ mod tests {
 
     #[tokio::test]
     async fn stub_vsock_client_init_succeeds() {
-        assert_unsupported_transport().await;
-    }
-
-    #[tokio::test]
-    async fn stub_vsock_client_send_ready_returns_vsock_not_supported() {
-        assert_unsupported_transport().await;
-    }
-
-    #[tokio::test]
-    async fn stub_vsock_client_receive_task_returns_vsock_not_supported() {
-        assert_unsupported_transport().await;
-    }
-
-    #[tokio::test]
-    async fn stub_vsock_client_send_complete_returns_vsock_not_supported() {
-        assert_unsupported_transport().await;
-    }
-
-    #[tokio::test]
-    async fn stub_vsock_client_check_cancel_returns_vsock_not_supported() {
-        assert_unsupported_transport().await;
-    }
-
-    #[tokio::test]
-    async fn stub_vsock_client_send_output_returns_vsock_not_supported() {
-        assert_unsupported_transport().await;
-    }
-
-    #[tokio::test]
-    async fn stub_vsock_client_send_metrics_returns_vsock_not_supported() {
-        assert_unsupported_transport().await;
-    }
-
-    #[tokio::test]
-    async fn stub_vsock_client_send_progress_returns_vsock_not_supported() {
-        assert_unsupported_transport().await;
-    }
-
-    #[tokio::test]
-    async fn stub_vsock_client_send_error_returns_vsock_not_supported() {
-        assert_unsupported_transport().await;
+        assert_eq!(
+            bind_test_transport(None).await.unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 }

@@ -12,6 +12,7 @@ use marathon_vm_agent::{
     repo_setup::{RepoPreparer, SetupError},
 };
 use std::{
+    future::Future,
     net::SocketAddr,
     os::unix::fs::PermissionsExt,
     path::Path,
@@ -20,6 +21,7 @@ use std::{
 };
 use tempfile::TempDir;
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     task::JoinHandle,
 };
@@ -64,7 +66,7 @@ async fn launch_with_cleanup(script: &str, fail_setup: bool, strategy: CleanupSt
     std::fs::create_dir_all(tmp.path().join("work")).unwrap();
     std::fs::create_dir_all(tmp.path().join("cache")).unwrap();
     std::fs::write(tmp.path().join("credentials"), "fake credential").unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = bounded(TcpListener::bind("127.0.0.1:0")).await.unwrap();
     let address = listener.local_addr().unwrap();
     let registry = Arc::new(Registry::default());
     let agent = Agent {
@@ -114,7 +116,19 @@ fn start(promise: Option<&str>, max: u32) -> VsockStart {
     }
 }
 
-async fn receive(stream: &mut TcpStream) -> Payload {
+async fn bounded<F: Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .expect("test operation timed out")
+}
+
+async fn send_frame(stream: &mut (impl AsyncWrite + Unpin), payload: Payload) {
+    bounded(write_message(stream, &payload.into()))
+        .await
+        .unwrap();
+}
+
+async fn receive(stream: &mut (impl AsyncRead + Unpin)) -> Payload {
     tokio::time::timeout(Duration::from_secs(10), read_message(stream))
         .await
         .unwrap()
@@ -124,26 +138,27 @@ async fn receive(stream: &mut TcpStream) -> Payload {
 }
 
 async fn connect(running: &Running) -> TcpStream {
-    let mut stream = TcpStream::connect(running.address).await.unwrap();
+    let mut stream = bounded(TcpStream::connect(running.address)).await.unwrap();
     assert!(matches!(receive(&mut stream).await, Payload::Ready(r) if r.vm_id == 0));
     stream
 }
 
 async fn send_start(stream: &mut TcpStream, task: VsockStart) {
-    write_message(stream, &Payload::Start(task).into())
-        .await
-        .unwrap();
+    send_frame(stream, Payload::Start(task)).await;
 }
 
 async fn terminal(stream: &mut TcpStream) -> (Vec<Payload>, Payload) {
-    let mut frames = Vec::new();
-    loop {
-        let frame = receive(stream).await;
-        if matches!(frame, Payload::Complete(_) | Payload::Error(_)) {
-            return (frames, frame);
+    bounded(async {
+        let mut frames = Vec::new();
+        loop {
+            let frame = receive(stream).await;
+            if matches!(frame, Payload::Complete(_) | Payload::Error(_)) {
+                return (frames, frame);
+            }
+            frames.push(frame);
         }
-        frames.push(frame);
-    }
+    })
+    .await
 }
 
 async fn finish(r: &mut Running) {
@@ -183,7 +198,7 @@ printf '%s' '{"usage":{"input_tokens":200,"output_tokens":80,"cache_read_input_t
 #[tokio::test]
 async fn probes_ready_start_output_metrics_progress_complete() {
     let mut r = launch(TWO_ITERATIONS, false).await;
-    drop(TcpStream::connect(r.address).await.unwrap());
+    drop(bounded(TcpStream::connect(r.address)).await.unwrap());
     drop(connect(&r).await);
     let mut stream = connect(&r).await;
     send_start(&mut stream, start(Some("DONE"), 3)).await;
@@ -265,13 +280,13 @@ async fn clarification() {
 #[tokio::test]
 async fn pr_url_completes() {
     let (_, frame) = run_terminal(
-        r#"printf '%s' 'Created PR: https://github.com/o/r/pull/42'"#,
+        r#"printf '%s' '{"usage":{"input_tokens":4,"output_tokens":3,"cache_read_input_tokens":2,"cache_creation_input_tokens":1},"result":"Created PR: https://github.com/o/r/pull/42"}'"#,
         start(Some("DONE"), 3),
         false,
     )
     .await;
     assert!(
-        matches!(frame, Payload::Complete(c) if c.pr_url.as_deref() == Some("https://github.com/o/r/pull/42") && c.promise_found && c.iteration == 1)
+        matches!(frame, Payload::Complete(c) if c.pr_url.as_deref() == Some("https://github.com/o/r/pull/42") && c.promise_found && c.iteration == 1 && c.metrics == Some(totals(4,3,2,1)))
     );
 }
 
@@ -308,13 +323,13 @@ async fn setup_failure() {
 #[tokio::test]
 async fn single_iteration_completes_even_nonzero() {
     let (_, frame) = run_terminal(
-        r#"printf '%s' '{"usage":{"input_tokens":9}}'; exit 7"#,
+        r#"printf '%s' '{"usage":{"input_tokens":9,"output_tokens":8,"cache_read_input_tokens":7,"cache_creation_input_tokens":6}}'; exit 7"#,
         start(None, 1),
         false,
     )
     .await;
     assert!(
-        matches!(frame, Payload::Complete(c) if c.iteration == 1 && !c.promise_found && c.exit_code == 7 && c.metrics.unwrap().input_tokens == 9)
+        matches!(frame, Payload::Complete(c) if c.iteration == 1 && !c.promise_found && c.exit_code == 7 && c.metrics == Some(totals(9,8,7,6)))
     );
 }
 
@@ -340,9 +355,7 @@ async fn cancel_before_iteration_two() {
     send_start(&mut stream, start(Some("DONE"), 3)).await;
     assert!(matches!(receive(&mut stream).await, Payload::Progress(p) if p.iteration == 1));
     assert!(matches!(receive(&mut stream).await, Payload::Output(_)));
-    write_message(&mut stream, &Payload::Cancel(VsockCancel {}).into())
-        .await
-        .unwrap();
+    send_frame(&mut stream, Payload::Cancel(VsockCancel {})).await;
     // Reader processes Cancel while the child is still in its first iteration.
     tokio::time::sleep(Duration::from_millis(50)).await;
     std::fs::write(r.tmp.path().join("work/release"), "").unwrap();
@@ -358,9 +371,7 @@ async fn protocol_error_before_start_relistens() {
     use tokio::io::AsyncWriteExt;
     let mut r = launch("exit 0", false).await;
     let mut stream = connect(&r).await;
-    write_message(&mut stream, &Payload::Cancel(VsockCancel {}).into())
-        .await
-        .unwrap();
+    send_frame(&mut stream, Payload::Cancel(VsockCancel {})).await;
     assert!(matches!(receive(&mut stream).await, Payload::Error(e) if e.code == "protocol_error"));
     drop(stream);
     for bytes in [
@@ -371,7 +382,7 @@ async fn protocol_error_before_start_relistens() {
             .to_vec(),
     ] {
         let mut s = connect(&r).await;
-        s.write_all(&bytes).await.unwrap();
+        bounded(s.write_all(&bytes)).await.unwrap();
         assert!(matches!(receive(&mut s).await, Payload::Error(e) if e.code == "protocol_error"));
     }
     let mut stream = connect(&r).await;
@@ -390,8 +401,8 @@ async fn truncated_probe_relistens() {
     let mut r = launch("exit 0", false).await;
     for bytes in [vec![0, 0], vec![0, 0, 0, 5, 1]] {
         let mut s = connect(&r).await;
-        s.write_all(&bytes).await.unwrap();
-        s.shutdown().await.unwrap();
+        bounded(s.write_all(&bytes)).await.unwrap();
+        bounded(s.shutdown()).await.unwrap();
         drop(s);
     }
     let mut s = connect(&r).await;
@@ -524,18 +535,66 @@ async fn ready_broken_pipe_and_start_connection_reset_relisten() {
         TestStream::Duplex(guest),
     ]));
     let handle = tokio::spawn(async move { agent.serve(listener).await });
-    let ready = read_message(&mut host).await.unwrap();
-    assert!(matches!(ready.payload, Some(Payload::Ready(r)) if r.vm_id == 123));
-    write_message(&mut host, &Payload::Start(start(None, 1)).into())
-        .await
-        .unwrap();
-    loop {
-        let frame = read_message(&mut host).await.unwrap();
-        if matches!(frame.payload, Some(Payload::Complete(_))) {
-            break;
+    let ready = receive(&mut host).await;
+    assert!(matches!(ready, Payload::Ready(r) if r.vm_id == 123));
+    send_frame(&mut host, Payload::Start(start(None, 1))).await;
+    bounded(async {
+        loop {
+            let frame = receive(&mut host).await;
+            if matches!(frame, Payload::Complete(_)) {
+                break;
+            }
         }
-    }
-    handle.await.unwrap().unwrap();
+    })
+    .await;
+    bounded(handle).await.unwrap().unwrap();
     assert_eq!(registry.probe_resets.load(Ordering::Relaxed), 2);
     assert_eq!(registry.connections_accepted.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn pr_iteration_two_has_cumulative_metrics() {
+    let script =
+        TWO_ITERATIONS.replace("<promise>DONE</promise>", "https://github.com/o/r/pull/42");
+    let (frames, frame) = run_terminal(&script, start(Some("DONE"), 3), false).await;
+    assert!(matches!(frames.last(), Some(Payload::Metrics(m)) if *m == totals(300,130,30,12)));
+    match frame {
+        Payload::Complete(c) => {
+            assert_eq!(c.iteration, 2);
+            assert_eq!(c.pr_url.as_deref(), Some("https://github.com/o/r/pull/42"));
+            assert!(c.promise_found);
+            assert_eq!(c.metrics, Some(totals(300, 130, 30, 12)));
+        }
+        other => panic!("Unexpected terminal frame {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn host_disconnect_stops_after_one_run_and_cleans_up() {
+    let script = r#"
+n=0
+test ! -f "$RUN_COUNTER" || n=$(cat "$RUN_COUNTER")
+printf '%s' "$((n+1))" > "$RUN_COUNTER"
+printf '%s' '{"usage":{"input_tokens":10},"result":"started"}'
+sleep 0.1
+exit 1
+"#;
+    let mut r = launch_with_cleanup(script, false, CleanupStrategy::Full).await;
+    let counter = r.tmp.path().join("run-counter");
+    let mut task = start(Some("DONE"), 5);
+    task.env_vars.push(EnvVar {
+        key: "RUN_COUNTER".into(),
+        value: counter.to_string_lossy().into(),
+    });
+    let mut stream = connect(&r).await;
+    send_start(&mut stream, task).await;
+    assert!(matches!(receive(&mut stream).await, Payload::Progress(p) if p.iteration == 1));
+    assert!(matches!(receive(&mut stream).await, Payload::Output(_)));
+    drop(stream);
+    finish(&mut r).await;
+    assert_eq!(std::fs::read_to_string(counter).unwrap(), "1");
+    assert_eq!(r.registry.iterations.load(Ordering::Relaxed), 1);
+    for path in ["work", "cache", "credentials"] {
+        assert!(!r.tmp.path().join(path).exists());
+    }
 }

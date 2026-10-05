@@ -92,7 +92,9 @@ impl RepoPreparer for RepoSetup {
             match fs::remove_dir_all(work_dir).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
+                Err(error) => {
+                    tracing::warn!(operation = "repo_clone", %error, "Could not remove previous workspace, continuing");
+                }
             }
             fs::create_dir_all(work_dir).await?;
             let dir = work_dir.to_string_lossy();

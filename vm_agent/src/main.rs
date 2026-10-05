@@ -33,6 +33,14 @@ async fn main() -> anyhow::Result<()> {
     let config = VmAgentConfig::from_env().inspect_err(|error| {
         tracing::error!(operation = "configuration", %error, "Invalid guest configuration");
     })?;
+    tracing::info!(
+        operation = "startup",
+        vsock_port = config.vsock_port,
+        work_dir = %config.work_dir,
+        claude_code_path = %config.claude_code_path,
+        cleanup_strategy = %config.cleanup_strategy,
+        "Guest execution configuration"
+    );
     #[cfg(target_os = "linux")]
     let listener = marathon_vm_agent::transport::VsockListener::bind(config.vsock_port)
         .inspect_err(|error| {
@@ -41,6 +49,11 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(target_os = "linux"))]
     let listener = {
         let address = std::env::var("MARATHON_VM_AGENT_TCP_ADDR").ok();
+        tracing::info!(
+            operation = "startup",
+            tcp_address = address.as_deref(),
+            "Guest test transport configuration"
+        );
         marathon_vm_agent::transport::bind_test_transport(address.as_deref())
             .await
             .map_err(|error| {

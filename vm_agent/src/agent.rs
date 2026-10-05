@@ -67,10 +67,12 @@ pub fn wire_metrics(metrics: UsageMetrics) -> VsockMetrics {
     }
 }
 
-async fn send(tx: &mpsc::Sender<VsockMessage>, payload: Payload) {
+async fn send(tx: &mpsc::Sender<VsockMessage>, payload: Payload) -> bool {
     if tx.send(payload.into()).await.is_err() {
         tracing::warn!(operation = "send_frame", "Host writer closed");
+        return false;
     }
+    true
 }
 
 async fn send_error(
@@ -91,7 +93,11 @@ async fn send_error(
     .await;
 }
 
-async fn read_frames(mut reader: impl AsyncRead + Unpin, cancelled: Arc<AtomicBool>) {
+async fn read_frames(
+    mut reader: impl AsyncRead + Unpin,
+    cancelled: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>,
+) {
     loop {
         match vsock::read_message(&mut reader).await {
             Ok(VsockMessage {
@@ -107,6 +113,7 @@ async fn read_frames(mut reader: impl AsyncRead + Unpin, cancelled: Arc<AtomicBo
                 );
             }
             Err(error) => {
+                disconnected.store(true, Ordering::Release);
                 tracing::warn!(operation = "read_frame", %error, "Host reader closed");
                 break;
             }
@@ -118,11 +125,13 @@ async fn write_frames(
     mut writer: impl AsyncWrite + Unpin,
     mut rx: mpsc::Receiver<VsockMessage>,
     registry: Arc<Registry>,
+    disconnected: Arc<AtomicBool>,
 ) {
     while let Some(frame) = rx.recv().await {
         match vsock::write_message(&mut writer, &frame).await {
             Ok(()) => registry.frame_sent(&frame),
             Err(error) => {
+                disconnected.store(true, Ordering::Release);
                 tracing::warn!(operation = "write_frame", %error, "Host connection lost");
                 break;
             }
@@ -179,13 +188,17 @@ impl<P: RepoPreparer> Agent<P> {
             self.registry.active_tasks.store(1, Ordering::Relaxed);
             let (reader, writer) = tokio::io::split(stream);
             let (tx, rx) = mpsc::channel(64);
+            let disconnected = Arc::new(AtomicBool::new(false));
             let writer_task = tokio::spawn(
-                write_frames(writer, rx, self.registry.clone()).instrument(op.span().clone()),
+                write_frames(writer, rx, self.registry.clone(), disconnected.clone())
+                    .instrument(op.span().clone()),
             );
             let cancelled = Arc::new(AtomicBool::new(false));
-            let reader_task =
-                tokio::spawn(read_frames(reader, cancelled.clone()).instrument(op.span().clone()));
-            self.run_task(&task, &tx, &cancelled)
+            let reader_task = tokio::spawn(
+                read_frames(reader, cancelled.clone(), disconnected.clone())
+                    .instrument(op.span().clone()),
+            );
+            self.run_task(&task, &tx, &cancelled, &disconnected)
                 .instrument(op.span().clone())
                 .await;
             self.cleanup
@@ -194,7 +207,18 @@ impl<P: RepoPreparer> Agent<P> {
             reader_task.abort();
             let _ = reader_task.await;
             drop(tx);
+            if disconnected.load(Ordering::Acquire) {
+                writer_task.abort();
+            }
             let _ = writer_task.await;
+            if disconnected.load(Ordering::Acquire) {
+                self.registry.error("host_disconnected");
+                tracing::warn!(
+                    operation = "task",
+                    code = "host_disconnected",
+                    "Host disconnected, stopping task"
+                );
+            }
             self.registry.active_tasks.store(0, Ordering::Relaxed);
             self.registry.observe("task", op.finish());
             self.registry.summary(&task.task_id);
@@ -207,6 +231,7 @@ impl<P: RepoPreparer> Agent<P> {
         task: &VsockStart,
         tx: &mpsc::Sender<VsockMessage>,
         cancelled: &AtomicBool,
+        disconnected: &AtomicBool,
     ) {
         if let Err(error) = self
             .preparer
@@ -231,6 +256,10 @@ impl<P: RepoPreparer> Agent<P> {
         let mut cumulative = UsageMetrics::default();
         let mut last_output = Vec::new();
         for iteration in 1..=max {
+            if disconnected.load(Ordering::Acquire) || tx.is_closed() {
+                disconnected.store(true, Ordering::Release);
+                return;
+            }
             if cancelled.load(Ordering::Acquire) {
                 send_error(
                     tx,
@@ -250,7 +279,7 @@ impl<P: RepoPreparer> Agent<P> {
                     operation = "iteration",
                     "Ralph iteration starting"
                 );
-                send(
+                let sent = send(
                     tx,
                     Payload::Progress(VsockProgress {
                         iteration,
@@ -259,6 +288,10 @@ impl<P: RepoPreparer> Agent<P> {
                     }),
                 )
                 .await;
+                if !sent || disconnected.load(Ordering::Acquire) {
+                    disconnected.store(true, Ordering::Release);
+                    return true;
+                }
                 let prompt = if iteration == 1 {
                     base.clone()
                 } else {
@@ -280,7 +313,12 @@ impl<P: RepoPreparer> Agent<P> {
                 cumulative.add(&result.metrics);
                 memory.log_iteration(iteration, result.exit_code, &result.stdout);
                 last_output = result.stdout;
-                send(tx, Payload::Metrics(wire_metrics(cumulative))).await;
+                if disconnected.load(Ordering::Acquire)
+                    || !send(tx, Payload::Metrics(wire_metrics(cumulative))).await
+                {
+                    disconnected.store(true, Ordering::Release);
+                    return true;
+                }
                 let signals = parse_signals(
                     &String::from_utf8_lossy(&last_output),
                     task.completion_promise.as_deref(),
