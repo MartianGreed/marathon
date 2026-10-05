@@ -7,13 +7,29 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "marathon_client"
+path = "src/lib.rs"
+
 [[bin]]
 name = "marathon"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 common.workspace = true
+rand.workspace = true
+rpassword = "7.4"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tonic.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rcgen = "0.14.10"
+tempfile.workspace = true
+tokio-stream.workspace = true
 
 [lints]
 workspace = true
