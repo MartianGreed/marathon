@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use common::config::NodeOperatorConfig;
 use common::{TaskId, VmId};
 use futures::future::BoxFuture;
+use tokio_util::sync::CancellationToken;
 
 use super::firecracker::{Vm, VmConfig, VmError};
 use crate::metrics;
@@ -84,6 +85,8 @@ pub enum PoolError {
     NoSlots(u32),
     #[error("no available VM: {0}")]
     LaunchFailed(String),
+    #[error("no available VM: node is shutting down")]
+    ShuttingDown,
 }
 
 /// What a task needs from the VM it was given.
@@ -110,6 +113,14 @@ struct PoolState {
     active: HashMap<VmId, Vm>,
     /// VMs booting outside the lock; they count toward the slots.
     starting: u32,
+    /// Set by `shutdown`: no new boots, and booted VMs are not kept.
+    closing: bool,
+}
+
+/// Where a freshly booted VM goes.
+enum Into {
+    Warm,
+    Active,
 }
 
 impl PoolState {
@@ -127,8 +138,11 @@ struct StartingSlot<'a> {
 
 impl Drop for StartingSlot<'_> {
     fn drop(&mut self) {
-        let mut s = self.pool.lock();
-        s.starting = s.starting.saturating_sub(1);
+        {
+            let mut s = self.pool.lock();
+            s.starting = s.starting.saturating_sub(1);
+        }
+        self.pool.boots_done.notify_waiters();
     }
 }
 
@@ -137,6 +151,10 @@ pub struct VmPool {
     launcher: Arc<dyn VmLauncher>,
     config: PoolConfig,
     state: Mutex<PoolState>,
+    /// Woken whenever a booting slot is released.
+    boots_done: tokio::sync::Notify,
+    /// Cancelled by `shutdown` to abort boots in flight.
+    closing_token: CancellationToken,
 }
 
 impl VmPool {
@@ -145,7 +163,31 @@ impl VmPool {
             launcher,
             config,
             state: Mutex::new(PoolState::default()),
+            boots_done: tokio::sync::Notify::new(),
+            closing_token: CancellationToken::new(),
         }
+    }
+
+    /// Keep a booted VM unless the pool is shutting down. A refused VM is
+    /// handed back for the caller to stop.
+    #[must_use]
+    fn keep(&self, vm: Vm, into: Into) -> Option<Vm> {
+        let mut s = self.lock();
+        if s.closing {
+            return Some(vm);
+        }
+        match into {
+            Into::Warm => s.warm.push(vm),
+            Into::Active => {
+                s.active.insert(vm.id, vm);
+            }
+        }
+        Self::update_gauges(&s);
+        None
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.lock().closing
     }
 
     pub fn config(&self) -> PoolConfig {
@@ -168,7 +210,7 @@ impl VmPool {
     /// accepts the current state.
     fn reserve(&self, admit: impl FnOnce(&PoolState) -> bool) -> Option<StartingSlot<'_>> {
         let mut s = self.lock();
-        if s.occupied() >= self.config.total_vm_slots || !admit(&s) {
+        if s.closing || s.occupied() >= self.config.total_vm_slots || !admit(&s) {
             return None;
         }
         s.starting += 1;
@@ -178,7 +220,13 @@ impl VmPool {
     /// Boot one VM in a reserved slot.
     async fn boot(&self, _slot: &StartingSlot<'_>) -> Result<Vm, VmError> {
         let mut vm = self.launcher.create();
-        match self.launcher.launch(&mut vm).await {
+        let launched = tokio::select! {
+            r = self.launcher.launch(&mut vm) => r,
+            () = self.closing_token.cancelled() => {
+                Err(VmError::Launch("pool shutting down".into()))
+            }
+        };
+        match launched {
             Ok(()) => Ok(vm),
             Err(e) => {
                 vm.stop().await;
@@ -202,9 +250,11 @@ impl VmPool {
             match self.boot(&slot).await {
                 Ok(vm) => {
                     failures = 0;
-                    let mut s = self.lock();
-                    s.warm.push(vm);
-                    Self::update_gauges(&s);
+                    if let Some(mut vm) = self.keep(vm, Into::Warm) {
+                        tracing::info!(parent: op.span(), vm_id = %vm.id, "pool shutting down, stopping freshly booted VM");
+                        vm.stop().await;
+                        break;
+                    }
                 }
                 Err(e) => {
                     failures += 1;
@@ -248,13 +298,14 @@ impl VmPool {
             PoolError::LaunchFailed(e.to_string())
         })?;
         let lease = VmLease::of(&vm);
-        {
-            let mut s = self.lock();
-            s.active.insert(vm.id, vm);
-            Self::update_gauges(&s);
-        }
+        let kept = self.keep(vm, Into::Active);
         // Drop the booting slot only after the VM is counted as active, so
         // the slot count never dips below the real number of VMs.
+        if let Some(mut vm) = kept {
+            vm.stop().await;
+            drop(slot);
+            return Err(PoolError::ShuttingDown);
+        }
         drop(slot);
         Ok(lease)
     }
@@ -296,9 +347,9 @@ impl VmPool {
         };
         match self.boot(&slot).await {
             Ok(vm) => {
-                let mut s = self.lock();
-                s.warm.push(vm);
-                Self::update_gauges(&s);
+                if let Some(mut vm) = self.keep(vm, Into::Warm) {
+                    vm.stop().await;
+                }
             }
             Err(e) => {
                 tracing::warn!(operation = "replenish_pool", error = %e, "failed to replenish warm pool")
@@ -318,8 +369,25 @@ impl VmPool {
         self.warm_count() + self.active_count()
     }
 
-    /// Stop every VM.
+    /// Stop every VM. New boots are refused from now on; boots already in
+    /// flight are waited for and their VMs stopped instead of kept.
     pub async fn shutdown(&self) {
+        let op = common::telemetry::Operation::start("pool_shutdown");
+        self.lock().closing = true;
+        self.closing_token.cancel();
+        loop {
+            let done = self.boots_done.notified();
+            tokio::pin!(done);
+            // Register before checking, so a slot released in between
+            // still wakes us.
+            done.as_mut().enable();
+            let starting = self.lock().starting;
+            if starting == 0 {
+                break;
+            }
+            tracing::info!(parent: op.span(), starting, "waiting for VM boots to finish");
+            done.await;
+        }
         let vms: Vec<Vm> = {
             let mut s = self.lock();
             let mut vms: Vec<Vm> = std::mem::take(&mut s.warm);
@@ -327,9 +395,12 @@ impl VmPool {
             Self::update_gauges(&s);
             vms
         };
+        let stopped = vms.len();
         for mut vm in vms {
             vm.stop().await;
         }
+        tracing::info!(parent: op.span(), stopped, "pool shut down");
+        op.finish();
     }
 }
 
@@ -384,6 +455,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::{pool, ready_vm};
     use super::*;
+    use std::time::Duration;
 
     // Port of Zig `test "pool acquire returns null when empty"`.
     #[test]
@@ -576,6 +648,109 @@ mod tests {
         let _ = p.acquire().unwrap();
         p.shutdown().await;
         assert_eq!(p.total_count(), 0);
+    }
+
+    /// A launcher that blocks every boot until released.
+    struct GatedLauncher {
+        entered: Arc<tokio::sync::Notify>,
+        proceed: Arc<tokio::sync::Notify>,
+    }
+
+    impl VmLauncher for GatedLauncher {
+        fn launch<'a>(&'a self, vm: &'a mut Vm) -> BoxFuture<'a, Result<(), VmError>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.proceed.notified().await;
+                vm.mark_ready();
+                Ok(())
+            })
+        }
+        fn create(&self) -> Vm {
+            Vm::in_dir(&std::env::temp_dir())
+        }
+    }
+
+    fn gated(
+        slots: u32,
+    ) -> (
+        Arc<VmPool>,
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let pool = Arc::new(VmPool::new(
+            Arc::new(GatedLauncher {
+                entered: entered.clone(),
+                proceed: proceed.clone(),
+            }),
+            PoolConfig {
+                total_vm_slots: slots,
+                warm_pool_target: 0,
+            },
+        ));
+        (pool, entered, proceed)
+    }
+
+    // A VM still booting holds its slot.
+    #[tokio::test]
+    async fn booting_vm_counts_toward_slots() {
+        let (p, entered, proceed) = gated(1);
+        let booting = {
+            let p = p.clone();
+            tokio::spawn(async move { p.acquire_or_create().await })
+        };
+        entered.notified().await;
+        let second = tokio::time::timeout(Duration::from_secs(1), p.acquire_or_create())
+            .await
+            .expect("second acquire must not wait for a boot");
+        assert_eq!(second, Err(PoolError::NoSlots(1)));
+        proceed.notify_one();
+        booting.await.unwrap().unwrap();
+        assert_eq!(p.active_count(), 1);
+    }
+
+    // C-R1-02: shutdown during a warm boot leaves nothing behind.
+    #[tokio::test]
+    async fn shutdown_during_warm_boot_keeps_nothing() {
+        let (p, entered, proceed) = gated(2);
+        let warming = {
+            let p = p.clone();
+            tokio::spawn(async move { p.warm_pool(2).await })
+        };
+        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), p.shutdown())
+            .await
+            .expect("shutdown hangs on a boot in flight");
+        proceed.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), warming)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.total_count(), 0);
+        assert_eq!(p.lock().starting, 0);
+        // And nothing new boots afterwards.
+        p.warm_pool(2).await;
+        assert_eq!(p.total_count(), 0);
+        assert_eq!(p.acquire_or_create().await, Err(PoolError::NoSlots(2)));
+    }
+
+    // C-R1-02: shutdown during an on-demand boot fails the acquire.
+    #[tokio::test]
+    async fn shutdown_during_on_demand_boot_fails_acquire() {
+        let (p, entered, _proceed) = gated(2);
+        let acquiring = {
+            let p = p.clone();
+            tokio::spawn(async move { p.acquire_or_create().await })
+        };
+        entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(2), p.shutdown())
+            .await
+            .expect("shutdown hangs on a boot in flight");
+        let r = acquiring.await.unwrap();
+        assert!(matches!(r, Err(PoolError::LaunchFailed(_))), "{r:?}");
+        assert_eq!(p.total_count(), 0);
+        assert!(p.is_closing());
     }
 
     #[test]

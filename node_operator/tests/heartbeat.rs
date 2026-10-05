@@ -60,6 +60,11 @@ struct FakeOrchestrator {
     commands: Arc<Mutex<VecDeque<pb::NodeCommand>>>,
     end_stream: Arc<AtomicBool>,
     streams: Arc<AtomicUsize>,
+    /// Fail the next `ReportTaskResult` with UNAVAILABLE.
+    fail_next_result: Arc<AtomicBool>,
+    failed_results: Arc<AtomicUsize>,
+    /// Delay every `ReportTaskResult` before accepting it.
+    result_delay: Arc<Mutex<Duration>>,
 }
 
 impl FakeOrchestrator {
@@ -70,6 +75,9 @@ impl FakeOrchestrator {
             commands: Arc::default(),
             end_stream: Arc::default(),
             streams: Arc::default(),
+            fail_next_result: Arc::default(),
+            failed_results: Arc::default(),
+            result_delay: Arc::default(),
         }
     }
 
@@ -152,6 +160,14 @@ impl NodeService for FakeOrchestrator {
         if let Err(s) = self.verify(req.auth.as_ref()) {
             self.log.lock().unwrap().push(Event::ReportRejected);
             return Err(s);
+        }
+        if self.fail_next_result.swap(false, Ordering::SeqCst) {
+            self.failed_results.fetch_add(1, Ordering::SeqCst);
+            return Err(Status::unavailable("injected report failure"));
+        }
+        let delay = *self.result_delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         self.log.lock().unwrap().push(Event::Results(req.results));
         Ok(Response::new(pb::ReportTaskResultResponse {}))
@@ -309,7 +325,22 @@ impl Node {
     }
 }
 
+fn fast_settings() -> HeartbeatSettings {
+    HeartbeatSettings {
+        interval: Duration::from_millis(50),
+        active_interval_cap: Duration::from_millis(50),
+        backoff_initial: Duration::from_millis(50),
+        backoff_max: Duration::from_millis(200),
+        connect_timeout: Duration::from_secs(2),
+        rpc_timeout: Duration::from_secs(2),
+    }
+}
+
 fn start_node(port: u16, key: Option<&str>, log: &Log) -> Node {
+    start_node_with(port, key, log, fast_settings())
+}
+
+fn start_node_with(port: u16, key: Option<&str>, log: &Log, settings: HeartbeatSettings) -> Node {
     // Short path: macOS limits Unix socket paths to 104 bytes.
     let dir = tempfile::Builder::new()
         .prefix("mnt")
@@ -334,6 +365,7 @@ fn start_node(port: u16, key: Option<&str>, log: &Log) -> Node {
                 connect_attempts: 5,
                 connect_delay: Duration::from_millis(20),
                 handshake_timeout: Duration::from_secs(2),
+                ready_timeout: Duration::from_secs(2),
                 cancel_grace: Duration::from_secs(5),
             },
         },
@@ -344,14 +376,6 @@ fn start_node(port: u16, key: Option<&str>, log: &Log) -> Node {
         auth_key: key.map(str::to_string),
         hostname: Some("test-node".into()),
         ..NodeOperatorConfig::default()
-    };
-    let settings = HeartbeatSettings {
-        interval: Duration::from_millis(50),
-        active_interval_cap: Duration::from_millis(50),
-        backoff_initial: Duration::from_millis(50),
-        backoff_max: Duration::from_millis(200),
-        connect_timeout: Duration::from_secs(2),
-        rpc_timeout: Duration::from_secs(2),
     };
     let client = Arc::new(HeartbeatClient::new(&config, executor.clone(), settings));
     let runner = client.clone();
@@ -662,6 +686,237 @@ async fn drain_rejects_new_tasks_and_warm_pool_boots_vms() {
             .any(|e| matches!(e, Event::AgentStart(_))),
         "a draining node started a task"
     );
+    node.stop().await;
+    server.abort();
+}
+
+fn key() -> Option<&'static str> {
+    Some(std::str::from_utf8(KEY).unwrap())
+}
+
+/// Takes the events `wait_for` already holds: locking the log again from
+/// inside its closure would deadlock.
+fn agent_started(events: &[Event], task: &TaskId) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, Event::AgentStart(s) if s.task_id == task.to_hex()))
+}
+
+// A task survives a stream drop, and a result whose report fails is sent
+// again exactly once (not lost, not duplicated).
+#[tokio::test]
+async fn failed_result_report_is_retried_once_across_a_stream_drop() {
+    let log: Log = Arc::default();
+    let listener = bind(false).await;
+    let port = listener.local_addr().unwrap().port();
+    let orch = FakeOrchestrator::new(Some(KEY), log.clone());
+    let server = serve(listener, orch.clone());
+    let node = start_node(port, key(), &log);
+
+    let task = TaskId::random();
+    orch.push(execute(&task, "wait-for-cancel"));
+    wait_for(&log, "start", |ev| agent_started(ev, &task).then_some(())).await;
+    orch.end_stream.store(true, Ordering::SeqCst);
+    wait_for(&log, "task listed on stream 2", |ev| {
+        ev.iter()
+            .any(|e| matches!(e, Event::Heartbeat { stream: 2, status, .. } if status.active_task_ids.contains(&task.to_hex())))
+            .then_some(())
+    })
+    .await;
+    assert_eq!(node.executor.active_task_count(), 1);
+
+    orch.fail_next_result.store(true, Ordering::SeqCst);
+    orch.push(Command::CancelTask(pb::CancelTask {
+        task_id: task.to_hex(),
+    }));
+    let result = wait_for(&log, "retried result", |ev| result_for(ev, &task)).await;
+    assert_eq!(
+        result.error_message.as_deref(),
+        Some("Task cancelled by user")
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let accepted = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::Results(r) if r.iter().any(|r| r.task_id == task.to_hex())))
+        .count();
+    assert_eq!(accepted, 1, "result accepted exactly once");
+    assert_eq!(orch.failed_results.load(Ordering::SeqCst), 1);
+    node.stop().await;
+    server.abort();
+}
+
+// C-R1-03: work started during a long idle wait gets an active heartbeat
+// within the active cap, not at the end of the idle interval.
+#[tokio::test]
+async fn active_heartbeat_follows_the_cap_after_work_starts() {
+    let log: Log = Arc::default();
+    let listener = bind(false).await;
+    let port = listener.local_addr().unwrap().port();
+    let orch = FakeOrchestrator::new(Some(KEY), log.clone());
+    let task = TaskId::random();
+    // Delivered in the answer to the registration heartbeat.
+    orch.push(execute(&task, "wait-for-cancel"));
+    let server = serve(listener, orch.clone());
+    let settings = HeartbeatSettings {
+        interval: Duration::from_millis(1500),
+        active_interval_cap: Duration::from_millis(100),
+        ..fast_settings()
+    };
+    let node = start_node_with(port, key(), &log, settings);
+    wait_for(&log, "start", |ev| agent_started(ev, &task).then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let active_heartbeats = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::Heartbeat { status, .. } if status.active_vms == 1))
+        .count();
+    node.executor.cancel_task(&task.to_hex());
+    node.stop().await;
+    server.abort();
+    assert!(
+        active_heartbeats >= 2,
+        "{active_heartbeats} active heartbeats within 400 ms with a 100 ms cap"
+    );
+}
+
+// A slow result report does not hold back heartbeats.
+#[tokio::test]
+async fn slow_report_does_not_block_heartbeats() {
+    let log: Log = Arc::default();
+    let listener = bind(false).await;
+    let port = listener.local_addr().unwrap().port();
+    let orch = FakeOrchestrator::new(Some(KEY), log.clone());
+    *orch.result_delay.lock().unwrap() = Duration::from_millis(1500);
+    let server = serve(listener, orch.clone());
+    let settings = HeartbeatSettings {
+        rpc_timeout: Duration::from_secs(5),
+        ..fast_settings()
+    };
+    let node = start_node_with(port, key(), &log, settings);
+    let task = TaskId::random();
+    orch.push(execute(&task, "complete"));
+    // The result is ready once the VM is released and the task removed.
+    wait_for(&log, "task finished on the node", |ev| {
+        (agent_started(ev, &task) && node.executor.active_task_count() == 0).then_some(())
+    })
+    .await;
+    // Give the report loop a tick to pick the result up and block on it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let before = heartbeat_count(&log);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let during = heartbeat_count(&log) - before;
+    assert!(
+        result_for(&log.lock().unwrap(), &task).is_none(),
+        "the delayed report already completed; the test proves nothing"
+    );
+    assert!(
+        during >= 5,
+        "only {during} heartbeats in 600 ms while a report was pending"
+    );
+    wait_for(&log, "delayed result", |ev| result_for(ev, &task)).await;
+    node.stop().await;
+    server.abort();
+}
+
+fn heartbeat_count(log: &Log) -> usize {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::Heartbeat { .. }))
+        .count()
+}
+
+// The reconnect backoff returns to its initial delay once the orchestrator
+// has answered.
+#[tokio::test]
+async fn backoff_resets_after_the_orchestrator_answers() {
+    let log: Log = Arc::default();
+    let port = {
+        let l = bind(false).await;
+        l.local_addr().unwrap().port()
+    };
+    let settings = HeartbeatSettings {
+        backoff_initial: Duration::from_millis(50),
+        backoff_max: Duration::from_millis(3000),
+        ..fast_settings()
+    };
+    let node = start_node_with(port, key(), &log, settings);
+    // Unreachable long enough to grow the backoff: 50+100+...+1600 ms.
+    tokio::time::sleep(Duration::from_millis(3300)).await;
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port)))
+        .await
+        .unwrap();
+    let orch = FakeOrchestrator::new(Some(KEY), log.clone());
+    let server = serve(listener, orch.clone());
+    wait_for(&log, "registration", |ev| {
+        ev.iter()
+            .any(|e| matches!(e, Event::Heartbeat { stream: 1, .. }))
+            .then_some(())
+    })
+    .await;
+    // Let the orchestrator answer, then drop the stream.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    orch.end_stream.store(true, Ordering::SeqCst);
+    let dropped = wait_for(&log, "stream drop", |ev| {
+        let n = ev
+            .iter()
+            .filter(|e| matches!(e, Event::Heartbeat { stream: 1, .. }))
+            .count();
+        (n >= 2).then(tokio::time::Instant::now)
+    })
+    .await;
+    wait_for(&log, "reconnect", |ev| {
+        ev.iter()
+            .any(|e| matches!(e, Event::Heartbeat { stream: 2, .. }))
+            .then_some(())
+    })
+    .await;
+    let took = dropped.elapsed();
+    assert!(
+        took < Duration::from_millis(1000),
+        "reconnect took {took:?}: the backoff did not reset after the orchestrator answered"
+    );
+    node.stop().await;
+    server.abort();
+}
+
+// Drain keeps a running task alive and cancellable while new work is
+// rejected and the warm pool still fills.
+#[tokio::test]
+async fn drain_preserves_the_running_task() {
+    let log: Log = Arc::default();
+    let listener = bind(false).await;
+    let port = listener.local_addr().unwrap().port();
+    let orch = FakeOrchestrator::new(Some(KEY), log.clone());
+    let server = serve(listener, orch.clone());
+    let node = start_node(port, key(), &log);
+    let running = TaskId::random();
+    orch.push(execute(&running, "wait-for-cancel"));
+    wait_for(&log, "start", |ev| {
+        agent_started(ev, &running).then_some(())
+    })
+    .await;
+    orch.push(Command::WarmPool(pb::WarmPool { target: Some(2) }));
+    orch.push(Command::Drain(pb::Drain {}));
+    wait_for(&log, "draining with warm VMs", |ev| {
+        ev.iter()
+            .any(|e| matches!(e, Event::Heartbeat { status, .. } if status.draining && status.warm_vms == 2 && status.active_vms == 1))
+            .then_some(())
+    })
+    .await;
+    let rejected = TaskId::random();
+    orch.push(execute(&rejected, "complete"));
+    let r = wait_for(&log, "rejection", |ev| result_for(ev, &rejected)).await;
+    assert_eq!(r.error_message.as_deref(), Some("node is draining"));
+    assert_eq!(node.executor.active_task_count(), 1);
+    orch.push(Command::CancelTask(pb::CancelTask {
+        task_id: running.to_hex(),
+    }));
+    let r = wait_for(&log, "cancelled result", |ev| result_for(ev, &running)).await;
+    assert_eq!(r.error_message.as_deref(), Some("Task cancelled by user"));
     node.stop().await;
     server.abort();
 }

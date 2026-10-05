@@ -82,6 +82,17 @@ pub fn event_from_message(msg: VsockMessage) -> Result<VsockEvent, HandlerError>
     }
 }
 
+/// Short name of an event, for logs (never its content).
+pub fn event_kind(event: &VsockEvent) -> &'static str {
+    match event {
+        VsockEvent::Ready { .. } => "ready",
+        VsockEvent::Output { .. } => "output",
+        VsockEvent::Metrics(_) => "metrics",
+        VsockEvent::Complete(_) => "complete",
+        VsockEvent::Error(_) => "error",
+    }
+}
+
 /// A connection to one VM's agent.
 #[derive(Debug)]
 pub struct VsockHandler {
@@ -210,6 +221,8 @@ pub struct RunnerSettings {
     pub connect_attempts: u32,
     pub connect_delay: Duration,
     pub handshake_timeout: Duration,
+    /// How long to wait for the agent's `ready` after the handshake.
+    pub ready_timeout: Duration,
     /// How long to wait for the agent to answer a cancel.
     pub cancel_grace: Duration,
 }
@@ -220,6 +233,7 @@ impl Default for RunnerSettings {
             connect_attempts: 15,
             connect_delay: Duration::from_secs(2),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            ready_timeout: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(30),
         }
     }
@@ -227,6 +241,8 @@ impl Default for RunnerSettings {
 
 /// Error text when the agent does not answer a cancel in time.
 pub const CANCEL_UNACKNOWLEDGED: &str = "Task cancelled; agent did not acknowledge";
+/// Error text when the agent never sends `ready`.
+pub const READY_TIMEOUT: &str = "VM agent did not send ready";
 /// Error text when a task is cancelled before it reached the agent.
 pub const CANCELLED_BEFORE_START: &str = "Task cancelled before start";
 /// Error text for a non-zero agent exit code.
@@ -278,7 +294,11 @@ impl TaskRunner {
         let attempts = self.settings.connect_attempts.max(1);
         let mut attempt = 0;
         loop {
-            match self.handler.connect().await {
+            let attempt_result = tokio::select! {
+                () = cancel.cancelled() => return Ok(false),
+                r = self.handler.connect() => r,
+            };
+            match attempt_result {
                 Ok(()) => return Ok(true),
                 Err(e) => {
                     attempt += 1;
@@ -317,23 +337,6 @@ impl TaskRunner {
     }
 
     async fn converse(&mut self, start: pb::VsockStart, cancel: &CancellationToken) -> TaskResult {
-        match self.handler.receive().await {
-            Ok(VsockEvent::Ready { vm_id }) => {
-                tracing::debug!(task_id = %self.task_id, guest_cid = vm_id, "agent ready");
-            }
-            Ok(other) => {
-                tracing::warn!(task_id = %self.task_id, event = ?other, "expected ready from agent");
-            }
-            Err(e) => return TaskResult::failed(e.to_string(), self.metrics),
-        }
-        if cancel.is_cancelled() {
-            return TaskResult::failed(CANCELLED_BEFORE_START, self.metrics);
-        }
-        if let Err(e) = self.handler.send_start(start).await {
-            return TaskResult::failed(e.to_string(), self.metrics);
-        }
-        tracing::info!(task_id = %self.task_id, "task started on VM");
-
         let Some(stream) = self.handler.take_stream() else {
             return TaskResult::failed(HandlerError::NotConnected.to_string(), self.metrics);
         };
@@ -354,6 +357,39 @@ impl TaskRunner {
             }
         });
         let _abort = AbortOnDrop(reader_task);
+
+        // Wait for `ready`, bounded and cancellable: before `start` the
+        // agent has nothing to cancel, so cancelling just stops here.
+        let first = tokio::select! {
+            biased;
+            item = rx.recv() => item,
+            () = cancel.cancelled() => {
+                tracing::info!(task_id = %self.task_id, "task cancelled before start");
+                return TaskResult::failed(CANCELLED_BEFORE_START, self.metrics);
+            }
+            () = tokio::time::sleep(self.settings.ready_timeout) => {
+                tracing::error!(task_id = %self.task_id, "VM agent did not send ready");
+                return TaskResult::failed(READY_TIMEOUT, self.metrics);
+            }
+        };
+        match first {
+            Some(Ok(VsockEvent::Ready { vm_id })) => {
+                tracing::debug!(task_id = %self.task_id, guest_cid = vm_id, "agent ready");
+            }
+            Some(Ok(other)) => {
+                tracing::warn!(task_id = %self.task_id, event = %event_kind(&other), "expected ready from agent");
+            }
+            Some(Err(e)) => return TaskResult::failed(e.to_string(), self.metrics),
+            None => return TaskResult::failed(FrameError::Closed.to_string(), self.metrics),
+        }
+        if cancel.is_cancelled() {
+            return TaskResult::failed(CANCELLED_BEFORE_START, self.metrics);
+        }
+        let msg = VsockMessage::from(Payload::Start(start));
+        if let Err(e) = common::vsock::write_message(&mut writer, &msg).await {
+            return TaskResult::failed(e.to_string(), self.metrics);
+        }
+        tracing::info!(task_id = %self.task_id, trace_id = %self.trace.trace_id(), "task started on VM");
 
         let mut cancel_deadline: Option<tokio::time::Instant> = None;
         loop {
@@ -414,7 +450,9 @@ impl TaskRunner {
                 })
             }
             VsockEvent::Error(e) => {
-                tracing::warn!(task_id = %self.task_id, code = %e.code, message = %e.message, "agent reported an error");
+                // The message goes to the orchestrator in the result; the
+                // log keeps only its code and size, as it can echo secrets.
+                tracing::warn!(task_id = %self.task_id, code = %e.code, message_bytes = e.message.len(), "agent reported an error");
                 Some(TaskResult::failed(e.message, self.metrics))
             }
         }
@@ -497,6 +535,7 @@ mod tests {
             connect_attempts: 3,
             connect_delay: Duration::from_millis(10),
             handshake_timeout: Duration::from_secs(2),
+            ready_timeout: Duration::from_secs(2),
             cancel_grace: Duration::from_millis(200),
         }
     }
@@ -938,5 +977,95 @@ mod tests {
             matches!(err, HandlerError::Handshake(HandshakeError::Rejected(_))),
             "{err:?}"
         );
+    }
+
+    /// An agent that completes the handshake and then stays silent.
+    fn silent_after_handshake(path: &Path) -> tokio::sync::oneshot::Receiver<()> {
+        let listener = bind(path);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _s = accept(&listener).await;
+            let _ = tx.send(());
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        rx
+    }
+
+    // C-R1-01: cancelling while waiting for `ready` must return promptly.
+    #[tokio::test]
+    async fn runner_cancel_while_waiting_for_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sock");
+        let handshaken = silent_after_handshake(&path);
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        let task = TaskId::random();
+        let mut settings = fast();
+        settings.ready_timeout = Duration::from_secs(30);
+        let run = tokio::spawn(async move {
+            TaskRunner::new(&path, 9999, task)
+                .with_settings(settings)
+                .run(start_for(&task), c)
+                .await
+        });
+        handshaken.await.unwrap();
+        cancel.cancel();
+        let r = tokio::time::timeout(Duration::from_millis(500), run)
+            .await
+            .expect("cancel before ready hangs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.error_message.as_deref(), Some(CANCELLED_BEFORE_START));
+    }
+
+    #[tokio::test]
+    async fn runner_ready_timeout_fails_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sock");
+        let _handshaken = silent_after_handshake(&path);
+        let task = TaskId::random();
+        let mut settings = fast();
+        settings.ready_timeout = Duration::from_millis(100);
+        let r = tokio::time::timeout(
+            Duration::from_secs(2),
+            TaskRunner::new(&path, 9999, task)
+                .with_settings(settings)
+                .run(start_for(&task), CancellationToken::new()),
+        )
+        .await
+        .expect("ready wait is unbounded")
+        .unwrap();
+        assert_eq!(r.error_message.as_deref(), Some(READY_TIMEOUT));
+    }
+
+    // Cancel during a handshake the agent never answers.
+    #[tokio::test]
+    async fn runner_cancel_during_stalled_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sock");
+        let listener = bind(&path);
+        tokio::spawn(async move {
+            let (_s, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            c.cancel();
+        });
+        let task = TaskId::random();
+        let mut settings = fast();
+        settings.handshake_timeout = Duration::from_secs(30);
+        let r = tokio::time::timeout(
+            Duration::from_secs(2),
+            TaskRunner::new(&path, 9999, task)
+                .with_settings(settings)
+                .run(start_for(&task), cancel),
+        )
+        .await
+        .expect("cancel during handshake hangs")
+        .unwrap();
+        assert_eq!(r.error_message.as_deref(), Some(CANCELLED_BEFORE_START));
     }
 }

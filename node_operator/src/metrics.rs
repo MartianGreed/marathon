@@ -4,7 +4,9 @@
 //! The workspace has no metrics exporter yet, so [`Metrics::log`] writes a
 //! snapshot at `debug` on every heartbeat and tests read the values directly.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// A monotonically increasing count.
@@ -26,6 +28,37 @@ impl Counter {
 
     pub fn get(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Counters keyed by two labels, such as `(rpc, status)`.
+#[derive(Debug, Default)]
+pub struct CounterVec(Mutex<BTreeMap<(&'static str, &'static str), u64>>);
+
+impl CounterVec {
+    pub const fn new() -> Self {
+        Self(Mutex::new(BTreeMap::new()))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<(&'static str, &'static str), u64>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn inc(&self, a: &'static str, b: &'static str) {
+        *self.lock().entry((a, b)).or_insert(0) += 1;
+    }
+
+    pub fn get(&self, a: &'static str, b: &'static str) -> u64 {
+        self.lock().get(&(a, b)).copied().unwrap_or(0)
+    }
+
+    /// `a{b}=n` pairs, sorted, for logs.
+    pub fn render(&self) -> String {
+        self.lock()
+            .iter()
+            .map(|((a, b), n)| format!("{a}{{{b}}}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -98,6 +131,22 @@ impl Histogram {
         self.sum_ms.load(Ordering::Relaxed)
     }
 
+    /// `count`, `sum_ms` and the non-empty buckets as `le<bound>=n`, for
+    /// logs.
+    pub fn render(&self) -> String {
+        let mut out = format!("count={} sum_ms={}", self.count(), self.sum_ms());
+        for (i, n) in self.buckets().into_iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            match LATENCY_BUCKETS_MS.get(i) {
+                Some(le) => out.push_str(&format!(" le{le}={n}")),
+                None => out.push_str(&format!(" inf={n}")),
+            }
+        }
+        out
+    }
+
     /// Count in each bucket, the last one being "slower than every bound".
     pub fn buckets(&self) -> Vec<u64> {
         self.buckets
@@ -123,6 +172,12 @@ pub struct Metrics {
     pub output_report_errors: Counter,
     pub heartbeat_connect_ms: Histogram,
     pub report_rpc_ms: Histogram,
+    /// Outgoing gRPC calls by `(rpc, status)`.
+    pub rpc_calls: CounterVec,
+    /// Commands from the orchestrator by `(command, "received")`.
+    pub commands: CounterVec,
+    /// 1 while a heartbeat stream is connected.
+    pub orchestrator_connected: Gauge,
 
     // Tasks
     pub tasks_started: Counter,
@@ -132,6 +187,10 @@ pub struct Metrics {
     pub tasks_rejected: Counter,
     pub task_duration_ms: Histogram,
     pub vsock_connect_retries: Counter,
+    /// Task events by `(stage, outcome)`.
+    pub tasks: CounterVec,
+    /// Results waiting to be reported.
+    pub result_queue_depth: Gauge,
 
     // VMs and Firecracker
     pub vm_boots: Counter,
@@ -169,6 +228,9 @@ impl Metrics {
             output_report_errors: Counter::new(),
             heartbeat_connect_ms: Histogram::new(),
             report_rpc_ms: Histogram::new(),
+            rpc_calls: CounterVec::new(),
+            commands: CounterVec::new(),
+            orchestrator_connected: Gauge::new(),
             tasks_started: Counter::new(),
             tasks_succeeded: Counter::new(),
             tasks_failed: Counter::new(),
@@ -176,6 +238,8 @@ impl Metrics {
             tasks_rejected: Counter::new(),
             task_duration_ms: Histogram::new(),
             vsock_connect_retries: Counter::new(),
+            tasks: CounterVec::new(),
+            result_queue_depth: Gauge::new(),
             vm_boots: Counter::new(),
             vm_boot_failures: Counter::new(),
             vm_boot_ms: Histogram::new(),
@@ -216,6 +280,16 @@ impl Metrics {
             active_vms = self.active_vms.get(),
             output_buffer_depth = self.output_buffer_depth.get(),
             output_events_dropped = self.output_events_dropped.get(),
+            result_queue_depth = self.result_queue_depth.get(),
+            orchestrator_connected = self.orchestrator_connected.get(),
+            rpc_calls = %self.rpc_calls.render(),
+            commands = %self.commands.render(),
+            tasks = %self.tasks.render(),
+            heartbeat_connect_ms = %self.heartbeat_connect_ms.render(),
+            report_rpc_ms = %self.report_rpc_ms.render(),
+            task_duration_ms = %self.task_duration_ms.render(),
+            vm_boot_ms = %self.vm_boot_ms.render(),
+            firecracker_api_ms = %self.firecracker_api_ms.render(),
             "node metrics"
         );
     }
@@ -242,6 +316,29 @@ mod tests {
         g.set(7);
         g.set(4);
         assert_eq!(g.get(), 4);
+    }
+
+    #[test]
+    fn counter_vec_counts_per_label_pair() {
+        let c = CounterVec::new();
+        c.inc("report_task_result", "ok");
+        c.inc("report_task_result", "ok");
+        c.inc("report_task_result", "unavailable");
+        assert_eq!(c.get("report_task_result", "ok"), 2);
+        assert_eq!(c.get("report_task_result", "unavailable"), 1);
+        assert_eq!(c.get("heartbeat_open", "ok"), 0);
+        assert_eq!(
+            c.render(),
+            "report_task_result{ok}=2 report_task_result{unavailable}=1"
+        );
+    }
+
+    #[test]
+    fn histogram_render_lists_non_empty_buckets() {
+        let h = Histogram::new();
+        h.observe_ms(3);
+        h.observe_ms(700_000);
+        assert_eq!(h.render(), "count=2 sum_ms=700003 le5=1 inf=1");
     }
 
     #[test]

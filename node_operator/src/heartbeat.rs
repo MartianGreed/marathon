@@ -127,6 +127,84 @@ enum SessionEnd {
     Timeout,
 }
 
+/// Exponential reconnect delay: `initial`, doubling up to `max`, back to
+/// `initial` after [`reset`](Self::reset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backoff {
+    initial: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl Backoff {
+    pub fn new(initial: Duration, max: Duration) -> Self {
+        Self {
+            initial,
+            max,
+            current: initial,
+        }
+    }
+
+    /// The delay to wait now; the following one doubles.
+    pub fn next_delay(&mut self) -> Duration {
+        let d = self.current;
+        self.current = (self.current * 2).min(self.max);
+        d
+    }
+
+    pub fn reset(&mut self) {
+        self.current = self.initial;
+    }
+}
+
+/// Metric label for a gRPC status code.
+fn code_label(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "ok",
+        tonic::Code::Unauthenticated => "unauthenticated",
+        tonic::Code::Unavailable => "unavailable",
+        tonic::Code::DeadlineExceeded => "deadline_exceeded",
+        tonic::Code::PermissionDenied => "permission_denied",
+        tonic::Code::InvalidArgument => "invalid_argument",
+        tonic::Code::Internal => "internal",
+        _ => "other",
+    }
+}
+
+fn outcome_label<T>(
+    outcome: &Result<Result<T, tonic::Status>, tokio::time::error::Elapsed>,
+) -> &'static str {
+    match outcome {
+        Ok(Ok(_)) => "ok",
+        Ok(Err(s)) => code_label(s.code()),
+        Err(_) => "timeout",
+    }
+}
+
+fn command_label(cmd: &pb::NodeCommand) -> &'static str {
+    match cmd.command {
+        Some(Command::ExecuteTask(_)) => "execute_task",
+        Some(Command::CancelTask(_)) => "cancel_task",
+        Some(Command::Drain(_)) => "drain",
+        Some(Command::WarmPool(_)) => "warm_pool",
+        None => "empty",
+    }
+}
+
+/// The node id from `MARATHON_NODE_ID` when it is a valid 32-hex id,
+/// otherwise a random one.
+pub fn resolve_node_id(config: &NodeOperatorConfig) -> NodeId {
+    match config.node_id.as_deref().map(NodeId::parse) {
+        Some(Ok(id)) => id,
+        Some(Err(e)) => {
+            let id = NodeId::random();
+            tracing::warn!(node_id = %id, error = %e, "MARATHON_NODE_ID is not a 32-hex node id, using a random id");
+            id
+        }
+        None => NodeId::random(),
+    }
+}
+
 /// The heartbeat loop.
 pub struct HeartbeatClient {
     target: OrchestratorTarget,
@@ -146,15 +224,8 @@ impl HeartbeatClient {
         executor: Arc<TaskExecutor>,
         settings: HeartbeatSettings,
     ) -> Self {
-        let node_id = match config.node_id.as_deref().map(NodeId::parse) {
-            Some(Ok(id)) => id,
-            Some(Err(e)) => {
-                let id = NodeId::random();
-                tracing::warn!(node_id = %id, error = %e, "MARATHON_NODE_ID is not a 32-hex node id, using a random id");
-                id
-            }
-            None => NodeId::random(),
-        };
+        let node_id = resolve_node_id(config);
+        executor.set_node_id(node_id);
         Self {
             target: OrchestratorTarget {
                 address: config.orchestrator_address.clone(),
@@ -233,9 +304,11 @@ impl HeartbeatClient {
         }
     }
 
-    /// The interval to use now: capped while VMs are running.
+    /// The interval to use now: capped while tasks or VMs are running. A
+    /// task counts from the moment its execute command is accepted, before
+    /// its VM has booted.
     pub fn current_interval(&self) -> Duration {
-        if self.executor.pool().active_count() > 0 {
+        if self.executor.pool().active_count() > 0 || self.executor.active_task_count() > 0 {
             self.settings
                 .interval
                 .min(self.settings.active_interval_cap)
@@ -272,15 +345,23 @@ impl HeartbeatClient {
     pub async fn run(&self) {
         self.running.store(true, Ordering::Release);
         let m = metrics::global();
-        let mut backoff = self.settings.backoff_initial;
+        let mut backoff = Backoff::new(self.settings.backoff_initial, self.settings.backoff_max);
         tracing::info!(operation = "heartbeat", node_id = %self.node_id, orchestrator = %self.target.uri(), "heartbeat loop starting");
         while self.is_running() && !self.shutdown.is_cancelled() {
             let (end, answered) = match self.connect().await {
-                Ok(channel) => self.session(channel).await,
-                Err(e) => (SessionEnd::Connect(e), false),
+                Ok(channel) => {
+                    m.orchestrator_connected.set(1);
+                    let r = self.session(channel).await;
+                    m.orchestrator_connected.set(0);
+                    r
+                }
+                Err(e) => {
+                    m.rpc_calls.inc("connect", "error");
+                    (SessionEnd::Connect(e), false)
+                }
             };
             if answered {
-                backoff = self.settings.backoff_initial;
+                backoff.reset();
             }
             match &end {
                 SessionEnd::Shutdown => break,
@@ -305,11 +386,12 @@ impl HeartbeatClient {
                 }
             }
             m.reconnects.inc();
+            let delay = backoff.next_delay();
+            tracing::debug!(operation = "heartbeat", node_id = %self.node_id, delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX), "reconnect backoff");
             tokio::select! {
                 () = self.shutdown.cancelled() => break,
-                () = tokio::time::sleep(backoff) => {}
+                () = tokio::time::sleep(delay) => {}
             }
-            backoff = (backoff * 2).min(self.settings.backoff_max);
         }
         self.running.store(false, Ordering::Release);
         tracing::info!(operation = "heartbeat", node_id = %self.node_id, "heartbeat loop stopped");
@@ -334,17 +416,53 @@ impl HeartbeatClient {
             r = tokio::time::timeout(self.settings.connect_timeout, client.heartbeat(request)) => r,
         };
         let mut inbound = match response {
-            Ok(Ok(r)) => r.into_inner(),
-            Ok(Err(status)) => return (SessionEnd::Status(status), false),
-            Err(_) => return (SessionEnd::Timeout, false),
+            Ok(Ok(r)) => {
+                m.rpc_calls.inc("heartbeat_open", "ok");
+                r.into_inner()
+            }
+            Ok(Err(status)) => {
+                m.rpc_calls.inc("heartbeat_open", code_label(status.code()));
+                return (SessionEnd::Status(status), false);
+            }
+            Err(_) => {
+                m.rpc_calls.inc("heartbeat_open", "timeout");
+                return (SessionEnd::Timeout, false);
+            }
         };
         m.heartbeat_connect_ms.observe(opened.elapsed());
         m.heartbeats_sent.inc();
         tracing::info!(operation = "heartbeat", node_id = %self.node_id, trace_id = %trace.trace_id(), "heartbeat stream open");
 
+        // Reports run beside the heartbeat loop so a slow report RPC never
+        // delays a heartbeat or a command. They stop between flushes only,
+        // so a drained result is always either reported or re-queued.
+        let stop_reports = CancellationToken::new();
+        let beats = async {
+            let end = self.heartbeat_loop(&mut inbound, &tx, &trace).await;
+            stop_reports.cancel();
+            end
+        };
+        let reports = self.report_loop(client, &trace, &stop_reports);
+        let (end, ()) = tokio::join!(beats, reports);
+        end
+    }
+
+    /// Send heartbeats and apply commands until the stream ends. The next
+    /// deadline is recomputed on every wake, so starting a task shortens a
+    /// pending idle wait at once.
+    async fn heartbeat_loop(
+        &self,
+        inbound: &mut tonic::Streaming<pb::HeartbeatResponse>,
+        tx: &mpsc::Sender<pb::NodeHeartbeat>,
+        trace: &TraceContext,
+    ) -> (SessionEnd, bool) {
+        let m = metrics::global();
         let mut answered = false;
-        let mut next = tokio::time::Instant::now() + self.current_interval();
+        let mut last_sent = tokio::time::Instant::now();
         loop {
+            let deadline = last_sent + self.current_interval();
+            let wake =
+                deadline.min(tokio::time::Instant::now() + self.settings.active_interval_cap);
             tokio::select! {
                 () = self.shutdown.cancelled() => return (SessionEnd::Shutdown, answered),
                 msg = inbound.message() => match msg {
@@ -355,14 +473,17 @@ impl HeartbeatClient {
                             tracing::warn!(operation = "heartbeat", node_id = %self.node_id, "heartbeat not acknowledged");
                         }
                         for cmd in resp.commands {
-                            self.process_command(cmd);
+                            self.process_command(cmd, trace);
                         }
                     }
                     Ok(None) => return (SessionEnd::StreamEnded, answered),
                     Err(status) => return (SessionEnd::Status(status), answered),
                 },
-                () = tokio::time::sleep_until(next) => {
-                    self.flush_reports(&mut client, &trace).await;
+                () = tokio::time::sleep_until(wake) => {
+                    let now = tokio::time::Instant::now();
+                    if now < last_sent + self.current_interval() {
+                        continue;
+                    }
                     match tx.try_send(self.build_heartbeat()) {
                         Ok(()) => m.heartbeats_sent.inc(),
                         Err(mpsc::error::TrySendError::Full(_)) => {
@@ -370,16 +491,45 @@ impl HeartbeatClient {
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => return (SessionEnd::StreamEnded, answered),
                     }
+                    last_sent = now;
                     m.log();
-                    next = tokio::time::Instant::now() + self.current_interval();
                 }
             }
         }
     }
 
+    /// Flush reports on the heartbeat cadence until `stop`.
+    async fn report_loop(
+        &self,
+        mut client: NodeServiceClient<Channel>,
+        trace: &TraceContext,
+        stop: &CancellationToken,
+    ) {
+        let mut last = tokio::time::Instant::now();
+        loop {
+            let deadline = last + self.current_interval();
+            let wake =
+                deadline.min(tokio::time::Instant::now() + self.settings.active_interval_cap);
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep_until(wake) => {}
+            }
+            let now = tokio::time::Instant::now();
+            if now < last + self.current_interval() {
+                continue;
+            }
+            last = now;
+            self.flush_reports(&mut client, trace).await;
+        }
+    }
+
     /// Send finished results and buffered output. Results whose report
     /// fails are queued again; output is dropped.
-    async fn flush_reports(&self, client: &mut NodeServiceClient<Channel>, trace: &TraceContext) {
+    pub async fn flush_reports(
+        &self,
+        client: &mut NodeServiceClient<Channel>,
+        trace: &TraceContext,
+    ) {
         let m = metrics::global();
         let results = self.executor.drain_results();
         if !results.is_empty() {
@@ -395,6 +545,8 @@ impl HeartbeatClient {
                 tokio::time::timeout(self.settings.rpc_timeout, client.report_task_result(req))
                     .await;
             m.report_rpc_ms.observe(started.elapsed());
+            m.rpc_calls
+                .inc("report_task_result", outcome_label(&outcome));
             match outcome {
                 Ok(Ok(_)) => {
                     m.result_reports.inc();
@@ -427,6 +579,8 @@ impl HeartbeatClient {
                 tokio::time::timeout(self.settings.rpc_timeout, client.report_task_output(req))
                     .await;
             m.report_rpc_ms.observe(started.elapsed());
+            m.rpc_calls
+                .inc("report_task_output", outcome_label(&outcome));
             match outcome {
                 Ok(Ok(_)) => {
                     m.output_reports.inc();
@@ -444,13 +598,16 @@ impl HeartbeatClient {
         }
     }
 
-    /// Apply one command from the orchestrator.
-    pub fn process_command(&self, cmd: pb::NodeCommand) {
-        metrics::global().commands_received.inc();
+    /// Apply one command from the orchestrator. `trace` is the stream's
+    /// trace; a task started here runs in a child span of it.
+    pub fn process_command(&self, cmd: pb::NodeCommand, trace: &TraceContext) {
+        let m = metrics::global();
+        m.commands_received.inc();
+        m.commands.inc(command_label(&cmd), "received");
         match cmd.command {
             Some(Command::ExecuteTask(task)) => {
                 // Rejections are logged and reported by the executor.
-                let _ = self.executor.execute_task(task);
+                let _ = self.executor.execute_task_traced(task, trace.child());
             }
             Some(Command::CancelTask(c)) => {
                 self.executor.cancel_task(&c.task_id);
@@ -617,9 +774,12 @@ mod tests {
     #[tokio::test]
     async fn drain_command_sets_draining() {
         let c = client(&NodeOperatorConfig::default());
-        c.process_command(pb::NodeCommand {
-            command: Some(Command::Drain(pb::Drain {})),
-        });
+        c.process_command(
+            pb::NodeCommand {
+                command: Some(Command::Drain(pb::Drain {})),
+            },
+            &TraceContext::new_root(),
+        );
         assert!(c.build_heartbeat().status.unwrap().draining);
     }
 
@@ -639,5 +799,41 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!c.is_running());
+    }
+
+    #[test]
+    fn backoff_doubles_to_max_and_resets() {
+        let mut b = Backoff::new(Duration::from_secs(1), Duration::from_secs(30));
+        let delays: Vec<u64> = (0..7).map(|_| b.next_delay().as_secs()).collect();
+        assert_eq!(delays, [1, 2, 4, 8, 16, 30, 30]);
+        b.reset();
+        assert_eq!(b.next_delay(), Duration::from_secs(1));
+    }
+
+    // C-R1-03: an accepted task shortens the interval before its VM exists.
+    #[tokio::test]
+    async fn accepted_task_shortens_the_interval() {
+        let config = NodeOperatorConfig::default();
+        // Launches fail slowly enough that the task is still running.
+        let executor = TaskExecutor::new(Arc::new(pool(false, 10, 0)), ExecutorSettings::default());
+        let c = HeartbeatClient::new(
+            &config,
+            executor.clone(),
+            HeartbeatSettings::from_config(&config),
+        );
+        assert_eq!(c.current_interval(), Duration::from_millis(5000));
+        executor
+            .execute_task(pb::ExecuteTask {
+                task_id: common::TaskId::random().to_hex(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(c.current_interval(), Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn executor_learns_the_node_id() {
+        let c = client(&NodeOperatorConfig::default());
+        assert_eq!(c.executor.node_label(), c.node_id().to_hex());
     }
 }

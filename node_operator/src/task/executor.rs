@@ -7,18 +7,18 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use common::pb;
-use common::{TaskId, UsageMetrics};
+use common::{NodeId, TaskId, UsageMetrics};
 use tokio_util::sync::CancellationToken;
 
 use crate::metrics;
 use crate::task::output_buffer::OutputBuffer;
 use crate::trace::TraceContext;
 use crate::vm::VmPool;
-use crate::vsock::handler::{RunnerSettings, TaskRunner};
+use crate::vsock::handler::{CANCELLED_BEFORE_START, RunnerSettings, TaskRunner};
 
 /// Error text for a task rejected because the node is draining.
 pub const DRAINING: &str = "node is draining";
@@ -60,6 +60,7 @@ pub struct TaskExecutor {
     output: Arc<OutputBuffer>,
     running: Mutex<HashMap<TaskId, CancellationToken>>,
     draining: AtomicBool,
+    node_id: OnceLock<NodeId>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -103,7 +104,26 @@ impl TaskExecutor {
             output: Arc::new(OutputBuffer::new()),
             running: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
+            node_id: OnceLock::new(),
         })
+    }
+
+    /// Record this node's id for logs and spans. Only the first call counts.
+    pub fn set_node_id(&self, node_id: NodeId) {
+        let _ = self.node_id.set(node_id);
+    }
+
+    /// This node's id in logs, `unknown` before it is set.
+    pub(crate) fn node_label(&self) -> String {
+        self.node_id
+            .get()
+            .map_or_else(|| "unknown".to_string(), NodeId::to_hex)
+    }
+
+    fn update_queue_gauge(queued: usize) {
+        metrics::global()
+            .result_queue_depth
+            .set(i64::try_from(queued).unwrap_or(i64::MAX));
     }
 
     pub fn pool(&self) -> &Arc<VmPool> {
@@ -116,7 +136,9 @@ impl TaskExecutor {
 
     /// Take the finished results, oldest first.
     pub fn drain_results(&self) -> Vec<pb::TaskResult> {
-        std::mem::take(&mut *lock(&self.results))
+        let taken = std::mem::take(&mut *lock(&self.results));
+        Self::update_queue_gauge(0);
+        taken
     }
 
     /// Put back results whose report failed, ahead of newer ones.
@@ -124,6 +146,7 @@ impl TaskExecutor {
         let mut queued = lock(&self.results);
         results.append(&mut queued);
         *queued = results;
+        Self::update_queue_gauge(queued.len());
     }
 
     /// Take the buffered output.
@@ -151,22 +174,38 @@ impl TaskExecutor {
     }
 
     fn push_result(&self, result: pb::TaskResult) {
-        lock(&self.results).push(result);
+        let mut queued = lock(&self.results);
+        queued.push(result);
+        Self::update_queue_gauge(queued.len());
     }
 
     /// Start a task in the background. A rejected task also leaves a
     /// failed result so the orchestrator does not wait for it forever.
     pub fn execute_task(self: &Arc<Self>, req: pb::ExecuteTask) -> Result<(), ExecuteError> {
+        self.execute_task_traced(req, TraceContext::new_root())
+    }
+
+    /// [`execute_task`](Self::execute_task) inside an existing trace (the
+    /// heartbeat stream's), so the task's logs join the command that
+    /// started it.
+    pub fn execute_task_traced(
+        self: &Arc<Self>,
+        req: pb::ExecuteTask,
+        trace: TraceContext,
+    ) -> Result<(), ExecuteError> {
         let m = metrics::global();
+        let node_id = self.node_label();
         let Ok(task_id) = TaskId::parse(&req.task_id) else {
-            tracing::error!(operation = "execute_task", task_id = %req.task_id, "invalid task id");
+            tracing::error!(operation = "execute_task", node_id = %node_id, task_id = %req.task_id, "invalid task id");
             m.tasks_rejected.inc();
+            m.tasks.inc("execute_task", "invalid_task_id");
             self.push_result(failed_result(req.task_id.clone(), INVALID_TASK_ID));
             return Err(ExecuteError::InvalidTaskId(req.task_id));
         };
         if self.is_draining() {
-            tracing::warn!(operation = "execute_task", task_id = %task_id, "rejecting task: node is draining");
+            tracing::warn!(operation = "execute_task", node_id = %node_id, task_id = %task_id, "rejecting task: node is draining");
             m.tasks_rejected.inc();
+            m.tasks.inc("execute_task", "draining");
             self.push_result(failed_result(task_id.to_hex(), DRAINING));
             return Err(ExecuteError::Draining);
         }
@@ -174,15 +213,17 @@ impl TaskExecutor {
         {
             let mut running = lock(&self.running);
             if running.contains_key(&task_id) {
-                tracing::warn!(operation = "execute_task", task_id = %task_id, "duplicate execute ignored: task already running");
+                tracing::warn!(operation = "execute_task", node_id = %node_id, task_id = %task_id, "duplicate execute ignored: task already running");
+                m.tasks.inc("execute_task", "duplicate");
                 return Err(ExecuteError::AlreadyRunning(task_id));
             }
             running.insert(task_id, token.clone());
         }
-        tracing::info!(operation = "execute_task", task_id = %task_id, "received task");
+        tracing::info!(operation = "execute_task", node_id = %node_id, task_id = %task_id, trace_id = %trace.trace_id(), "received task");
         m.tasks_started.inc();
+        m.tasks.inc("execute_task", "accepted");
         let this = self.clone();
-        tokio::spawn(async move { this.run_task(task_id, req, token).await });
+        tokio::spawn(async move { this.run_task(task_id, req, token, trace).await });
         Ok(())
     }
 
@@ -198,12 +239,12 @@ impl TaskExecutor {
         };
         match lock(&self.running).get(&id) {
             Some(token) => {
-                tracing::info!(operation = "cancel_task", task_id = %id, "cancelling task");
+                tracing::info!(operation = "cancel_task", node_id = %self.node_label(), task_id = %id, "cancelling task");
                 token.cancel();
                 true
             }
             None => {
-                tracing::warn!(operation = "cancel_task", task_id = %id, "cancel for unknown task ignored");
+                tracing::warn!(operation = "cancel_task", node_id = %self.node_label(), task_id = %id, "cancel for unknown task ignored");
                 false
             }
         }
@@ -214,18 +255,32 @@ impl TaskExecutor {
         task_id: TaskId,
         req: pb::ExecuteTask,
         token: CancellationToken,
+        trace: TraceContext,
     ) {
-        let op = common::telemetry::Operation::start("run_task").task_id(&task_id);
+        let op = common::telemetry::Operation::start("run_task")
+            .task_id(&task_id)
+            .node_id(&self.node_label());
         let started = Instant::now();
-        let trace = TraceContext::new_root();
-        tracing::info!(parent: op.span(), trace_id = %trace.trace_id(), "task starting");
+        tracing::info!(parent: op.span(), trace_id = %trace.trace_id(), span_id = %trace.span_id(), "task starting");
 
-        let (report, used_vm) = match self.pool.acquire_or_create().await {
-            Err(e) => {
+        // A cancel while the VM boots drops the boot (the VM is torn down).
+        let acquired = tokio::select! {
+            r = self.pool.acquire_or_create() => Some(r),
+            () = token.cancelled() => None,
+        };
+        let (report, used_vm) = match acquired {
+            None => {
+                tracing::info!(parent: op.span(), "task cancelled while acquiring a VM");
+                (
+                    failed_result(task_id.to_hex(), CANCELLED_BEFORE_START),
+                    None,
+                )
+            }
+            Some(Err(e)) => {
                 tracing::error!(parent: op.span(), error = %e, "failed to acquire VM");
                 (failed_result(task_id.to_hex(), e.to_string()), None)
             }
-            Ok(lease) => {
+            Some(Ok(lease)) => {
                 tracing::info!(parent: op.span(), vm_id = %lease.vm_id, "task assigned to VM");
                 self.pool.assign_task(lease.vm_id, task_id);
                 let mut runner =
@@ -254,10 +309,13 @@ impl TaskExecutor {
         m.task_duration_ms.observe(started.elapsed());
         if report.success {
             m.tasks_succeeded.inc();
+            m.tasks.inc("run_task", "succeeded");
         } else if token.is_cancelled() {
             m.tasks_cancelled.inc();
+            m.tasks.inc("run_task", "cancelled");
         } else {
             m.tasks_failed.inc();
+            m.tasks.inc("run_task", "failed");
         }
         tracing::info!(
             parent: op.span(),
