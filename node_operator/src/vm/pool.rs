@@ -135,12 +135,26 @@ impl PoolState {
 /// A slot reserved for a VM that is booting; released when dropped. `P`
 /// is how the slot refers to its pool: borrowed inside the pool, owned
 /// (`Arc`) when a task carries it from accept time to boot.
+///
+/// Only built after `try_start` admitted it, so every live, armed slot
+/// owns exactly one unit of `starting`. When its VM is kept, the count is
+/// handed over in the same critical section and the slot is disarmed.
 struct StartingSlot<P: Deref<Target = VmPool>> {
     pool: P,
+    armed: bool,
+}
+
+impl<P: Deref<Target = VmPool>> StartingSlot<P> {
+    fn admitted(pool: P) -> Self {
+        Self { pool, armed: true }
+    }
 }
 
 impl<P: Deref<Target = VmPool>> Drop for StartingSlot<P> {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         {
             let mut s = self.pool.lock();
             s.starting = s.starting.saturating_sub(1);
@@ -192,22 +206,36 @@ impl VmPool {
         &self.copy_jobs
     }
 
-    /// Keep a booted VM unless the pool is shutting down. A refused VM is
-    /// handed back for the caller to stop.
+    /// Keep a VM booted in `slot` unless the pool is shutting down. The
+    /// VM and the slot's `starting` count swap in one critical section, so
+    /// the VM is never counted twice (or not at all). A refused VM is
+    /// handed back for the caller to stop; its slot is released normally.
     #[must_use]
-    fn keep(&self, vm: Vm, into: Into) -> Option<Vm> {
-        let mut s = self.lock();
-        if s.closing {
-            return Some(vm);
-        }
-        match into {
-            Into::Warm => s.warm.push(vm),
-            Into::Active => {
-                s.active.insert(vm.id, vm);
+    fn keep_from_slot<P: Deref<Target = VmPool>>(
+        &self,
+        vm: Vm,
+        into: Into,
+        mut slot: StartingSlot<P>,
+    ) -> Option<Vm> {
+        {
+            let mut s = self.lock();
+            if !s.closing {
+                match into {
+                    Into::Warm => s.warm.push(vm),
+                    Into::Active => {
+                        s.active.insert(vm.id, vm);
+                    }
+                }
+                s.starting = s.starting.saturating_sub(1);
+                slot.armed = false;
+                Self::update_gauges(&s);
+                drop(s);
+                self.boots_done.notify_waiters();
+                return None;
             }
         }
-        Self::update_gauges(&s);
-        None
+        drop(slot);
+        Some(vm)
     }
 
     pub fn is_closing(&self) -> bool {
@@ -244,7 +272,13 @@ impl VmPool {
     /// Reserve a slot for a VM about to boot, if one is free and `admit`
     /// accepts the current state.
     fn reserve(&self, admit: impl FnOnce(&PoolState) -> bool) -> Option<StartingSlot<&VmPool>> {
-        self.try_start(admit).then_some(StartingSlot { pool: self })
+        // Built only after admission: a refused reservation must not create
+        // (and then drop) a guard that would release someone else's slot.
+        if self.try_start(admit) {
+            Some(StartingSlot::admitted(self))
+        } else {
+            None
+        }
     }
 
     /// Slots currently booting (warm-pool boots and claimed task slots).
@@ -268,7 +302,7 @@ impl VmPool {
             return Ok(Claim::Warm(lease));
         }
         if self.try_start(|_| true) {
-            return Ok(Claim::Slot(BootSlot(StartingSlot { pool: self.clone() })));
+            return Ok(Claim::Slot(BootSlot(StartingSlot::admitted(self.clone()))));
         }
         metrics::global().vm_ops.inc("acquire", "no_slots");
         Err(PoolError::NoSlots(self.config.total_vm_slots))
@@ -298,15 +332,10 @@ impl VmPool {
         })?;
         metrics::global().vm_ops.inc("acquire", "on_demand");
         let lease = VmLease::of(&vm);
-        let kept = self.keep(vm, Into::Active);
-        // Drop the booting slot only after the VM is counted as active, so
-        // the slot count never dips below the real number of VMs.
-        if let Some(mut vm) = kept {
+        if let Some(mut vm) = self.keep_from_slot(vm, Into::Active, slot) {
             vm.stop().await;
-            drop(slot);
             return Err(PoolError::ShuttingDown);
         }
-        drop(slot);
         Ok(lease)
     }
 
@@ -347,13 +376,14 @@ impl VmPool {
             match self.boot(&slot).await {
                 Ok(vm) => {
                     failures = 0;
-                    if let Some(mut vm) = self.keep(vm, Into::Warm) {
+                    if let Some(mut vm) = self.keep_from_slot(vm, Into::Warm, slot) {
                         tracing::info!(parent: op.span(), vm_id = %vm.id, "pool shutting down, stopping freshly booted VM");
                         vm.stop().await;
                         break;
                     }
                 }
                 Err(e) => {
+                    drop(slot);
                     failures += 1;
                     tracing::error!(parent: op.span(), error = %e, failures, "failed to start warm VM");
                     if failures >= MAX_CONSECUTIVE_FAILURES {
@@ -362,7 +392,6 @@ impl VmPool {
                     }
                 }
             }
-            drop(slot);
         }
         tracing::info!(parent: op.span(), target, warm = self.warm_count(), "warm pool done");
         op.finish();
@@ -436,7 +465,7 @@ impl VmPool {
         match self.boot(&slot).await {
             Ok(vm) => {
                 metrics::global().vm_ops.inc("replenish", "ok");
-                if let Some(mut vm) = self.keep(vm, Into::Warm) {
+                if let Some(mut vm) = self.keep_from_slot(vm, Into::Warm, slot) {
                     vm.stop().await;
                 }
             }
@@ -850,12 +879,19 @@ mod tests {
     #[tokio::test]
     async fn closing_pool_refuses_a_completed_boot() {
         let p = pool(false, 4, 0);
+        let warm_slot = p.reserve(|_| true).unwrap();
+        let active_slot = p.reserve(|_| true).unwrap();
         p.lock().closing = true;
-        let refused = p.keep(ready_vm(), Into::Warm);
+        let refused = p.keep_from_slot(ready_vm(), Into::Warm, warm_slot);
         assert!(refused.is_some(), "a closing pool kept a VM");
-        let refused = p.keep(ready_vm(), Into::Active);
+        let refused = p.keep_from_slot(ready_vm(), Into::Active, active_slot);
         assert!(refused.is_some(), "a closing pool kept a VM");
         assert_eq!(p.total_count(), 0);
+        assert_eq!(
+            p.starting_count(),
+            0,
+            "refused VMs still release their slots"
+        );
     }
 
     // N04: shutdown does not return while a slot is still reserved.
@@ -938,6 +974,80 @@ mod tests {
         ));
         assert_eq!(p.occupied_count(), 0);
         assert!(p.claim().is_ok());
+    }
+
+    // C-R9-01: a refused warm reservation must not release a claimed slot.
+    #[tokio::test]
+    async fn refused_reservation_keeps_another_claim() {
+        let p = Arc::new(pool(false, 1, 0));
+        let held = p.claim().unwrap();
+        assert!(matches!(held, Claim::Slot(_)));
+        assert_eq!(p.starting_count(), 1);
+        p.warm_pool(1).await; // refused: no free slot
+        assert_eq!(
+            p.starting_count(),
+            1,
+            "a refused reservation released the claim"
+        );
+        assert!(matches!(p.claim(), Err(PoolError::NoSlots(1))));
+        drop(held);
+        assert_eq!(p.starting_count(), 0);
+    }
+
+    // C-R9-01, via release: refused replenishment keeps the other claim.
+    #[tokio::test]
+    async fn release_without_replenishment_keeps_another_claim() {
+        let p = Arc::new(pool(false, 2, 0));
+        p.insert_warm(ready_vm());
+        let Ok(Claim::Warm(lease)) = p.claim() else {
+            panic!("expected the warm VM");
+        };
+        let held = p.claim().unwrap();
+        assert!(matches!(held, Claim::Slot(_)));
+        p.release(lease.vm_id).await; // target 0: replenishment refused
+        assert_eq!(
+            p.starting_count(),
+            1,
+            "refused replenishment released the claim"
+        );
+        drop(held);
+        assert_eq!(p.starting_count(), 0);
+    }
+
+    // C-R9-02: the handoff from booting to kept is atomic.
+    #[test]
+    fn keep_from_slot_hands_the_count_over() {
+        let p = pool(false, 1, 0);
+        let slot = p.reserve(|_| true).unwrap();
+        assert_eq!(p.occupied_count(), 1);
+        assert!(p.keep_from_slot(ready_vm(), Into::Active, slot).is_none());
+        let s = p.lock();
+        assert_eq!((s.active.len(), s.starting), (1, 0));
+    }
+
+    // C-R9-02: an observer never sees more occupied slots than exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn occupied_never_exceeds_total_slots() {
+        let p = Arc::new(pool(false, 1, 0));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observer = {
+            let (p, stop) = (p.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut peak = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    peak = peak.max(p.occupied_count());
+                }
+                peak
+            })
+        };
+        for _ in 0..20_000 {
+            let claim = p.claim().unwrap();
+            let lease = p.start_claimed(claim).await.unwrap();
+            p.release(lease.vm_id).await;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let peak = observer.join().unwrap();
+        assert!(peak <= 1, "observed {peak} occupied slots with 1 slot");
     }
 
     #[test]

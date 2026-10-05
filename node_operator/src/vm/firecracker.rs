@@ -1281,15 +1281,19 @@ mod tests {
                 let pool = pool.clone();
                 tokio::spawn(async move { pool.acquire_or_create().await })
             };
-            tokio::time::timeout(Duration::from_secs(2), async {
-                while pool.copy_jobs().active() == 0 {
+            // The spawn attempt is counted right before `cp` fails to spawn;
+            // from there the job reaches the queued fallback without
+            // yielding, so it is pending (not still before it) by the time
+            // shutdown cancels. A fixed sleep here was flaky under load.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while pool.copy_jobs().cp_spawns() == 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
-            .expect("copy job never started");
-            // Let `cp` fail and the fallback queue behind the held thread.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            .expect("copy job never reached its cp spawn");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(pool.copy_jobs().active(), 1);
             let shutting = {
                 let pool = pool.clone();
                 tokio::spawn(async move { pool.shutdown().await })
