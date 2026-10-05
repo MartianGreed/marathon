@@ -5,7 +5,8 @@ entryPoints:
 certificatesResolvers:
   letsencrypt:
     acme:
-      email: "${MARATHON_ACME_EMAIL}"
+      # Standalone file example: replace this email before use.
+      email: operator@example.com
       storage: /letsencrypt/acme.json
       tlsChallenge: {}
 

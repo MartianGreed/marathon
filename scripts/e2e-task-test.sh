@@ -16,16 +16,16 @@ set -euo pipefail
 # Requires:
 #   GITHUB_TOKEN         — GitHub token with repo access
 #   ANTHROPIC_API_KEY    — For Claude Code (optional, orchestrator may provide)
-#   MARATHON_HOST        — Orchestrator address (default: localhost)
-#   MARATHON_PORT        — Orchestrator port (default: 8443)
+#   MARATHON_ORCHESTRATOR_ADDRESS        — Orchestrator address (default: localhost)
+#   MARATHON_ORCHESTRATOR_PORT        — Orchestrator port (default: 8080)
 #
 # Can also run against a remote server via --host <ip> (uses e2e SSH key).
 ###############################################################################
 
 # ── Config ───────────────────────────────────────────────────────────────────
-MARATHON_HOST="${MARATHON_HOST:-localhost}"
-MARATHON_PORT="${MARATHON_PORT:-8443}"
-MARATHON_BIN="${MARATHON_BIN:-./zig-out/bin/marathon}"
+MARATHON_ORCHESTRATOR_ADDRESS="${MARATHON_ORCHESTRATOR_ADDRESS:-localhost}"
+MARATHON_ORCHESTRATOR_PORT="${MARATHON_ORCHESTRATOR_PORT:-8080}"
+MARATHON_BIN="${MARATHON_BIN:-./target/debug/marathon}"
 
 TARGET_REPO="https://github.com/MartianGreed/ccmanager"
 TARGET_BRANCH="main"
@@ -37,7 +37,7 @@ POLL_INTERVAL=15
 # E2E SSH state (from e2e-test.sh)
 STATE_DIR="/tmp/marathon-e2e"
 SSH_KEY="$STATE_DIR/id_ed25519"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR"
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR)
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -50,6 +50,8 @@ die()   { err "$@"; exit 1; }
 # ── The actual task prompt ───────────────────────────────────────────────────
 # This is a real, actionable task that produces a measurable output (a PR).
 # It's scoped to be completable in a single iteration but meaningful.
+# The prompt intentionally includes literal shell expressions.
+# shellcheck disable=SC2016
 TASK_PROMPT='Add a "session export" feature to ccmanager.
 
 Requirements:
@@ -85,11 +87,22 @@ parse_args() {
 }
 
 marathon_cmd() {
+    local auth_cmd=""
+    if [[ "${1:-}" == submit ]]; then
+        local email
+        email="e2e-$(date +%s)-$$@example.com"
+        printf -v auth_cmd '%q ' env "MARATHON_ORCHESTRATOR_ADDRESS=$MARATHON_ORCHESTRATOR_ADDRESS" "MARATHON_ORCHESTRATOR_PORT=$MARATHON_ORCHESTRATOR_PORT" "$MARATHON_BIN" register --email "$email" --password marathon-e2e-throwaway
+    fi
     if [[ -n "$REMOTE_HOST" ]]; then
-        ssh $SSH_OPTS -i "$SSH_KEY" "root@$REMOTE_HOST" \
-            "cd /opt/marathon && $MARATHON_BIN $*"
+        local remote_cmd
+        printf -v remote_cmd '%q ' env "MARATHON_ORCHESTRATOR_ADDRESS=$MARATHON_ORCHESTRATOR_ADDRESS" "MARATHON_ORCHESTRATOR_PORT=$MARATHON_ORCHESTRATOR_PORT" "$MARATHON_BIN" "$@"
+        ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "root@$REMOTE_HOST" \
+            "cd /opt/marathon && ${auth_cmd:+$auth_cmd && }$remote_cmd"
     else
-        $MARATHON_BIN "$@"
+        if [[ -n "$auth_cmd" ]]; then
+            MARATHON_ORCHESTRATOR_ADDRESS="$MARATHON_ORCHESTRATOR_ADDRESS" MARATHON_ORCHESTRATOR_PORT="$MARATHON_ORCHESTRATOR_PORT" "$MARATHON_BIN" register --email "$email" --password marathon-e2e-throwaway || return
+        fi
+        MARATHON_ORCHESTRATOR_ADDRESS="$MARATHON_ORCHESTRATOR_ADDRESS" MARATHON_ORCHESTRATOR_PORT="$MARATHON_ORCHESTRATOR_PORT" "$MARATHON_BIN" "$@"
     fi
 }
 
@@ -97,7 +110,7 @@ check_prereqs() {
     if [[ -n "$REMOTE_HOST" ]]; then
         [[ -f "$SSH_KEY" ]] || die "SSH key not found at $SSH_KEY (run e2e-test.sh provision first)"
         info "Testing SSH to $REMOTE_HOST..."
-        ssh $SSH_OPTS -i "$SSH_KEY" "root@$REMOTE_HOST" "echo ok" &>/dev/null \
+        ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "root@$REMOTE_HOST" "echo ok" &>/dev/null \
             || die "Cannot SSH to $REMOTE_HOST"
         ok "SSH to $REMOTE_HOST works"
     else
@@ -323,7 +336,7 @@ main() {
         run)     do_run ;;
         submit)  check_prereqs; do_submit ;;
         status)  [[ $# -ge 1 ]] || die "Usage: $0 status <task_id>"; marathon_cmd status "$1" ;;
-        logs)    [[ $# -ge 1 ]] || die "Usage: $0 logs <task_id>"; marathon_cmd status "$1" --verbose ;;
+        logs)    [[ $# -ge 1 ]] || die "Usage: $0 logs <task_id>"; marathon_cmd status "$1" ;;
         *)
             echo "Marathon E2E Task Test — Real task against ccmanager"
             echo
@@ -340,8 +353,8 @@ main() {
             echo
             echo "Environment:"
             echo "  GITHUB_TOKEN         GitHub token with repo access"
-            echo "  MARATHON_HOST        Orchestrator address (default: localhost)"
-            echo "  MARATHON_PORT        Orchestrator port (default: 8443)"
+            echo "  MARATHON_ORCHESTRATOR_ADDRESS        Orchestrator address (default: localhost)"
+            echo "  MARATHON_ORCHESTRATOR_PORT        Orchestrator port (default: 8080)"
             echo "  MARATHON_BIN         Path to marathon binary"
             echo
             echo "Task: Adds a session export feature to ccmanager (Go project)"

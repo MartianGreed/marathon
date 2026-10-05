@@ -1,181 +1,37 @@
-# Node Operator Workflow Documentation
+# Node operator
 
-## Overview
+`marathon-node-operator` is a Rust process on an x86_64 Linux Firecracker host. It initializes snapshot storage, warms a bounded VM pool, and opens an outbound bidirectional gRPC heartbeat stream to the orchestrator. It does not bind a node RPC or metrics port. The orchestrator sends execute, cancel, drain, and warm-pool commands on that stream; the node reports status and task results.
 
-The node_operator is a compute node service that manages Firecracker VMs for executing Claude Code tasks. It maintains a warm pool of pre-started VMs for fast task assignment and communicates with VMs via vsock.
+## Lifecycle and capacity
 
-## Architecture
+`node_operator/src/main.rs` wires `SnapshotManager`, `FirecrackerLauncher`, `VmPool`, `TaskExecutor`, and `HeartbeatClient`. The pool reuses warm VMs or claims a free slot for an on-demand boot. Failed launches and cancelled tasks release capacity. Snapshot restoration uses Firecracker's Unix socket API; cold boot needs the configured kernel and rootfs.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Node Operator                             │
-├─────────────────────────────────────────────────────────────────┤
-│  main.zig                                                        │
-│    ├── SnapshotManager (snapshot/manager.zig)                   │
-│    ├── VmPool (vm/firecracker.zig)                              │
-│    │     ├── warm_vms: []Vm (pre-started, ready)                │
-│    │     └── active_vms: HashMap<VmId, Vm> (running tasks)      │
-│    ├── HeartbeatClient (heartbeat/heartbeat.zig)                │
-│    └── VsockHandler (vsock/handler.zig)                         │
-└─────────────────────────────────────────────────────────────────┘
-```
+`NodeStatus.active_vms` counts every occupied non-warm slot, including running VMs and slots still booting. Booting warm-pool reservations also count until they become warm. `warm_vms` counts ready unclaimed VMs. A task ID appears in `active_task_ids` only once its slot is claimed. This prevents the scheduler from treating an accepted task's booting slot as spare capacity.
 
-## Component Details
+Heartbeat intervals shorten while tasks are active. Reconnection uses bounded exponential backoff. Drain stops new work. Configure a persistent 32-character hexadecimal `MARATHON_NODE_ID`; otherwise startup chooses a random ID. `HOSTNAME` supplies the human-readable host label.
 
-### 1. Entry Point (`main.zig`)
+## Guest transport
 
-```zig
-main() -> void
-  1. Initialize GeneralPurposeAllocator
-  2. Load config from environment (NodeOperatorConfig)
-  3. Create SnapshotManager
-  4. Create VmPool with snapshot_mgr reference
-  5. Enter main loop (currently a placeholder)
-```
+The node connects to Firecracker's vsock Unix socket and performs its connection handshake. Node and guest then exchange length-prefixed protobuf frames from `common/src/vsock.rs`, with a four-byte length and a bounded message size. This transport carries task configuration, output, results, and trace context. It is separate from the HTTP/2 gRPC client and heartbeat APIs.
 
-### 2. VM Lifecycle (`vm/firecracker.zig`)
+The Alpine guest rootfs needs the static x86_64 musl `marathon-vm-agent`. On x86_64 Linux with musl tools and protoc installed, run `make vm-agent-musl`, then `make rootfs`. `MARATHON_VM_AGENT_BIN` overrides the binary copied by `snapshot/create_rootfs.sh`. Creating rootfs images, snapshots, and real VMs requires host privileges and KVM.
 
-**State Machine:**
-```
-creating → ready → running → stopped
-              ↓        ↓
-           failed   failed
-```
+## Configuration
 
-**Vm struct:**
-- `id: VmId` - 32-byte unique identifier
-- `state: VmState` - current lifecycle state
-- `process: ?std.process.Child` - Firecracker process handle
-- `socket_path: []const u8` - Unix socket for Firecracker API
-- `vsock_cid: u32` - Context ID for vsock (3 to 0xFFFFFFFF)
-- `task_id: ?TaskId` - assigned task (if running)
-- `start_time: ?i64` - timestamp for uptime tracking
-
-**Key operations:**
-- `init()` - allocate VM, generate random ID and CID
-- `start(config)` - cold start from kernel/rootfs
-- `startFromSnapshot(mgr, config)` - restore from snapshot
-- `stop()` - kill process, wait, transition to stopped
-- `assignTask(task_id)` - mark as running
-- `releaseTask()` - return to ready state
-
-### 3. VM Pool (`vm/firecracker.zig`)
-
-**VmPool struct:**
-- `warm_vms: ArrayListUnmanaged(*Vm)` - ready VMs awaiting tasks
-- `active_vms: AutoHashMap(VmId, *Vm)` - VMs running tasks
-- `mutex: Thread.Mutex` - protects both collections
-
-**Operations:**
-- `warmPool(target)` - pre-start VMs to maintain warm pool size
-- `acquire()` - pop from warm_vms, add to active_vms
-- `release(vm_id)` - remove from active_vms, destroy VM
-- `warmCount()` / `activeCount()` / `totalCount()` - pool statistics
-
-### 4. Snapshot Management (`snapshot/manager.zig`)
-
-**SnapshotManager struct:**
-- `base_path: []const u8` - directory containing snapshots
-- `snapshots: StringHashMap(SnapshotInfo)` - discovered snapshots
-- `mutex: Thread.Mutex` - protects snapshot map
-
-**Snapshot validation:**
-- Requires both `snapshot` and `mem` files in directory
-- Scans `base_path` on init for valid snapshots
-- Creates directory if not found
-
-**Operations:**
-- `getSnapshot(name)` - lookup by name
-- `getDefaultSnapshot()` - returns "base" snapshot
-- `listSnapshots()` - return all registered snapshots
-
-### 5. Vsock Communication (`vsock/handler.zig`)
-
-**Message Protocol (binary, big-endian):**
-```
-┌──────────┬──────────┬─────────────┐
-│ Type (1) │ Len (4)  │ Payload (N) │
-└──────────┴──────────┴─────────────┘
-```
-
-**Message Types:**
-| Type | Name | Payload |
-|------|------|---------|
-| 0x01 | Output | stdout/stderr data |
-| 0x02 | Metrics | input_tokens(u32) + output_tokens(u32) + cost_usd(f64) |
-| 0x03 | Complete | exit_code(i32) + optional pr_url |
-| 0x04 | Error | error message string |
-
-**VsockHandler:**
-- Connects to VM via vsock (CID + port)
-- Reads messages in loop
-- Decodes and dispatches by type
-- Aggregates metrics for metering
-
-### 6. Heartbeat (`heartbeat/heartbeat.zig`)
-
-**HeartbeatClient:**
-- Reports node status to orchestrator periodically
-- Collects: hostname, available VMs, active tasks, memory/CPU stats
-- Runs in background thread
-- Stop flag for graceful shutdown
-
-## Task Execution Flow
-
-```
-1. Orchestrator assigns task to node
-         ↓
-2. Node calls vmPool.acquire()
-         ↓
-3. VM popped from warm_vms → active_vms
-         ↓
-4. vm.assignTask(task_id)
-         ↓
-5. VsockHandler connects to VM
-         ↓
-6. VM Agent executes Claude Code
-         ↓
-7. Messages flow back via vsock:
-   - Output (streaming stdout/stderr)
-   - Metrics (token counts, costs)
-   - Complete or Error (final status)
-         ↓
-8. vmPool.release(vm_id)
-         ↓
-9. VM destroyed, new VM warmed up
-```
-
-## Thread Safety
-
-All shared state protected by mutexes:
-- `VmPool.mutex` - warm_vms and active_vms access
-- `SnapshotManager.mutex` - snapshot map access
-
-Pattern used: `self.mutex.lock(); defer self.mutex.unlock();`
-
-## Error Handling
-
-- Snapshot restore failure → falls back to cold start
-- VM start failure → logged, skipped (pool may be undersized)
-- Vsock connection failure → task marked failed
-- Process kill failure → ignored in cleanup (catch {})
-
-## Configuration (`common/config.zig`)
-
-```zig
-NodeOperatorConfig:
-  - listen_address/port
-  - orchestrator_address/port
-  - firecracker_bin, kernel_path, rootfs_path, snapshot_path
-  - total_vm_slots, warm_pool_target
-```
+| Variable | Meaning |
+| --- | --- |
+| `MARATHON_ORCHESTRATOR_ADDRESS` | Orchestrator hostname, default `127.0.0.1` |
+| `MARATHON_ORCHESTRATOR_PORT` | gRPC port, default `8080` |
+| `MARATHON_TLS_ENABLED` | `true` or `1` enables TLS; defaults on for port 443 |
+| `MARATHON_TLS_CA_PATH` | Optional PEM CA for the server |
+| `MARATHON_NODE_AUTH_KEY` | Shared heartbeat authentication key |
+| `MARATHON_TOTAL_VM_SLOTS` | Pool capacity, default 10 |
+| `MARATHON_WARM_POOL_TARGET` | Ready VM target, default 5; zero disables startup boots |
+| `MARATHON_SNAPSHOT_PATH` | Snapshot directory |
+| `MARATHON_KERNEL_PATH` | Kernel file |
+| `MARATHON_ROOTFS_PATH` | Guest ext4 rootfs |
+| `MARATHON_FIRECRACKER_BIN` | Firecracker executable, default `/usr/bin/firecracker` |
 
 ## Verification
 
-```bash
-# Run all node_operator tests
-zig build test
-
-# Run with coverage
-make coverage-node-operator
-```
+`cargo test -p marathon-node-operator` exercises pool capacity, cancellation, heartbeat state, snapshot handling, and transport behavior. A macOS smoke can verify registration and client APIs with `MARATHON_WARM_POOL_TARGET=0`; submitted tasks cannot complete without a working Firecracker host. A real Firecracker end-to-end run on a KVM host is owed until its commands and results are recorded. Provisioning scripts can allocate billed bare metal; inspect them before execution.

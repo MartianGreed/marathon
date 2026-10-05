@@ -13,6 +13,9 @@ services:
       MARATHON_POSTGRES_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@marathon-postgres:5432/${POSTGRES_DB}
       MARATHON_REDIS_URL: redis://marathon-redis:6379
       MARATHON_NODE_AUTH_KEY: ${MARATHON_NODE_AUTH_KEY:-}
+      MARATHON_LISTEN_ADDRESS: "0.0.0.0"
+      MARATHON_LISTEN_PORT: "8080"
+      MARATHON_JWT_SECRET: ${MARATHON_JWT_SECRET:?Set MARATHON_JWT_SECRET}
     networks:
       - marathon-internal
     depends_on:

@@ -48,6 +48,7 @@ check_os() {
         log_error "Cannot detect OS"
         exit 1
     fi
+    # shellcheck source=/dev/null
     source /etc/os-release
     if [[ "$ID" != "ubuntu" ]]; then
         log_warn "This script is designed for Ubuntu. Detected: $ID"
@@ -98,7 +99,7 @@ install_firecracker() {
 
     RELEASE_URL="https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
     TEMP_DIR=$(mktemp -d)
-    trap "rm -rf $TEMP_DIR" EXIT
+    trap 'rm -rf "$TEMP_DIR"' EXIT
 
     wget -q -O "$TEMP_DIR/firecracker.tgz" "$RELEASE_URL"
     tar -xzf "$TEMP_DIR/firecracker.tgz" -C "$TEMP_DIR"
@@ -365,9 +366,9 @@ install_binary() {
         systemctl stop marathon-node-operator
     fi
 
-    if [[ -f "./zig-out/bin/marathon-node-operator" ]]; then
+    if [[ -f "./target/release/marathon-node-operator" ]]; then
         log_info "Installing marathon-node-operator from local build..."
-        cp "./zig-out/bin/marathon-node-operator" /usr/local/bin/
+        cp "./target/release/marathon-node-operator" /usr/local/bin/
         chmod +x /usr/local/bin/marathon-node-operator
     elif [[ -f "/tmp/marathon-node-operator" ]]; then
         log_info "Installing marathon-node-operator from /tmp..."

@@ -12,6 +12,7 @@ data:
   MARATHON_LISTEN_ADDRESS: "0.0.0.0"
   MARATHON_LISTEN_PORT: "8080"
   MARATHON_REDIS_URL: "redis://redis:6379"
+  MARATHON_METRICS_PORT: "9090"
 ---
 apiVersion: v1
 kind: Secret
@@ -22,6 +23,8 @@ type: Opaque
 stringData:
   MARATHON_ANTHROPIC_API_KEY: ""
   MARATHON_POSTGRES_URL: ""
+  MARATHON_JWT_SECRET: "replace-with-random-secret"
+  MARATHON_NODE_AUTH_KEY: "replace-with-shared-node-key"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -98,5 +101,5 @@ spec:
     app: orchestrator
   ports:
   - name: grpc
-    port: 443
+    port: 8080
     targetPort: 8080

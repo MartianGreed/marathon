@@ -31,11 +31,10 @@ REPO_BRANCH="${MARATHON_E2E_BRANCH:-main}"
 STATE_DIR="/tmp/marathon-e2e"
 STATE_FILE="$STATE_DIR/state.json"
 SSH_KEY="$STATE_DIR/id_ed25519"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR"
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR)
 
 PROVISION_TIMEOUT=900   # 15 min
 CLOUDINIT_TIMEOUT=1200  # 20 min
-FULL_TIMEOUT=1800       # 30 min
 
 # ── Colors ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
@@ -237,7 +236,7 @@ do_provision() {
     info "Waiting for SSH..."
     deadline=$(($(date +%s) + 300))
     while [[ $(date +%s) -lt $deadline ]]; do
-        if ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "echo ok" &>/dev/null; then
+        if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@$ip" "echo ok" &>/dev/null; then
             ok "SSH accessible"
             break
         fi
@@ -248,13 +247,13 @@ do_provision() {
     info "Waiting for cloud-init to complete (timeout: ${CLOUDINIT_TIMEOUT}s)..."
     deadline=$(($(date +%s) + CLOUDINIT_TIMEOUT))
     while [[ $(date +%s) -lt $deadline ]]; do
-        if ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "test -f /tmp/marathon-setup-complete" &>/dev/null; then
+        if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@$ip" "test -f /tmp/marathon-setup-complete" &>/dev/null; then
             ok "Cloud-init complete!"
             break
         fi
         # Show progress
         local log_tail
-        log_tail=$(ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "tail -1 /var/log/marathon-setup.log 2>/dev/null" 2>/dev/null || echo "waiting...")
+        log_tail=$(ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@$ip" "tail -1 /var/log/marathon-setup.log 2>/dev/null" 2>/dev/null || echo "waiting...")
         printf "  %s\r" "$log_tail"
         sleep 20
     done
@@ -279,7 +278,7 @@ do_test() {
     run_test() {
         local name="$1" cmd="$2"
         total=$((total+1))
-        if ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "$cmd" &>/dev/null; then
+        if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@$ip" "$cmd" &>/dev/null; then
             ok "PASS: $name"; passed=$((passed+1))
         else
             err "FAIL: $name"; failed=$((failed+1))
@@ -290,7 +289,7 @@ do_test() {
         local name="$1" cmd="$2"
         total=$((total+1))
         local output
-        output=$(ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" "$cmd" 2>/dev/null) || true
+        output=$(ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@$ip" "$cmd" 2>/dev/null) || true
         if [[ -n "$output" ]]; then
             ok "PASS: $name — $output"; passed=$((passed+1))
         else
@@ -305,22 +304,24 @@ do_test() {
 
     echo
     info "=== Service Tests ==="
-    run_test "Orchestrator listening on :8080" "curl -sf http://localhost:8080/health || ss -tlnp | grep -q :8080"
-    run_test "Node operator listening on :8081" "curl -sf http://localhost:8081/health || ss -tlnp | grep -q :8081"
+    run_test "Orchestrator listening on :8080" "ss -tlnp | grep -q :8080"
+    run_test "Node operator process running" "pgrep -f marathon-node-operator"
 
     echo
     info "=== Integration Tests ==="
     run_test "Node operator registered with orchestrator" \
-        "grep -q 'registered\|registration\|connected' /opt/marathon/logs/node_operator*.log 2>/dev/null || journalctl -u marathon-node-operator --no-pager 2>/dev/null | grep -qi 'register'"
+        "grep -q 'heartbeat stream open' /opt/marathon/logs/node_operator*.log 2>/dev/null || journalctl -u marathon-node-operator --no-pager 2>/dev/null | grep -q 'heartbeat stream open'"
 
     # Check warm pool
     local warm_pool_output
-    warm_pool_output=$(ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" \
-        "grep -o 'Warm pool initialized: [0-9]* VMs ready' /opt/marathon/logs/*.log 2>/dev/null || echo ''" 2>/dev/null)
+    local strip_ansi
+    strip_ansi="sed -E 's/$(printf '\033')\[[0-9;]*m//g'"
+    warm_pool_output=$(ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@$ip" \
+        "$strip_ansi /opt/marathon/logs/*.log 2>/dev/null | grep -E 'warm pool initialized.*warm=[1-9][0-9]*' || echo ''" 2>/dev/null)
     total=$((total+1))
-    if [[ "$warm_pool_output" =~ "VMs ready" ]]; then
+    if [[ -n "$warm_pool_output" ]]; then
         local vm_count
-        vm_count=$(echo "$warm_pool_output" | grep -oP '\d+(?= VMs ready)' | head -1)
+        vm_count=$(echo "$warm_pool_output" | grep -oE 'warm=[0-9]+' | cut -d= -f2 | head -1)
         if [[ -n "$vm_count" && "$vm_count" -gt 0 ]]; then
             ok "PASS: Warm pool has $vm_count VMs ready"
             passed=$((passed+1))
@@ -330,9 +331,9 @@ do_test() {
             info "=== Task Submission Test ==="
             total=$((total+1))
             local task_output
-            task_output=$(ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" \
-                "cd /opt/marathon && ./zig-out/bin/marathon-client submit --task 'echo hello-marathon' 2>&1 || true" 2>/dev/null)
-            if [[ -n "$task_output" ]]; then
+            task_output=$(ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@$ip" \
+                "cd /opt/marathon && ./target/debug/marathon register --email e2e-$(date +%s)-$$@example.com --password marathon-e2e-throwaway && ./target/debug/marathon submit --repo https://github.com/MartianGreed/marathon --prompt 'echo hello-marathon' 2>&1" 2>/dev/null)
+            if [[ "$task_output" =~ [a-f0-9]{64} ]]; then
                 ok "PASS: Task submitted — $task_output"
                 passed=$((passed+1))
             else
@@ -348,7 +349,7 @@ do_test() {
     # Collect logs summary
     echo
     info "=== Setup Log Summary ==="
-    ssh $SSH_OPTS -i "$SSH_KEY" "ubuntu@$ip" \
+    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "ubuntu@$ip" \
         "tail -20 /var/log/marathon-setup.log 2>/dev/null" 2>/dev/null || true
 
     echo
@@ -366,7 +367,7 @@ do_teardown() {
 
     if [[ -n "$server_id" ]]; then
         info "Deleting server $server_id..."
-        api DELETE "/servers/$server_id" && ok "Server deleted" || warn "Server deletion failed (may already be gone)"
+        if api DELETE "/servers/$server_id"; then ok "Server deleted"; else warn "Server deletion failed (may already be gone)"; fi
     else
         warn "No server ID to teardown"
     fi

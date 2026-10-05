@@ -4,14 +4,23 @@ metadata:
   name: node-operator-config
   namespace: marathon
 data:
-  MARATHON_LISTEN_ADDRESS: "0.0.0.0"
-  MARATHON_LISTEN_PORT: "8081"
   MARATHON_ORCHESTRATOR_ADDRESS: "orchestrator"
   MARATHON_ORCHESTRATOR_PORT: "8080"
   MARATHON_TOTAL_VM_SLOTS: "10"
   MARATHON_WARM_POOL_TARGET: "5"
   MARATHON_SNAPSHOT_PATH: "/var/lib/marathon/snapshots"
   MARATHON_FIRECRACKER_BIN: "/usr/bin/firecracker"
+  MARATHON_KERNEL_PATH: "/var/lib/marathon/kernel/vmlinux"
+  MARATHON_ROOTFS_PATH: "/var/lib/marathon/rootfs/rootfs.ext4"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: node-operator-secrets
+  namespace: marathon
+type: Opaque
+stringData:
+  MARATHON_NODE_AUTH_KEY: "replace-with-shared-node-key"
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -33,6 +42,7 @@ spec:
       hostNetwork: true
       nodeSelector:
         marathon.io/compute-node: "true"
+        kubernetes.io/arch: amd64
       tolerations:
       - key: "marathon.io/compute-node"
         operator: "Exists"
@@ -42,16 +52,13 @@ spec:
         image: marathon/node-operator:latest
         securityContext:
           privileged: true
-        ports:
-        - containerPort: 8081
-          name: grpc
-        - containerPort: 9091
-          name: metrics
         envFrom:
         - configMapRef:
             name: node-operator-config
+        - secretRef:
+            name: node-operator-secrets
         env:
-        - name: MARATHON_NODE_ID
+        - name: HOSTNAME
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
@@ -73,16 +80,6 @@ spec:
           mountPath: /var/lib/marathon/kernel
         - name: run
           mountPath: /run/firecracker
-        livenessProbe:
-          tcpSocket:
-            port: 8081
-          initialDelaySeconds: 30
-          periodSeconds: 10
-        readinessProbe:
-          tcpSocket:
-            port: 8081
-          initialDelaySeconds: 10
-          periodSeconds: 5
       volumes:
       - name: dev-kvm
         hostPath:
