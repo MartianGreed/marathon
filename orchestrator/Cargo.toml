@@ -14,6 +14,31 @@ path = "src/main.rs"
 [dependencies]
 common.workspace = true
 tracing.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+tonic.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+hex.workspace = true
+sha2.workspace = true
+pbkdf2.workspace = true
+subtle.workspace = true
+jsonwebtoken.workspace = true
+base64 = "0.22.1"
+metrics = "0.24.3"
+metrics-exporter-prometheus = { version = "0.18.1", default-features = false, features = ["http-listener"] }
+
+[dev-dependencies]
+rcgen = "0.14.5"
+tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[lib]
+path = "src/lib.rs"
