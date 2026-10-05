@@ -339,7 +339,7 @@ async fn report_batches_continue_after_store_errors_and_retry_safely() {
             events: ids.iter().copied().map(output).collect(),
         }))
         .await;
-    assert_eq!(response.unwrap_err().code(), Code::Internal);
+    response.unwrap();
     assert_eq!(
         a.get_task(ids[0]).await.unwrap().unwrap().state,
         TaskState::Running
@@ -352,7 +352,14 @@ async fn report_batches_continue_after_store_errors_and_retry_safely() {
         a.get_task(ids[2]).await.unwrap().unwrap().state,
         TaskState::Running
     );
-    assert_eq!(a.state.lock().await.tasks[&ids[2]].events.outputs.len(), 1);
+    for id in &ids {
+        assert_eq!(a.state.lock().await.tasks[id].events.outputs.len(), 1);
+        let state = a.get_task(*id).await.unwrap().unwrap().state.to_wire();
+        assert_eq!(
+            a.state.lock().await.tasks[id].events.outputs[0].event.state,
+            state
+        );
+    }
     let reports = ids.iter().map(|id| result(*id, 100)).collect::<Vec<_>>();
     let response = service
         .report_task_result(Request::new(pb::ReportTaskResultRequest {
@@ -515,4 +522,145 @@ async fn failed_late_usage_commit_remains_retryable() {
     );
     assert_eq!(store.usage_report(c, 0, i64::MAX).await.unwrap().1, 1);
     assert_eq!(a.state.lock().await.meter.records.len(), 1);
+}
+
+async fn terminal_state_without_usage_does_not_bill(store: Arc<dyn Store>) {
+    let client = ClientId::random();
+    let node = NodeId::random();
+    for state in [TaskState::Completed, TaskState::Failed] {
+        let mut task = Task::new(client, "https://github.com/a/b", "main", "stored terminal");
+        task.state = state;
+        task.node_id = Some(node);
+        task.started_at = Some(task.created_at + 1);
+        task.completed_at = Some(task.created_at + 2);
+        task.usage.input_tokens = 42;
+        task.error_message = Some("stored error".into());
+        task.pr_url = Some("https://github.com/a/b/pull/1".into());
+        store.create_task(&task).await.unwrap();
+        assert!(!store.has_task_usage(task.id).await.unwrap());
+        // No process-local result marker or usage record can mask this guard branch.
+        let fresh = app(store.clone());
+        assert!(fresh.state.lock().await.tasks.is_empty());
+        assert!(fresh.state.lock().await.recorded_results.is_empty());
+        fresh
+            .result(node, result(task.id, 999), task.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.usage_report(client, 0, i64::MAX).await.unwrap(),
+            (UsageMetrics::default(), 0)
+        );
+        assert!(fresh.state.lock().await.meter.records.is_empty());
+        let saved = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(saved.to_proto(), task.to_proto());
+    }
+}
+
+#[tokio::test]
+async fn terminal_state_without_usage_does_not_bill_memory() {
+    terminal_state_without_usage_does_not_bill(Arc::new(MemoryStore::default())).await;
+}
+
+#[tokio::test]
+async fn terminal_state_without_usage_does_not_bill_postgres() {
+    with_db(|pool| async move {
+        migrate(&pool).await.unwrap();
+        terminal_state_without_usage_does_not_bill(Arc::new(PostgresStore { pool: pool.clone() }))
+            .await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(COUNT_USAGE_SQL)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn output_batch_retains_order_when_first_running_save_fails() {
+    let store = failing_store(2, 0);
+    let server = TestServer::start(Some(store.clone()), None).await;
+    let id = tasks(&server.app, ClientId::random(), 1).await[0];
+    let node = NodeId::random();
+    server
+        .app
+        .heartbeat(node, node_status(node, 1), 1)
+        .await
+        .unwrap();
+    let mut live = server.app.state.lock().await.tasks[&id]
+        .events
+        .sender
+        .subscribe();
+    server
+        .node()
+        .report_task_output(pb::ReportTaskOutputRequest {
+            auth: heartbeat(node, None, 1).auth,
+            events: (1..=3)
+                .map(|value| pb::TaskOutputEvent {
+                    task_id: id.to_hex(),
+                    data: vec![value],
+                    ..Default::default()
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    let buffered: Vec<_> = server.app.state.lock().await.tasks[&id]
+        .events
+        .outputs
+        .iter()
+        .map(|event| match &event.event.event {
+            Some(pb::task_event::Event::Output(output)) => output.data[0],
+            _ => panic!("retained non-output event"),
+        })
+        .collect();
+    assert_eq!(buffered, vec![1, 2, 3]);
+    let mut published = Vec::new();
+    while let Ok(event) = live.try_recv() {
+        if let Some(pb::task_event::Event::Output(output)) = event.event.event {
+            published.push(output.data[0]);
+        }
+    }
+    assert_eq!(published, vec![1, 2, 3]);
+    assert_eq!(
+        server.app.get_task(id).await.unwrap().unwrap().state,
+        TaskState::Running
+    );
+    assert_eq!(
+        store.get_task(id).await.unwrap().unwrap().state,
+        TaskState::Running
+    );
+}
+
+#[tokio::test]
+async fn output_is_retained_while_starting_and_next_output_retries_running_save() {
+    let store = failing_store(2, 0);
+    let a = app(store.clone());
+    let id = tasks(&a, ClientId::random(), 1).await[0];
+    let node = NodeId::random();
+    a.heartbeat(node, node_status(node, 1), 1).await.unwrap();
+    let service = Service { app: a.clone() };
+    for (value, expected) in [(1, TaskState::Starting), (2, TaskState::Running)] {
+        service
+            .report_task_output(Request::new(pb::ReportTaskOutputRequest {
+                auth: heartbeat(node, None, 1).auth,
+                events: vec![pb::TaskOutputEvent {
+                    task_id: id.to_hex(),
+                    data: vec![value],
+                    ..Default::default()
+                }],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(a.get_task(id).await.unwrap().unwrap().state, expected);
+        assert_eq!(store.get_task(id).await.unwrap().unwrap().state, expected);
+        let state = a.state.lock().await;
+        assert_eq!(state.tasks[&id].events.outputs.len(), usize::from(value));
+        assert_eq!(
+            state.tasks[&id].events.outputs.back().unwrap().event.state,
+            expected.to_wire()
+        );
+    }
 }

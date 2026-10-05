@@ -477,7 +477,7 @@ impl Orchestrator {
         Ok(true)
     }
 
-    /// Accept assigned-node output and move a starting task to RUNNING.
+    /// Publish assigned-node output, retrying RUNNING persistence without dropping output.
     pub async fn output(
         &self,
         node: NodeId,
@@ -496,8 +496,20 @@ impl Orchestrator {
                 );
                 return Ok(());
             }
-            if t.task.state == TaskState::Starting {
-                self.transition(t, TaskState::Running).await?;
+            if t.task.state == TaskState::Starting
+                && let Err(error) = self.transition(t, TaskState::Running).await
+            {
+                metrics::counter!("marathon_db_errors_total", "operation" => "output_running")
+                    .increment(1);
+                // transition keeps the STARTING snapshot when its store write fails.
+                // Output is process-local; publish it so the node need not resend it.
+                tracing::error!(
+                    operation = "output",
+                    task_id = %id,
+                    node_id = %node,
+                    error = %error,
+                    "running persistence failed; output retained"
+                );
             }
             t.events.publish(pb::TaskEvent {
                 task_id: id.to_hex(),

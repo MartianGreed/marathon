@@ -185,16 +185,10 @@ impl pb::node_service_server::NodeService for Service {
                         .map_err(|_| Status::invalid_argument("Invalid task id"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            // Parse every id before applying anything. Entry failures do not stop the
-            // batch; returning the first error lets the node retry uncommitted work.
-            let mut first_error = None;
+            // Parse every id before applying anything. Output transition persistence
+            // is best effort: acknowledge retained output rather than invite a retry.
             for (id, r) in parsed {
-                if let Err(error) = self.app.output(node, r, id).await {
-                    first_error.get_or_insert(error);
-                }
-            }
-            if let Some(error) = first_error {
-                return Err(error);
+                self.app.output(node, r, id).await?;
             }
             Ok(Response::new(pb::ReportTaskOutputResponse {}))
         }
