@@ -644,21 +644,88 @@ impl Drop for Vm {
     }
 }
 
+/// Rootfs copy jobs still running, joined by [`wait_for_copy_jobs`].
+static COPY_JOBS: AtomicU32 = AtomicU32::new(0);
+static COPY_JOBS_IDLE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Wait until no rootfs copy job (or its cleanup) is running.
+pub async fn wait_for_copy_jobs() {
+    loop {
+        let idle = COPY_JOBS_IDLE.notified();
+        tokio::pin!(idle);
+        idle.as_mut().enable();
+        if COPY_JOBS.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        idle.await;
+    }
+}
+
+/// Lives as long as a copy job, however it ends: normal return, error,
+/// or the task being dropped (runtime shutdown). Unless the copy finished
+/// and was not abandoned, the destination is deleted. Declared before the
+/// `cp` child in `copy_job` so the child is dropped (and killed) first.
+struct CopyJobGuard {
+    dest: PathBuf,
+    abandon: CancellationToken,
+    finished: bool,
+}
+
+impl CopyJobGuard {
+    fn new(dest: PathBuf, abandon: CancellationToken) -> Self {
+        COPY_JOBS.fetch_add(1, Ordering::SeqCst);
+        Self {
+            dest,
+            abandon,
+            finished: false,
+        }
+    }
+}
+
+impl Drop for CopyJobGuard {
+    fn drop(&mut self) {
+        if !self.finished || self.abandon.is_cancelled() {
+            let _ = std::fs::remove_file(&self.dest);
+        }
+        COPY_JOBS.fetch_sub(1, Ordering::SeqCst);
+        COPY_JOBS_IDLE.notify_waiters();
+    }
+}
+
+fn abandoned_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "rootfs copy abandoned")
+}
+
+/// The plain-copy fallback, run on a blocking thread. It checks `abandon`
+/// itself before and after copying and deletes `dest` when abandoned, so
+/// a copy that only starts or ends after its async job is gone (runtime
+/// shutdown) still leaves nothing behind.
+fn blocking_copy(base: &Path, dest: &Path, abandon: &CancellationToken) -> std::io::Result<()> {
+    if abandon.is_cancelled() {
+        return Err(abandoned_error());
+    }
+    let copied = std::fs::copy(base, dest);
+    if abandon.is_cancelled() {
+        let _ = std::fs::remove_file(dest);
+        return Err(abandoned_error());
+    }
+    copied.map(|_| ())
+}
+
 /// Copy `base` to `dest`: `cp --reflink=auto`, else a plain copy. Returns
 /// whether `cp` did it. When `abandon` fires, `cp` is killed and reaped,
-/// a running fallback copy is waited for, and `dest` is deleted.
+/// a running fallback copy is waited for, and `dest` is deleted; see
+/// [`CopyJobGuard`] and [`blocking_copy`] for the shutdown cases.
 async fn copy_job(
     cp: PathBuf,
     base: PathBuf,
     dest: PathBuf,
     abandon: CancellationToken,
 ) -> std::io::Result<bool> {
+    let mut guard = CopyJobGuard::new(dest.clone(), abandon.clone());
     let abandoned = |dest: &Path| {
         let _ = std::fs::remove_file(dest);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "rootfs copy abandoned",
-        ))
+        Err(abandoned_error())
     };
     let spawned = Command::new(&cp)
         .arg("--reflink=auto")
@@ -683,14 +750,18 @@ async fn copy_job(
         return abandoned(&dest);
     }
     if !reflinked {
-        // Not cancellable mid-way (it runs on a blocking thread); wait for
-        // it and clean up afterwards instead.
-        let copied = tokio::fs::copy(&base, &dest).await;
+        // Not cancellable mid-way (it runs on a blocking thread); it cleans
+        // up after itself when abandoned, even if this task is gone.
+        let (b, d, a) = (base.clone(), dest.clone(), abandon.clone());
+        let copied = tokio::task::spawn_blocking(move || blocking_copy(&b, &d, &a))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
         if abandon.is_cancelled() {
             return abandoned(&dest);
         }
         copied?;
     }
+    guard.finished = true;
     Ok(reflinked)
 }
 
@@ -910,6 +981,102 @@ mod tests {
             "rootfs copy written or left after cancel: {:?}",
             std::fs::read_to_string(&dest)
         );
+    }
+
+    // C-R3-01: an abandoned fallback copy that is still queued when the
+    // runtime shuts down must not recreate the file afterwards.
+    #[test]
+    fn cancelled_fallback_copy_cleans_up_across_runtime_shutdown() {
+        let dir = short_dir();
+        let base = dir.path().join("rootfs.ext4");
+        std::fs::write(&base, "rootfs").unwrap();
+        let cp = fake_cp(dir.path(), "exit 1");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let dest = rt.block_on(async {
+            // Hold the only blocking thread so the fallback copy queues.
+            let _hold = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            let mut vm = Vm::in_dir(dir.path());
+            vm.cp_program = cp;
+            let dest = PathBuf::from(format!("{}.{}", base.display(), vm.id));
+            let copy = tokio::time::timeout(
+                Duration::from_millis(300),
+                vm.copy_rootfs(&base.display().to_string()),
+            )
+            .await;
+            assert!(
+                copy.is_err(),
+                "fallback copy was not queued; the test proves nothing"
+            );
+            drop(vm);
+            dest
+        });
+        // Shut the runtime down with the copy still queued, then let the
+        // blocking thread go.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let _ = release.send(());
+        });
+        drop(rt);
+        releaser.join().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !dest.exists(),
+            "abandoned copy recreated the destination: {:?}",
+            std::fs::read_to_string(&dest)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_copy_leaves_no_partial_file() {
+        let dir = short_dir();
+        // A directory as base makes the plain-copy fallback fail too.
+        let base = dir.path().join("rootfs-dir");
+        std::fs::create_dir(&base).unwrap();
+        let mut vm = Vm::in_dir(dir.path());
+        vm.cp_program = fake_cp(dir.path(), r#"printf partial > "$3"; exit 1"#);
+        let dest = PathBuf::from(format!("{}.{}", base.display(), vm.id));
+        let err = vm
+            .copy_rootfs(&base.display().to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VmError::RootfsCopyFailed { .. }), "{err:?}");
+        drop(vm);
+        assert!(
+            !dest.exists(),
+            "failed copy left {:?}",
+            std::fs::read_to_string(&dest)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_shutdown_waits_for_copy_jobs() {
+        let dir = short_dir();
+        let base = dir.path().join("rootfs.ext4");
+        std::fs::write(&base, "root").unwrap();
+        let mut vm = Vm::in_dir(dir.path());
+        vm.cp_program = fake_cp(
+            dir.path(),
+            r#"printf partial > "$3"; sleep 1; printf late >> "$3""#,
+        );
+        let copy = tokio::spawn(async move {
+            let base = base.display().to_string();
+            let _ = vm.copy_rootfs(&base).await;
+            vm
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(COPY_JOBS.load(Ordering::SeqCst) >= 1);
+        copy.abort();
+        tokio::time::timeout(Duration::from_secs(3), wait_for_copy_jobs())
+            .await
+            .expect("copy jobs never finished");
     }
 
     #[tokio::test]

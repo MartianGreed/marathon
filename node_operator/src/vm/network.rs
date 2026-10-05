@@ -84,6 +84,7 @@ pub async fn create_tap(vm_index: u32) -> Result<String, NetworkError> {
         if !out.status.success() {
             tracing::warn!(
                 operation = "create_tap",
+                node_id = %crate::identity::label(),
                 tap = %tap,
                 command = %args.join(" "),
                 stderr = %String::from_utf8_lossy(&out.stderr).trim(),
@@ -91,7 +92,7 @@ pub async fn create_tap(vm_index: u32) -> Result<String, NetworkError> {
             );
         }
     }
-    tracing::info!(operation = "create_tap", tap = %tap, ip = %host_cidr(vm_index), "TAP device created");
+    tracing::info!(operation = "create_tap", node_id = %crate::identity::label(), tap = %tap, ip = %host_cidr(vm_index), "TAP device created");
     Ok(tap)
 }
 
@@ -108,16 +109,17 @@ pub fn destroy_tap(tap: &str) {
         .output()
     {
         Ok(out) if out.status.success() => {
-            tracing::debug!(operation = "destroy_tap", tap, "TAP device deleted");
+            tracing::debug!(operation = "destroy_tap", node_id = %crate::identity::label(), tap, "TAP device deleted");
         }
         Ok(out) => tracing::warn!(
             operation = "destroy_tap",
+            node_id = %crate::identity::label(),
             tap,
             stderr = %String::from_utf8_lossy(&out.stderr).trim(),
             "ip link del returned non-zero"
         ),
         Err(e) => {
-            tracing::warn!(operation = "destroy_tap", tap, error = %e, "failed to run ip link del")
+            tracing::warn!(operation = "destroy_tap", node_id = %crate::identity::label(), tap, error = %e, "failed to run ip link del")
         }
     }
 }

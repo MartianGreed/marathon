@@ -219,12 +219,23 @@ pub struct HeartbeatClient {
 }
 
 impl HeartbeatClient {
+    /// A client with the node id from [`resolve_node_id`].
     pub fn new(
         config: &NodeOperatorConfig,
         executor: Arc<TaskExecutor>,
         settings: HeartbeatSettings,
     ) -> Self {
-        let node_id = resolve_node_id(config);
+        Self::with_node_id(config, resolve_node_id(config), executor, settings)
+    }
+
+    /// A client for an already chosen node id (the binary resolves it
+    /// before warming the pool, so warm-up logs carry it too).
+    pub fn with_node_id(
+        config: &NodeOperatorConfig,
+        node_id: NodeId,
+        executor: Arc<TaskExecutor>,
+        settings: HeartbeatSettings,
+    ) -> Self {
         executor.set_node_id(node_id);
         crate::identity::set(node_id);
         Self {

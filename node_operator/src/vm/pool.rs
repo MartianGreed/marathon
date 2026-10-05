@@ -401,6 +401,9 @@ impl VmPool {
             tracing::info!(parent: op.span(), starting, "waiting for VM boots to finish");
             done.await;
         }
+        // A cancelled boot may still be cleaning up its rootfs copy; a
+        // released slot does not mean that cleanup is done.
+        super::firecracker::wait_for_copy_jobs().await;
         let vms: Vec<Vm> = {
             let mut s = self.lock();
             let mut vms: Vec<Vm> = std::mem::take(&mut s.warm);

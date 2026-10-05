@@ -476,4 +476,120 @@ mod tests {
         assert!(!e.cancel_task(&TaskId::random().to_hex()));
         assert!(!e.cancel_task("zz"));
     }
+
+    /// Captures everything logged on this thread.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A process-wide subscriber writing into a buffer. A thread-local
+    /// one can miss events whose callsite interest another test thread
+    /// already cached, so this test installs a global one, once.
+    fn captured_logs() -> LogBuf {
+        static LOGS: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = LogBuf::default();
+            let sink = logs.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || sink.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("no other test installs a global subscriber");
+            logs
+        })
+        .clone()
+    }
+
+    /// Boots "VMs" whose agent answers `start` with an error carrying a
+    /// secret.
+    struct ErrorAgentLauncher {
+        dir: std::path::PathBuf,
+        message: String,
+    }
+
+    impl crate::vm::VmLauncher for ErrorAgentLauncher {
+        fn launch<'a>(
+            &'a self,
+            vm: &'a mut crate::vm::Vm,
+        ) -> futures::future::BoxFuture<'a, Result<(), crate::vm::VmError>> {
+            use crate::vsock::handler::fake_agent::{accept, bind, ready, recv, send};
+            Box::pin(async move {
+                let listener = bind(&vm.vsock_uds_path);
+                let message = self.message.clone();
+                tokio::spawn(async move {
+                    let mut s = accept(&listener).await;
+                    send(&mut s, ready()).await;
+                    let _ = recv(&mut s).await;
+                    send(
+                        &mut s,
+                        common::pb::vsock_message::Payload::Error(pb::VsockError {
+                            code: "clone_failed".into(),
+                            message,
+                        }),
+                    )
+                    .await;
+                });
+                vm.mark_ready();
+                Ok(())
+            })
+        }
+
+        fn create(&self) -> crate::vm::Vm {
+            crate::vm::Vm::in_dir(&self.dir)
+        }
+    }
+
+    // R06: agent error text reaches the orchestrator, never the logs.
+    #[tokio::test]
+    async fn agent_error_text_is_not_logged() {
+        const SECRET: &str = "https://user:SYNTHETIC_TEST_SECRET@host/r";
+        let logs = captured_logs();
+
+        let dir = tempfile::Builder::new()
+            .prefix("mne")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let pool = Arc::new(crate::vm::VmPool::new(
+            Arc::new(ErrorAgentLauncher {
+                dir: dir.path().to_path_buf(),
+                message: format!("git clone {SECRET} failed"),
+            }),
+            crate::vm::PoolConfig {
+                total_vm_slots: 2,
+                warm_pool_target: 0,
+            },
+        ));
+        let e = TaskExecutor::new(pool, ExecutorSettings::default());
+        let id = TaskId::random();
+        e.execute_task(pb::ExecuteTask {
+            task_id: id.to_hex(),
+            ..Default::default()
+        })
+        .unwrap();
+        let r = wait_result(&e).await;
+        assert!(!r.success);
+        assert!(
+            r.error_message.as_deref().unwrap_or("").contains(SECRET),
+            "the orchestrator still gets the agent's message"
+        );
+        let logged = String::from_utf8_lossy(&lock(&logs.0)).into_owned();
+        assert!(
+            logged.contains("task completed") && logged.contains(&id.to_hex()),
+            "logs were not captured"
+        );
+        assert!(
+            !logged.contains("SYNTHETIC_TEST_SECRET"),
+            "agent error text reached the logs"
+        );
+    }
 }

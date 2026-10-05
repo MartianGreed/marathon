@@ -82,6 +82,17 @@ pub fn event_from_message(msg: VsockMessage) -> Result<VsockEvent, HandlerError>
     }
 }
 
+/// An agent error code fit for logs: kept when it looks like an
+/// identifier (`[a-z0-9_]`, at most 32 bytes), otherwise `<invalid>`.
+pub fn safe_code(code: &str) -> &str {
+    let ok = !code.is_empty()
+        && code.len() <= 32
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if ok { code } else { "<invalid>" }
+}
+
 /// Short name of an event, for logs (never its content).
 pub fn event_kind(event: &VsockEvent) -> &'static str {
     match event {
@@ -481,7 +492,7 @@ impl TaskRunner {
             VsockEvent::Error(e) => {
                 // The message goes to the orchestrator in the result; the
                 // log keeps only its code and size, as it can echo secrets.
-                tracing::warn!(task_id = %self.task_id, code = %e.code, message_bytes = e.message.len(), "agent reported an error");
+                tracing::warn!(task_id = %self.task_id, code = safe_code(&e.code), message_bytes = e.message.len(), "agent reported an error");
                 Some(TaskResult::failed(e.message, self.metrics))
             }
         }
@@ -605,6 +616,15 @@ mod tests {
             h.send_cancel().await,
             Err(HandlerError::NotConnected)
         ));
+    }
+
+    #[test]
+    fn agent_error_codes_are_logged_only_when_plain() {
+        assert_eq!(safe_code("clone_failed"), "clone_failed");
+        assert_eq!(safe_code("cancelled"), "cancelled");
+        assert_eq!(safe_code("https://u:secret@host"), "<invalid>");
+        assert_eq!(safe_code(""), "<invalid>");
+        assert_eq!(safe_code(&"a".repeat(33)), "<invalid>");
     }
 
     #[test]

@@ -202,6 +202,7 @@ pub async fn call_with_timeout(
     match &result {
         Ok(()) => tracing::debug!(
             operation = "firecracker_api",
+                node_id = %crate::identity::label(),
             method,
             endpoint,
             duration_ms,
@@ -211,6 +212,7 @@ pub async fn call_with_timeout(
             m.firecracker_api_errors.inc();
             tracing::error!(
                 operation = "firecracker_api",
+                node_id = %crate::identity::label(),
                 method,
                 endpoint,
                 socket = %socket_path.display(),

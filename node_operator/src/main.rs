@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use common::config::NodeOperatorConfig;
-use node_operator::heartbeat::{HeartbeatClient, HeartbeatSettings};
+use node_operator::heartbeat::{HeartbeatClient, HeartbeatSettings, resolve_node_id};
 use node_operator::snapshot::SnapshotManager;
 use node_operator::task::executor::{ExecutorSettings, TaskExecutor};
 use node_operator::vm::{FirecrackerLauncher, PoolConfig, VmConfig, VmPool};
@@ -33,6 +33,11 @@ async fn main() -> ExitCode {
         "Marathon node operator starting"
     );
 
+    // Chosen before anything else logs, so warm-up VMs carry it too.
+    let node_id = resolve_node_id(&config);
+    node_operator::identity::set(node_id);
+    tracing::info!(operation = "startup", node_id = %node_id, "node identity");
+
     let snapshots = match SnapshotManager::new(&config.snapshot_path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -57,8 +62,9 @@ async fn main() -> ExitCode {
             ..ExecutorSettings::default()
         },
     );
-    let heartbeat = Arc::new(HeartbeatClient::new(
+    let heartbeat = Arc::new(HeartbeatClient::with_node_id(
         &config,
+        node_id,
         executor,
         HeartbeatSettings::from_config(&config),
     ));
