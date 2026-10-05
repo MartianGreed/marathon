@@ -19,9 +19,12 @@ const SECRET_MESSAGES: &[&str] = &[
     ".marathon.v1.NodeAuth",
     ".marathon.v1.ExecuteTask",
     ".marathon.v1.VsockStart",
-    // Repository URLs can embed credentials (https://user:token@host/...).
+    // Repository and PR URLs can embed credentials (https://user:token@host/...).
     ".marathon.v1.Task",
     ".marathon.v1.TaskSummary",
+    ".marathon.v1.TaskComplete",
+    ".marathon.v1.TaskResult",
+    ".marathon.v1.VsockComplete",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

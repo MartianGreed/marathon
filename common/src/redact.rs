@@ -41,52 +41,90 @@ impl fmt::Debug for OptSecret<'_> {
     }
 }
 
-/// A URL safe to log: user info (`user:password@`) and the query string and
+/// A URL safe to log. User info (`user:password@`), the query string and the
 /// fragment (which can carry `password=` or tokens) become `<redacted>`.
 ///
-/// Errs on the side of hiding:
-/// - a scheme is kept only when the string starts with a valid one
-///   (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ) "://"`);
-/// - everything before the last `@` is treated as user info, so `/`, `?`,
-///   `#` or `://` inside an unencoded password are hidden too;
-/// - SSH-style `git@host:path` keeps only `host:path`.
+/// The output only ever contains:
+/// - a scheme, kept when the text before the first `://` is one of
+///   [`KNOWN_SCHEMES`] and otherwise printed as `<redacted>://`;
+/// - `<redacted>@` when the authority carries user info;
+/// - the host and path, taken after the authority's last `@`;
+/// - `?<redacted>` / `#<redacted>` for a query or fragment.
 ///
-/// `redis://:pw@host:6379/0` becomes `redis://<redacted>@host:6379/0`.
+/// The authority runs up to the first `/`, `?` or `#`. When an `@` appears
+/// after it (an `@` in a path, query or fragment, or an unencoded `/`, `?` or
+/// `#` in a password), the input is ambiguous and everything after the
+/// scheme becomes `<redacted>`.
+///
+/// `redis://:pw@host:6379/0` becomes `redis://<redacted>@host:6379/0`;
+/// `git@github.com:o/r.git` becomes `<redacted>@github.com:o/r.git`.
 pub fn redact_url(url: &str) -> String {
     let (scheme, rest) = split_scheme(url);
-    let host_part = match rest.rfind('@') {
-        Some(at) => &rest[at + 1..],
-        None => rest,
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after) = rest.split_at(authority_end);
+    if after.contains('@') {
+        return format!("{scheme}{REDACTED}");
+    }
+    let (userinfo, host) = match authority.rfind('@') {
+        Some(at) => (format!("{REDACTED}@"), &authority[at + 1..]),
+        None => (String::new(), authority),
     };
-    let userinfo = if host_part.len() < rest.len() {
-        format!("{REDACTED}@")
-    } else {
-        String::new()
-    };
-    let (main, tail) = match host_part.find(['?', '#']) {
-        Some(i) => host_part.split_at(i),
-        None => (host_part, ""),
+    let (path, tail) = match after.find(['?', '#']) {
+        Some(i) => after.split_at(i),
+        None => (after, ""),
     };
     let tail = match tail.chars().next() {
         Some(c) => format!("{c}{REDACTED}"),
         None => String::new(),
     };
-    format!("{scheme}{userinfo}{main}{tail}")
+    format!("{scheme}{userinfo}{host}{path}{tail}")
 }
 
-/// Split off a leading RFC 3986 scheme and `://`, if there is a valid one.
-fn split_scheme(url: &str) -> (&str, &str) {
+/// Schemes [`redact_url`] prints. Anything else before `://` could be a
+/// credential (`token://@host`), so it is not treated as a scheme.
+pub const KNOWN_SCHEMES: &[&str] = &[
+    "http",
+    "https",
+    "ws",
+    "wss",
+    "grpc",
+    "grpcs",
+    "ssh",
+    "git",
+    "git+ssh",
+    "ssh+git",
+    "git+https",
+    "file",
+    "unix",
+    "tcp",
+    "redis",
+    "rediss",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "etcd",
+];
+
+/// Split off the text up to the first `://`. Returns the printable scheme
+/// and the rest:
+/// - a known scheme is printed as is;
+/// - other text without `/`, `?`, `#` or `@` is printed as `<redacted>://`;
+/// - otherwise the `://` is not a scheme separator and nothing is split off.
+fn split_scheme(url: &str) -> (String, &str) {
     let Some(i) = url.find("://") else {
-        return ("", url);
+        return (String::new(), url);
     };
-    let scheme = &url[..i];
-    let mut chars = scheme.chars();
-    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    if valid {
-        url.split_at(i + 3)
+    let prefix = &url[..i];
+    let (scheme, rest) = url.split_at(i + 3);
+    if KNOWN_SCHEMES
+        .iter()
+        .any(|known| prefix.eq_ignore_ascii_case(known))
+    {
+        (scheme.to_owned(), rest)
+    } else if prefix.contains(['/', '?', '#', '@']) {
+        (String::new(), url)
     } else {
-        ("", url)
+        (format!("{REDACTED}://"), rest)
     }
 }
 
@@ -96,6 +134,18 @@ pub struct SafeUrl<'a>(pub &'a str);
 impl fmt::Debug for SafeUrl<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&redact_url(self.0), f)
+    }
+}
+
+/// Debug-formats an optional URL through [`redact_url`].
+pub struct OptSafeUrl<'a>(pub Option<&'a str>);
+
+impl fmt::Debug for OptSafeUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            None => f.write_str("None"),
+            Some(url) => write!(f, "Some({:?})", SafeUrl(url)),
+        }
     }
 }
 
@@ -232,7 +282,7 @@ impl fmt::Debug for pb::Task {
             .field("started_at", &self.started_at)
             .field("completed_at", &self.completed_at)
             .field("error_message", &self.error_message)
-            .field("pr_url", &self.pr_url)
+            .field("pr_url", &OptSafeUrl(self.pr_url.as_deref()))
             .field("usage", &self.usage)
             .field("create_pr", &self.create_pr)
             .field("pr_title", &self.pr_title)
@@ -255,12 +305,93 @@ impl fmt::Debug for pb::TaskSummary {
     }
 }
 
+impl fmt::Debug for pb::TaskComplete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskComplete")
+            .field("usage", &self.usage)
+            .field("pr_url", &OptSafeUrl(self.pr_url.as_deref()))
+            .field("error_message", &self.error_message)
+            .finish()
+    }
+}
+
+impl fmt::Debug for pb::TaskResult {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TaskResult")
+            .field("task_id", &self.task_id)
+            .field("success", &self.success)
+            .field("error_message", &self.error_message)
+            .field("metrics", &self.metrics)
+            .field("pr_url", &OptSafeUrl(self.pr_url.as_deref()))
+            .finish()
+    }
+}
+
+impl fmt::Debug for pb::VsockComplete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VsockComplete")
+            .field("exit_code", &self.exit_code)
+            .field("pr_url", &OptSafeUrl(self.pr_url.as_deref()))
+            .field("metrics", &self.metrics)
+            .field("iteration", &self.iteration)
+            .field("promise_found", &self.promise_found)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pb::{node_command, vsock_message};
+    use crate::pb::{node_command, task_event, vsock_message};
 
     const REPO_WITH_CREDS: &str = "https://user:repo-SECRET7@github.com/example/repo.git";
+    const PR_WITH_CREDS: &str = "https://user:pr-SECRET8@github.com/example/repo/pull/1";
+
+    #[test]
+    fn pull_request_urls_redacted_everywhere() {
+        let check = |debug: String| {
+            assert!(!debug.contains("SECRET"), "{debug}");
+            assert!(debug.contains("github.com/example/repo/pull/1"), "{debug}");
+        };
+        let mut task = crate::Task::new(crate::ClientId::random(), "https://h/r", "main", "p");
+        task.pr_url = Some(PR_WITH_CREDS.into());
+        check(format!("{task:?}"));
+        check(format!("{:?}", task.to_proto()));
+        check(format!(
+            "{:?}",
+            pb::TaskEvent {
+                event: Some(task_event::Event::Complete(pb::TaskComplete {
+                    pr_url: Some(PR_WITH_CREDS.into()),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+        ));
+        check(format!(
+            "{:?}",
+            pb::ReportTaskResultRequest {
+                auth: None,
+                results: vec![pb::TaskResult {
+                    pr_url: Some(PR_WITH_CREDS.into()),
+                    ..Default::default()
+                }],
+            }
+        ));
+        check(format!(
+            "{:?}",
+            pb::VsockMessage {
+                payload: Some(vsock_message::Payload::Complete(pb::VsockComplete {
+                    pr_url: Some(PR_WITH_CREDS.into()),
+                    ..Default::default()
+                })),
+            }
+        ));
+        assert_eq!(
+            format!("{:?}", OptSafeUrl(None)),
+            "None",
+            "absent PR URLs stay visible"
+        );
+    }
 
     #[test]
     fn repo_urls_redacted_everywhere() {
@@ -470,19 +601,40 @@ mod tests {
                 "postgres://u@h/db?sslmode=require&password=pw",
                 "postgres://<redacted>@h/db?<redacted>",
             ),
-            ("redis://:p/w@h:1", "redis://<redacted>@h:1"),
+            // `@` inside the password stays within the authority.
             ("redis://:p@w@h:1#frag", "redis://<redacted>@h:1#<redacted>"),
             ("user:pw@host:5432", "<redacted>@host:5432"),
             ("redis://localhost:6379", "redis://localhost:6379"),
             ("localhost:2379", "localhost:2379"),
             ("", ""),
-            // A-R3-01: `://` that is not a leading scheme is user info.
-            ("user:scheme_secret://pw@host:5432", "<redacted>@host:5432"),
-            ("1http://u:pw@h", "<redacted>@h"),
-            ("://u:pw@h", "<redacted>@h"),
-            // `?`, `#` or `@` inside an unencoded password.
-            ("redis://:p?w@h:1/0", "redis://<redacted>@h:1/0"),
-            ("redis://:p#w@h:1", "redis://<redacted>@h:1"),
+            // A-R3-01: text before `://` that is not a known scheme is hidden.
+            (
+                "user:scheme_secret://pw@host:5432",
+                "<redacted>://<redacted>@host:5432",
+            ),
+            ("1http://u:pw@h", "<redacted>://<redacted>@h"),
+            ("://u:pw@h", "<redacted>://<redacted>@h"),
+            ("token://host/p", "<redacted>://host/p"),
+            ("HTTPS://h/p", "HTTPS://h/p"),
+            // `://` after a `/`, `?`, `#` or `@` is not a scheme separator.
+            ("host/p?k=v://@x", "<redacted>"),
+            ("u:pw@h/x://y", "<redacted>@h/x://y"),
+            // Unencoded `/`, `?` or `#` in a password: ambiguous, all hidden.
+            ("redis://:p/w@h:1", "redis://<redacted>"),
+            ("redis://:p?w@h:1/0", "redis://<redacted>"),
+            ("redis://:p#w@h:1", "redis://<redacted>"),
+            // A-R4-01: `@` in a query or fragment never exposes what follows.
+            (
+                "https://h/p?password=user@query_secret",
+                "https://<redacted>",
+            ),
+            (
+                "redis://h/0?password=left@query_secret",
+                "redis://<redacted>",
+            ),
+            ("https://h/p#token=left@query_secret", "https://<redacted>"),
+            ("https://h/p?email=a@b", "https://<redacted>"),
+            ("https://h/a@b/c", "https://<redacted>"),
             // Schemes with + - . digits, IPv6 hosts, encoded passwords.
             (
                 "git+ssh://u:pw@h.example:22/r.git",
@@ -503,6 +655,43 @@ mod tests {
             format!("{:?}", SafeUrl("redis://:pw@h:1")),
             "\"redis://<redacted>@h:1\""
         );
+    }
+
+    /// Whatever the shape, a secret placed in user info, query or fragment
+    /// never reaches the output.
+    #[test]
+    fn url_secrets_never_printed() {
+        let schemes = [
+            "",
+            "https://",
+            "REDIS://",
+            "git+ssh://",
+            "x+y.z-1://",
+            "1bad://",
+            "://",
+            "SECRET://",
+        ];
+        let seps = ["", "/", "?", "#", "@", ":", "://", "/p@", "?a@", "#a@"];
+        let templates = [
+            "{s}user:SECRET{x}@host:1/p",
+            "{s}:SECRET{x}@host",
+            "{s}SECRET{x}@host",
+            "{s}host/p?password=SECRET{x}",
+            "{s}host/p?k=v{x}@SECRET",
+            "{s}host/p#tok=SECRET{x}",
+            "{s}host/p#a{x}@SECRET",
+            "{s}host{x}?password=SECRET",
+            "{s}user@host/p?x=1@SECRET{x}",
+        ];
+        for s in schemes {
+            for x in seps {
+                for t in templates {
+                    let input = t.replace("{s}", s).replace("{x}", x);
+                    let out = redact_url(&input);
+                    assert!(!out.contains("SECRET"), "{input:?} -> {out:?}");
+                }
+            }
+        }
     }
 
     #[test]
