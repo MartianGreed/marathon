@@ -57,6 +57,14 @@ const UPDATE_TASK_QUERY_SQL: &str = "
     WHERE id = $1
 ";
 
+const HAS_TASK_USAGE_SQL: &str = "
+    SELECT EXISTS (
+        SELECT 1
+        FROM usage_records
+        WHERE task_id = $1
+    )
+";
+
 const INSERT_USAGE_QUERY_SQL: &str = "
     INSERT INTO usage_records (
         client_id, task_id, timestamp, compute_time_ms, input_tokens, output_tokens,
@@ -767,6 +775,17 @@ impl Store for PostgresStore {
             ))
         }
         .await;
+        op.finish(&result);
+        result
+    }
+
+    async fn has_task_usage(&self, id: TaskId) -> Result<bool, DbError> {
+        let op = self.operation("has_task_usage");
+        let result = sqlx::query_scalar(HAS_TASK_USAGE_SQL)
+            .bind(id.as_bytes().as_slice())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(DbError::from);
         op.finish(&result);
         result
     }

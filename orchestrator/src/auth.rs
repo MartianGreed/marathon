@@ -114,7 +114,8 @@ impl Jwt {
         )
         .ok()?
         .claims;
-        // jsonwebtoken's clock comparison accepts equality; expiry is exclusive.
+        // RFC 7519 expiry is exclusive. Deliberately reject Zig's final accepted second.
+        // jsonwebtoken's clock comparison accepts equality, so check it explicitly.
         if claims.exp <= common::types::now_ms() / 1000 {
             return None;
         }
@@ -336,5 +337,27 @@ mod tests {
             assert!(!validate_repo_url(s));
         }
         assert!(validate_repo_url(&format!("https://{}", "a".repeat(2040))));
+    }
+
+    #[test]
+    fn jwt_expiry_is_exclusive() {
+        let now = common::types::now_ms() / 1000;
+        let claims = Claims {
+            sub: UserId::random().to_hex(),
+            email: "expiry@example.com".into(),
+            iat: now - 1,
+            exp: now,
+        };
+        let token = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"expiry-test-secret"),
+        )
+        .unwrap();
+        assert!(
+            Jwt::new(Some("expiry-test-secret"))
+                .validate(&token)
+                .is_none()
+        );
     }
 }

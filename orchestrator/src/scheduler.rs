@@ -15,7 +15,7 @@ use common::{
     types::{NodeStatus, Task, TaskState, UsageMetrics, now_ms},
 };
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 use tokio::sync::Mutex;
@@ -63,6 +63,8 @@ pub struct State {
     pub disconnected_pending: BTreeMap<NodeId, VecDeque<TaskId>>,
     /// Sequence assigned to the next submitted task.
     pub next_order: u64,
+    /// Successfully committed results, checked and marked under the task-state lock.
+    pub recorded_results: HashSet<TaskId>,
 }
 
 /// Application services sharing configuration, persistence and scheduling state.
@@ -319,6 +321,7 @@ impl Orchestrator {
             .map(|n| n.reservations.iter().copied().collect())
             .unwrap_or_default();
         let mut commands = vec![];
+        let mut failed = Vec::new();
         for id in ids {
             if let Some(t) = s.tasks.get_mut(&id) {
                 if t.task.state != TaskState::Queued {
@@ -330,10 +333,22 @@ impl Orchestrator {
                 task.started_at = Some(now_ms());
                 task.transition_to(TaskState::Starting)
                     .map_err(|_| Status::internal("Invalid queued task"))?;
-                self.store
-                    .save_task(&task)
-                    .await
-                    .map_err(|e| db_error("update_started", &e))?;
+                if let Err(error) = self.store.save_task(&task).await {
+                    db_error("update_started", &error);
+                    tracing::error!(
+                        operation = "dispatch",
+                        task_id = %id,
+                        node_id = %node,
+                        error = %error,
+                        "starting persistence failed; task requeued"
+                    );
+                    // The queued snapshot is unchanged until persistence succeeds.
+                    failed.push(id);
+                    if let Some(session) = s.sessions.get_mut(&node) {
+                        session.reservations.retain(|reserved| *reserved != id);
+                    }
+                    continue;
+                }
                 t.task = task;
                 commands.push(pb::NodeCommand {
                     command: Some(pb::node_command::Command::ExecuteTask(
@@ -372,7 +387,16 @@ impl Orchestrator {
                 })),
             }));
         }
-        self.schedule(&mut s);
+        if failed.is_empty() {
+            self.schedule(&mut s);
+        } else {
+            metrics::counter!("marathon_requeues_total").increment(failed.len() as u64);
+            // Keep failed reservations at the front, in their original FIFO order.
+            for id in failed.into_iter().rev() {
+                s.queue.push_front(id);
+            }
+            self.gauges(&s);
+        }
         Ok(pb::HeartbeatResponse {
             timestamp: now_ms(),
             acknowledged: true,
@@ -495,7 +519,7 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Persist an assigned-node result and record usage, including late terminal results.
+    /// Commit an assigned-node result once, including the first late cancelled result.
     pub async fn result(
         &self,
         node: NodeId,
@@ -522,6 +546,23 @@ impl Orchestrator {
         };
         let trace = s.tasks.get(&id).map(|t| t.trace_id.as_str()).unwrap_or("");
         let _op = crate::telemetry::task_operation("result", id, Some(node), trace);
+        if s.recorded_results.contains(&id)
+            || matches!(task.state, TaskState::Completed | TaskState::Failed)
+            || self
+                .store
+                .has_task_usage(id)
+                .await
+                .map_err(|error| db_error("has_task_usage", &error))?
+        {
+            tracing::warn!(
+                operation = "result",
+                task_id = %id,
+                node_id = %node,
+                "duplicate task result ignored"
+            );
+            metrics::counter!("marathon_duplicate_results_total").increment(1);
+            return Ok(());
+        }
         let usage: UsageMetrics = result.metrics.unwrap_or_default().into();
         let completed = now_ms();
         let terminal = task.state.is_terminal();
@@ -556,6 +597,8 @@ impl Orchestrator {
             .commit_result(&task, &record, !terminal)
             .await
             .map_err(|e| db_error("commit_result", &e))?;
+        // The store commit succeeded. A failed write leaves this task retryable.
+        s.recorded_results.insert(id);
         s.meter.record(record);
         if let Some(t) = s.tasks.get_mut(&id) {
             t.task = task.clone();

@@ -223,6 +223,7 @@ fn submission() -> pb::SubmitTaskRequest {
 }
 
 async fn end_to_end(store: Option<Arc<dyn Store>>) -> TestServer {
+    let persistent = store.clone();
     let s = TestServer::start(store, Some("node-key")).await;
     let registered = register(&s, "e2e@example.com").await;
     assert!(registered.success);
@@ -479,18 +480,22 @@ async fn end_to_end(store: Option<Arc<dyn Store>>) -> TestServer {
         cache_write_tokens: 3,
         tool_calls: 5,
     };
-    node.report_task_result(pb::ReportTaskResultRequest {
-        auth: heartbeat(node_id, Some("node-key"), 1).auth,
-        results: vec![pb::TaskResult {
-            task_id: id.clone(),
-            success: true,
-            metrics: Some(usage),
-            pr_url: Some("https://github.com/test/repo/pull/1".into()),
-            error_message: None,
-        }],
-    })
-    .await
-    .unwrap();
+    let result = pb::TaskResult {
+        task_id: id.clone(),
+        success: true,
+        metrics: Some(usage),
+        pr_url: Some("https://github.com/test/repo/pull/1".into()),
+        error_message: None,
+    };
+    // Duplicates within a batch and a retried RPC must bill once.
+    for _ in 0..2 {
+        node.report_task_result(pb::ReportTaskResultRequest {
+            auth: heartbeat(node_id, Some("node-key"), 1).auth,
+            results: vec![result.clone(), result.clone()],
+        })
+        .await
+        .unwrap();
+    }
     let complete = next_event(&mut follower).await;
     assert_eq!(complete.state, 4);
     assert!(matches!(
@@ -537,6 +542,22 @@ async fn end_to_end(store: Option<Arc<dyn Store>>) -> TestServer {
     assert_eq!(report.total, Some(usage));
     assert_eq!(report.task_count, 1);
     assert_eq!(report.client_id, got.client_id);
+    if let Some(store) = &persistent {
+        let saved = store
+            .get_task(TaskId::parse(&id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.state, TaskState::Completed);
+        assert!(saved.completed_at.is_some());
+        assert_eq!(saved.node_id, Some(node_id));
+        assert_eq!(saved.usage, usage.into());
+        assert_eq!(
+            saved.pr_url.as_deref(),
+            Some("https://github.com/test/repo/pull/1")
+        );
+    }
+
     // Snapshots retain output and are not consumed by reads.
     for _ in 0..2 {
         let mut events = client
@@ -616,17 +637,30 @@ async fn end_to_end(store: Option<Arc<dyn Store>>) -> TestServer {
             .into_inner()
             .success
     );
-    node.report_task_result(pb::ReportTaskResultRequest {
-        auth: heartbeat(node_id, Some("node-key"), 1).auth,
-        results: vec![pb::TaskResult {
-            task_id: cancel_id.clone(),
-            success: true,
-            metrics: Some(usage),
-            ..Default::default()
-        }],
-    })
-    .await
-    .unwrap();
+    if let Some(store) = &persistent {
+        let saved = store
+            .get_task(TaskId::parse(&cancel_id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.state, TaskState::Cancelled);
+        assert!(saved.completed_at.is_some());
+        assert_eq!(saved.node_id, Some(node_id));
+    }
+    let late_result = pb::TaskResult {
+        task_id: cancel_id.clone(),
+        success: true,
+        metrics: Some(usage),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        node.report_task_result(pb::ReportTaskResultRequest {
+            auth: heartbeat(node_id, Some("node-key"), 1).auth,
+            results: vec![late_result.clone(), late_result.clone()],
+        })
+        .await
+        .unwrap();
+    }
     assert_eq!(
         s.app
             .get_task(TaskId::parse(&cancel_id).unwrap())
@@ -666,7 +700,7 @@ async fn dispatch_postgres() {
     with_db(|pool| async move {
         migrate(&pool).await.unwrap();
         let store = Arc::new(PostgresStore { pool: pool.clone() });
-        let s = end_to_end(Some(store)).await;
+        let s = end_to_end(Some(store.clone())).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>(COUNT_TASKS_SQL)
                 .fetch_one(&pool)
@@ -695,6 +729,75 @@ async fn dispatch_postgres() {
                 .unwrap(),
             2
         );
+        // A failed node result must also survive a fresh repository read.
+        let completed = s
+            .app
+            .state
+            .lock()
+            .await
+            .tasks
+            .values()
+            .find(|task| task.task.state == TaskState::Completed)
+            .unwrap()
+            .task
+            .clone();
+        let node = completed.node_id.unwrap();
+        let failed_id = s
+            .app
+            .submit(
+                common::types::Task::new(
+                    completed.client_id,
+                    "https://github.com/test/repo",
+                    "main",
+                    "fail",
+                ),
+                "failed-task-trace".into(),
+            )
+            .await
+            .unwrap();
+        let status = common::types::NodeStatus {
+            node_id: node,
+            total_vm_slots: 1,
+            healthy: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.app
+                .heartbeat(node, status, 2)
+                .await
+                .unwrap()
+                .commands
+                .len(),
+            1
+        );
+        let failed_usage = pb::UsageMetrics {
+            input_tokens: 17,
+            output_tokens: 9,
+            ..Default::default()
+        };
+        s.node()
+            .report_task_result(pb::ReportTaskResultRequest {
+                auth: heartbeat(node, Some("node-key"), 1).auth,
+                results: vec![pb::TaskResult {
+                    task_id: failed_id.to_hex(),
+                    success: false,
+                    error_message: Some("node execution failed".into()),
+                    metrics: Some(failed_usage),
+                    ..Default::default()
+                }],
+            })
+            .await
+            .unwrap();
+        let saved = store.get_task(failed_id).await.unwrap().unwrap();
+        assert_eq!(saved.state, TaskState::Failed);
+        assert!(saved.completed_at.is_some());
+        assert_eq!(saved.node_id, Some(node));
+        assert_eq!(saved.usage, failed_usage.into());
+        assert_eq!(
+            saved.error_message.as_deref(),
+            Some("node execution failed")
+        );
+        assert!(saved.pr_url.is_none());
         drop(s);
     })
     .await;

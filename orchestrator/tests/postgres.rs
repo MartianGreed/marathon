@@ -20,12 +20,6 @@ const MIGRATION_HISTORY_SQL: &str = "
     ORDER BY version
 ";
 
-const INITIAL_MIGRATION_TIME_SQL: &str = "
-    SELECT applied_at
-    FROM schema_migrations
-    WHERE version = 1
-";
-
 const LIST_USERS_SQL: &str = "
     SELECT *
     FROM users
@@ -257,7 +251,7 @@ async fn zig_v1_upgrade() {
             .execute(&pool)
             .await
             .unwrap();
-        let before: (i64,) = sqlx::query_as(INITIAL_MIGRATION_TIME_SQL)
+        let before: (i32, i64, String) = sqlx::query_as(MIGRATION_HISTORY_SQL)
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -267,8 +261,12 @@ async fn zig_v1_upgrade() {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, before.0);
-        assert_eq!(rows[1].2, "users and authentication");
+        assert_eq!(rows[0], before);
+        assert_eq!(
+            (rows[1].0, rows[1].2.as_str()),
+            (2, "users and authentication")
+        );
+        assert!(rows[1].1 > 0);
         assert!(
             sqlx::query(LIST_USERS_SQL)
                 .fetch_all(&pool)
@@ -291,7 +289,14 @@ async fn fresh_idempotent_and_racing_migrations() {
             .await
             .unwrap();
         assert_eq!(before.len(), 2);
-        assert_eq!(before.iter().map(|r| r.0).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            before
+                .iter()
+                .map(|row| (row.0, row.2.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "initial schema"), (2, "users and authentication")]
+        );
+        assert!(before.iter().all(|row| row.1 > 0));
         migrate(&pool).await.unwrap();
         let after: Vec<(i32, i64, String)> = sqlx::query_as(MIGRATION_HISTORY_SQL)
             .fetch_all(&pool)

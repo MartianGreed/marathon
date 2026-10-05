@@ -79,6 +79,11 @@ pub trait Store: Send + Sync {
         end: i64,
     ) -> Result<(UsageMetrics, u32), DbError>;
 
+    /// Check persisted usage when receiving a result after process restart.
+    async fn has_task_usage(&self, _id: TaskId) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
     /// Commit completion and its usage together where the store supports transactions.
     async fn commit_result(
         &self,
@@ -198,6 +203,17 @@ impl Store for MemoryStore {
         end: i64,
     ) -> Result<(UsageMetrics, u32), DbError> {
         Ok(self.inner.lock().await.meter.report(client, start, end))
+    }
+
+    async fn has_task_usage(&self, id: TaskId) -> Result<bool, DbError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .meter
+            .records
+            .iter()
+            .any(|r| r.task_id == id))
     }
 
     async fn commit_result(

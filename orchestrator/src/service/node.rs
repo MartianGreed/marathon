@@ -148,8 +148,16 @@ impl pb::node_service_server::NodeService for Service {
                         .map_err(|_| Status::invalid_argument("Invalid task id"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // Parse every id before applying anything. Entry failures do not stop the
+            // batch; returning the first error lets the node retry uncommitted work.
+            let mut first_error = None;
             for (id, r) in parsed {
-                self.app.result(node, r, id).await?;
+                if let Err(error) = self.app.result(node, r, id).await {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
             Ok(Response::new(pb::ReportTaskResultResponse {}))
         }
@@ -177,8 +185,16 @@ impl pb::node_service_server::NodeService for Service {
                         .map_err(|_| Status::invalid_argument("Invalid task id"))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // Parse every id before applying anything. Entry failures do not stop the
+            // batch; returning the first error lets the node retry uncommitted work.
+            let mut first_error = None;
             for (id, r) in parsed {
-                self.app.output(node, r, id).await?;
+                if let Err(error) = self.app.output(node, r, id).await {
+                    first_error.get_or_insert(error);
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
             Ok(Response::new(pb::ReportTaskOutputResponse {}))
         }
