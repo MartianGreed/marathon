@@ -1,7 +1,7 @@
-tcp:
+http:
   routers:
     marathon:
-      rule: "HostSNI(`{{ env \"MARATHON_DOMAIN\" }}`)"
+      rule: 'Host(`{{ env "MARATHON_DOMAIN" }}`)'
       service: marathon-svc
       tls:
         certResolver: letsencrypt
@@ -11,4 +11,4 @@ tcp:
     marathon-svc:
       loadBalancer:
         servers:
-          - address: "orchestrator:8080"
+          - url: h2c://orchestrator:8080

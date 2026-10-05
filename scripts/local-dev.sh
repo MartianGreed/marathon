@@ -24,7 +24,10 @@ err()   { echo -e "${RED}[ERR ]${NC} $*"; }
 
 load_env() {
     if [[ -f "$ENV_FILE" ]]; then
-        set -a; source "$ENV_FILE"; set +a
+        set -a
+        # shellcheck source=/dev/null
+        source "$ENV_FILE"
+        set +a
     fi
 }
 
@@ -53,6 +56,10 @@ install_system_deps() {
     command -v curl      &>/dev/null || missing+=(curl)
     command -v wget      &>/dev/null || missing+=(wget)
     command -v jq        &>/dev/null || missing+=(jq)
+    command -v protoc    &>/dev/null || missing+=(protobuf-compiler)
+    command -v musl-gcc  &>/dev/null || missing+=(musl-tools)
+    command -v gcc       &>/dev/null && command -v g++ &>/dev/null && command -v make &>/dev/null || missing+=(build-essential)
+    command -v pkg-config &>/dev/null || missing+=(pkg-config)
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         info "Installing: ${missing[*]}"
@@ -62,27 +69,18 @@ install_system_deps() {
     ok "System deps OK"
 }
 
-# ─── Zig ─────────────────────────────────────────────────────────
-
-install_zig() {
-    if command -v zig &>/dev/null; then
-        ok "Zig: $(zig version)"
-        return
+# Rust toolchain
+install_rust() {
+    export HOME="${HOME:-/root}"
+    if ! command -v rustup >/dev/null || ! command -v cargo >/dev/null; then
+        info "Installing Rust stable..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+        # shellcheck source=/dev/null
+        source "${CARGO_HOME:-$HOME/.cargo}/env"
     fi
-    # Check common local install paths
-    for p in /tmp/zig-x86_64-linux-*/zig /tmp/zig-linux-x86_64-*/zig /usr/local/bin/zig; do
-        if [[ -x "$p" ]]; then
-            export PATH="$(dirname "$p"):$PATH"
-            ok "Zig: $(zig version)"
-            return
-        fi
-    done
-    info "Installing Zig 0.15.2..."
-    cd /tmp
-    curl -sL "https://ziglang.org/download/0.15.2/zig-x86_64-linux-0.15.2.tar.xz" -o zig.tar.xz
-    tar xf zig.tar.xz && rm zig.tar.xz
-    export PATH="/tmp/zig-x86_64-linux-0.15.2:$PATH"
-    ok "Zig installed: $(zig version)"
+    rustup toolchain install stable --profile minimal
+    rustup target add --toolchain stable x86_64-unknown-linux-musl
+    ok "Rust: $(cargo --version)"
 }
 
 # ─── Postgres ────────────────────────────────────────────────────
@@ -138,7 +136,8 @@ install_firecracker() {
     fi
 
     info "Installing Firecracker $FIRECRACKER_VERSION..."
-    local tmp=$(mktemp -d)
+    local tmp
+    tmp=$(mktemp -d)
     wget -q -O "$tmp/fc.tgz" \
         "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz"
     tar -xzf "$tmp/fc.tgz" -C "$tmp"
@@ -182,7 +181,7 @@ setup_rootfs() {
     fi
 
     # Build custom rootfs with vm-agent if binary exists
-    if [[ -x "$PROJECT_DIR/zig-out/bin/marathon-vm-agent" ]]; then
+    if [[ -x "$PROJECT_DIR/target/x86_64-unknown-linux-musl/release/marathon-vm-agent" ]]; then
         info "Building custom rootfs with vm-agent (this takes a few minutes)..."
         cd "$PROJECT_DIR/snapshot"
         if bash create_rootfs.sh rootfs 4G "$rpath" 2>&1 | tail -3; then
@@ -269,19 +268,10 @@ setup_snapshot() {
 # ─── Build ───────────────────────────────────────────────────────
 
 build_binaries() {
-    local orch="$PROJECT_DIR/zig-out/bin/marathon-orchestrator"
-    local node="$PROJECT_DIR/zig-out/bin/marathon-node-operator"
-
-    if [[ -x "$orch" && -x "$node" ]]; then
-        if [[ "$PROJECT_DIR/build.zig" -nt "$orch" ]]; then
-            info "Source changed, rebuilding..."
-        else
-            ok "Binaries up to date"; return
-        fi
-    else
-        info "Building binaries..."
+    cd "$PROJECT_DIR" && cargo build --workspace --locked
+    if [[ "${HAS_KVM:-0}" == "1" ]]; then
+        make vm-agent-musl
     fi
-    cd "$PROJECT_DIR" && zig build
     ok "Build complete"
 }
 
@@ -297,14 +287,14 @@ do_start() {
 
     check_kvm
     install_system_deps
-    install_zig
+    install_rust
     setup_postgres
     setup_redis
     install_firecracker
     setup_kernel
+    build_binaries
     setup_rootfs
     setup_snapshot
-    build_binaries
 
     # Kill any existing
     do_stop_quiet
@@ -323,9 +313,10 @@ do_start() {
     fi
 
     echo ""
-    info "Starting orchestrator on :${MARATHON_ORCHESTRATOR_PORT:-8080}..."
+    export MARATHON_LISTEN_PORT="${MARATHON_ORCHESTRATOR_PORT:-8080}"
+    info "Starting orchestrator on :$MARATHON_LISTEN_PORT..."
     cd "$PROJECT_DIR"
-    "$PROJECT_DIR/zig-out/bin/marathon-orchestrator" \
+    NO_COLOR=1 MARATHON_LOG_FORMAT=text "$PROJECT_DIR/target/debug/marathon-orchestrator" \
         > "$LOG_DIR/orchestrator.log" 2>&1 &
     echo $! > "$PID_DIR/orchestrator.pid"
 
@@ -342,7 +333,7 @@ do_start() {
     ok "Orchestrator running (PID $(cat "$PID_DIR/orchestrator.pid"))"
 
     info "Starting node_operator..."
-    "$PROJECT_DIR/zig-out/bin/marathon-node-operator" \
+    NO_COLOR=1 MARATHON_LOG_FORMAT=text "$PROJECT_DIR/target/debug/marathon-node-operator" \
         > "$LOG_DIR/node_operator.log" 2>&1 &
     echo $! > "$PID_DIR/node_operator.pid"
     sleep 3
@@ -363,7 +354,8 @@ do_stop_quiet() {
     for svc in node_operator orchestrator; do
         local pidfile="$PID_DIR/${svc}.pid"
         if [[ -f "$pidfile" ]]; then
-            local pid=$(cat "$pidfile")
+            local pid
+            pid=$(cat "$pidfile")
             if kill -0 "$pid" 2>/dev/null; then
                 kill "$pid" 2>/dev/null
                 for _ in $(seq 1 5); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
@@ -384,7 +376,8 @@ do_stop() {
     for svc in node_operator orchestrator; do
         local pidfile="$PID_DIR/${svc}.pid"
         if [[ -f "$pidfile" ]]; then
-            local pid=$(cat "$pidfile")
+            local pid
+            pid=$(cat "$pidfile")
             if kill -0 "$pid" 2>/dev/null; then
                 kill "$pid" 2>/dev/null
                 for _ in $(seq 1 5); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
@@ -408,7 +401,7 @@ do_status() {
     for svc in orchestrator node_operator; do
         local pidfile="$PID_DIR/${svc}.pid"
         local port
-        [[ "$svc" == "orchestrator" ]] && port="8080" || port="8081"
+        [[ "$svc" == "orchestrator" ]] && port="${MARATHON_LISTEN_PORT:-8080}" || port="outbound heartbeat"
         if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
             echo -e "  ${GREEN}●${NC} $svc  PID=$(cat "$pidfile")  port=$port"
         else

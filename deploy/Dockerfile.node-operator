@@ -1,37 +1,25 @@
-ARG ALPINE_VERSION=3.19
-ARG ZIG_VERSION=0.15.2
-
-FROM alpine:${ALPINE_VERSION} AS builder
-
-ARG ZIG_VERSION
-
-RUN apk add --no-cache curl xz tar
-
-RUN curl -L https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz | tar -xJ -C /opt && \
-    ln -s /opt/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
-
+FROM rust:1-alpine AS builder
+RUN apk add --no-cache musl-dev protobuf-dev protoc make gcc
 WORKDIR /build
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY common/ common/
+COPY orchestrator/ orchestrator/
+COPY node_operator/ node_operator/
+COPY vm_agent/ vm_agent/
+COPY client/ client/
+COPY proto/ proto/
+RUN cargo build -p marathon-node-operator --release --locked
 
-RUN zig build -Doptimize=ReleaseFast
-
-FROM alpine:${ALPINE_VERSION}
-
-RUN apk add --no-cache ca-certificates
-
+FROM alpine:3.22
+RUN apk add --no-cache ca-certificates curl gcompat
 ENV FIRECRACKER_VERSION=1.8.0
-RUN curl -L "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz" | \
-    tar -xz -C /usr/bin --strip-components=1 release-v${FIRECRACKER_VERSION}-x86_64/firecracker-v${FIRECRACKER_VERSION}-x86_64 && \
-    mv /usr/bin/firecracker-v${FIRECRACKER_VERSION}-x86_64 /usr/bin/firecracker
-
-RUN curl -L "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz" | \
-    tar -xz -C /usr/bin --strip-components=1 release-v${FIRECRACKER_VERSION}-x86_64/jailer-v${FIRECRACKER_VERSION}-x86_64 && \
-    mv /usr/bin/jailer-v${FIRECRACKER_VERSION}-x86_64 /usr/bin/jailer
-
-COPY --from=builder /build/zig-out/bin/marathon-node-operator /usr/local/bin/
-
-RUN mkdir -p /var/lib/marathon/{snapshots,rootfs,kernel} /run/firecracker
-
-EXPOSE 8081 9091
-
+# Firecracker hosts and this runtime image require x86_64 and /dev/kvm.
+RUN test "$(uname -m)" = x86_64 && \
+    curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/v${FIRECRACKER_VERSION}/firecracker-v${FIRECRACKER_VERSION}-x86_64.tgz" -o /tmp/firecracker.tgz && \
+    tar -xzf /tmp/firecracker.tgz -C /tmp && \
+    cp /tmp/release-v${FIRECRACKER_VERSION}-x86_64/firecracker-v${FIRECRACKER_VERSION}-x86_64 /usr/bin/firecracker && \
+    cp /tmp/release-v${FIRECRACKER_VERSION}-x86_64/jailer-v${FIRECRACKER_VERSION}-x86_64 /usr/bin/jailer && \
+    rm -rf /tmp/firecracker.tgz /tmp/release-v${FIRECRACKER_VERSION}-x86_64
+COPY --from=builder /build/target/release/marathon-node-operator /usr/local/bin/
+RUN mkdir -p /var/lib/marathon/snapshots /var/lib/marathon/rootfs /var/lib/marathon/kernel /run/firecracker
 ENTRYPOINT ["/usr/local/bin/marathon-node-operator"]

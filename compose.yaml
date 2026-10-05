@@ -4,21 +4,33 @@ services:
     ports:
       - "443:443"
     volumes:
-      - ./traefik/:/etc/traefik/:ro
+      - ./traefik/dynamic.yaml:/etc/traefik/dynamic.yaml:ro
       - letsencrypt_data:/letsencrypt
     environment:
       MARATHON_DOMAIN: ${MARATHON_DOMAIN}
-      MARATHON_ACME_EMAIL: ${MARATHON_ACME_EMAIL}
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL: ${MARATHON_ACME_EMAIL}
+      TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS: ":443"
+      TRAEFIK_PROVIDERS_FILE_FILENAME: /etc/traefik/dynamic.yaml
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_STORAGE: /letsencrypt/acme.json
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_TLSCHALLENGE: "true"
+      TRAEFIK_LOG_LEVEL: INFO
     depends_on:
       orchestrator:
         condition: service_started
 
   orchestrator:
     image: marathon/orchestrator:latest
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.orchestrator
     environment:
       MARATHON_ANTHROPIC_API_KEY: ${MARATHON_ANTHROPIC_API_KEY}
       MARATHON_POSTGRES_URL: postgresql://${POSTGRES_USER:-marathon}:${POSTGRES_PASSWORD:-marathon}@postgres:5432/${POSTGRES_DB:-marathon}
       MARATHON_REDIS_URL: redis://redis:6379
+      MARATHON_LISTEN_ADDRESS: "0.0.0.0"
+      MARATHON_LISTEN_PORT: "8080"
+      MARATHON_JWT_SECRET: ${MARATHON_JWT_SECRET:?Set MARATHON_JWT_SECRET}
+      MARATHON_NODE_AUTH_KEY: ${MARATHON_NODE_AUTH_KEY:?Set MARATHON_NODE_AUTH_KEY}
     depends_on:
       postgres:
         condition: service_healthy

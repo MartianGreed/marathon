@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 make build              # Debug build
 make build-release      # Release build with optimizations
 make test               # Run all tests
-make lint               # Check formatting
+make lint               # Check formatting and Clippy
 make format             # Auto-format code
 make proto-check        # Validate protobuf definitions
 make snapshot           # Create VM snapshots (kernel + rootfs)
@@ -16,12 +16,15 @@ make docker-build       # Build via Alpine Docker container
 make install            # Install binaries to /usr/local/bin
 ```
 
-Zig direct commands:
+Rust direct commands:
 ```bash
-zig build                    # Build all targets
-zig build test               # Run all tests
-zig build -Doptimize=ReleaseSafe  # Release build
+cargo build --workspace
+cargo test --workspace
+cargo build --workspace --release --locked
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Use stable Rust, edition 2024, Rust 1.88 or newer, and protoc.
 
 ## Architecture
 
@@ -39,7 +42,7 @@ Client CLI → Orchestrator → Node Operator → Firecracker VM → VM Agent (r
 - Scheduler: assigns tasks to nodes using capacity-based scoring
 - Registry: tracks node health and capabilities
 - Metering: tracks token usage and compute time
-- Auth: API key validation
+- Auth: account registration, password authentication, JWT sessions
 
 **node_operator/** - Runs on compute nodes
 - VM pool management with warm instances
@@ -53,7 +56,7 @@ Client CLI → Orchestrator → Node Operator → Firecracker VM → VM Agent (r
 - Communicates results via vsock
 
 **client/** - CLI tool (`marathon` binary)
-- Commands: submit, status, cancel, usage
+- Commands: register, login, logout, whoami, submit, status, cancel, usage
 
 **common/** - Shared library
 - Types, config, protocol definitions
@@ -61,25 +64,31 @@ Client CLI → Orchestrator → Node Operator → Firecracker VM → VM Agent (r
 
 ### Communication
 
-- Orchestrator ↔ Node Operator: gRPC (protobuf definitions in `proto/marathon/v1/`)
-- Node Operator ↔ VM Agent: vsock
+- Orchestrator ↔ Node Operator: bidirectional gRPC heartbeat stream over HTTP/2 (protobuf definitions in `proto/marathon/v1/`)
+- Node Operator ↔ VM Agent: vsock with length-prefixed protobuf frames
 - Client ↔ Orchestrator: gRPC
 
 ### Infrastructure Dependencies
 
 - PostgreSQL: task persistence
-- Redis: caching, rate limiting
-- etcd: distributed coordination
+- Redis and etcd: legacy compose infrastructure; current Rust services do not use them
 - Firecracker: VM isolation
 
 ## Configuration
 
 Key environment variables:
 - `MARATHON_ANTHROPIC_API_KEY`: API key for Claude
-- `MARATHON_ORCHESTRATOR_HOST/PORT`: orchestrator address
+- `MARATHON_ORCHESTRATOR_ADDRESS` / `MARATHON_ORCHESTRATOR_PORT`: orchestrator address
 - `MARATHON_NODE_ID`: unique node identifier
-- `MARATHON_VM_SLOTS`: max concurrent VMs per node
+- `MARATHON_TOTAL_VM_SLOTS`: max concurrent VMs per node
 - `GITHUB_TOKEN`: for PR creation
+- `MARATHON_POSTGRES_URL`: persistent orchestrator store
+- `MARATHON_JWT_SECRET`: JWT signing secret
+- `MARATHON_NODE_AUTH_KEY`: shared node authentication key
+- `MARATHON_LISTEN_ADDRESS` / `MARATHON_LISTEN_PORT`: orchestrator listener, default `0.0.0.0:8080`
+- `MARATHON_METRICS_PORT`: optional orchestrator Prometheus port
+
+The node operator dials out and does not listen on a port. PostgreSQL tests need `MARATHON_TEST_POSTGRES_URL`; set `MARATHON_TEST_REQUIRE_POSTGRES=1` to require them. A real Firecracker end-to-end test on a KVM host is owed.
 
 ## Observability
 
@@ -89,7 +98,7 @@ When writing or modifying code, automatically add:
 - Log at function entry/exit for public APIs with relevant parameters
 - Log errors with context (operation, inputs, error details)
 - Use structured logging with fields: `task_id`, `node_id`, `operation`, `duration_ms`
-- Log levels: `err` for failures, `warn` for degraded states, `info` for state transitions, `debug` for internals
+- Log levels: `error` for failures, `warn` for degraded states, `info` for state transitions, `debug` for internals
 
 **Metrics**
 - Counters: requests, errors, retries (with labels for type/status)
@@ -101,60 +110,6 @@ When writing or modifying code, automatically add:
 - Create spans for: task lifecycle, VM operations, external service calls
 - Include `task_id` and `node_id` as span attributes
 
-## Zig Code Standards
+## Rust Code Standards
 
-See `docs/zig-guide.md` for comprehensive patterns and examples.
-
-### Memory Allocation (prefer in order)
-
-1. **No allocation** - comptime, stack variables, slices of existing data
-2. **FixedBufferAllocator** - pre-sized buffer, no heap
-3. **BoundedArray** - compile-time max, runtime length
-4. **ArenaAllocator** - batch allocations, single bulk free
-5. **GeneralPurposeAllocator** - debug builds only
-
-### Required Patterns
-
-```zig
-// Always defer cleanup immediately
-var buf = try allocator.alloc(u8, size);
-defer allocator.free(buf);
-
-// errdefer for partial cleanup
-var a = try allocator.alloc(A, n);
-errdefer allocator.free(a);
-var b = try allocator.alloc(B, n); // if fails, a is freed
-
-// Arena for request-scoped work
-var arena = std.heap.ArenaAllocator.init(allocator);
-defer arena.deinit();
-```
-
-### Error Handling
-
-- Use `try` to propagate errors up
-- Use `catch` with switch for local handling
-- Combine error sets with `||` operator
-- `errdefer` for cleanup on error paths only
-
-### Generics & Comptime
-
-- Use `comptime` for compile-time computation
-- Generic structs: `fn List(comptime T: type) type { return struct { ... }; }`
-- Use `@This()` for self-reference in generic structs
-- Type reflection via `@typeInfo(T)`
-
-### Performance
-
-- Prefer slices over pointers (bounds checking, length included)
-- Use `inline` for hot small functions
-- Use `@Vector` for SIMD operations
-- Avoid heap allocation in hot paths
-- Build with `ReleaseSafe` for production
-
-### Data Structures
-
-- `std.ArrayList(T)` - dynamic array, requires allocator
-- `std.AutoHashMap(K, V)` - general hash map
-- `std.StringHashMap(V)` - string-keyed map
-- `std.BoundedArray(T, N)` - fixed max size, no allocator
+See [docs/rust-guide.md](docs/rust-guide.md). Prefer borrowed data and avoid needless clones and allocations. Use `thiserror` for typed errors, `anyhow` at application boundaries, and `?` for propagation. Inherit workspace dependencies and lints, including `unsafe_code = "deny"`. Keep unit tests next to code and integration tests in `tests/`. Formatting and Clippy with `-D warnings` must pass.

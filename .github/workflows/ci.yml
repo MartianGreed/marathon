@@ -7,57 +7,6 @@ on:
     branches: [main, master]
 
 jobs:
-  lint:
-    name: Lint & Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-      - name: Check formatting
-        run: make lint
-
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-      - name: Cache Zig
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            zig-cache
-          key: zig-${{ runner.os }}-${{ hashFiles('build.zig') }}
-          restore-keys: zig-${{ runner.os }}-
-      - name: Build (debug)
-        run: make build
-      - name: Build (release)
-        run: make build-release
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-      - name: Cache Zig
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/zig
-            zig-cache
-          key: zig-${{ runner.os }}-${{ hashFiles('build.zig') }}
-          restore-keys: zig-${{ runner.os }}-
-      - name: Run tests
-        run: make test
-
   rust-fmt:
     name: Rust Format
     runs-on: ubuntu-latest
@@ -86,6 +35,21 @@ jobs:
   rust-test:
     name: Rust Build & Test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: marathon
+          POSTGRES_DB: marathon
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d marathon"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      MARATHON_TEST_POSTGRES_URL: postgresql://postgres:marathon@127.0.0.1:5432/marathon
+      MARATHON_TEST_REQUIRE_POSTGRES: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
@@ -106,3 +70,50 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Validate proto files
         run: make proto-check
+
+  rust-release:
+    name: Rust Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release --locked
+
+  vm-agent-linux:
+    name: Static Linux VM agent
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p marathon-vm-agent --target x86_64-unknown-linux-musl
+      - run: file target/x86_64-unknown-linux-musl/release/marathon-vm-agent
+
+  docker:
+    name: Docker Images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build workspace binaries
+        run: make docker-build
+      - run: ls -l target/docker/release/
+      - run: docker build -f deploy/Dockerfile.orchestrator -t marathon/orchestrator:ci .
+      - run: docker build -f deploy/Dockerfile.node-operator -t marathon/node-operator:ci .
+      - name: Smoke check binary startup
+        run: |
+          docker run --rm --entrypoint sh marathon/orchestrator:ci -ec '
+            test -x /usr/local/bin/marathon-orchestrator
+            if MARATHON_LISTEN_PORT=invalid /usr/local/bin/marathon-orchestrator > /tmp/startup.log 2>&1; then exit 1; fi
+            cat /tmp/startup.log
+            grep -q MARATHON_LISTEN_PORT /tmp/startup.log'
+          docker run --rm --entrypoint sh marathon/node-operator:ci -ec '
+            test -x /usr/local/bin/marathon-node-operator
+            if MARATHON_TOTAL_VM_SLOTS=invalid /usr/local/bin/marathon-node-operator > /tmp/startup.log 2>&1; then exit 1; fi
+            cat /tmp/startup.log
+            grep -q MARATHON_TOTAL_VM_SLOTS /tmp/startup.log'

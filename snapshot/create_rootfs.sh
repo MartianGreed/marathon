@@ -5,6 +5,9 @@ ROOTFS_DIR="${1:-rootfs}"
 ROOTFS_SIZE="${2:-4G}"
 OUTPUT="${3:-rootfs.ext4}"
 
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VM_AGENT_BIN="${MARATHON_VM_AGENT_BIN:-$PROJECT_ROOT/target/x86_64-unknown-linux-musl/release/marathon-vm-agent}"
+[[ -f "$VM_AGENT_BIN" ]] || { echo "Missing static VM agent: $VM_AGENT_BIN. Run make vm-agent-musl on Linux." >&2; exit 1; }
 echo "Creating Marathon VM rootfs..."
 echo "  Directory: $ROOTFS_DIR"
 echo "  Size: $ROOTFS_SIZE"
@@ -13,14 +16,14 @@ echo "  Output: $OUTPUT"
 if [ ! -x "$ROOTFS_DIR/bin/busybox" ]; then
     rm -rf "$ROOTFS_DIR"
     echo "Creating rootfs directory structure..."
-    mkdir -p "$ROOTFS_DIR"/{bin,sbin,usr/bin,usr/sbin,lib,lib64,etc,dev,proc,sys,tmp,root,workspace,var/log}
+    mkdir -p "$ROOTFS_DIR"/{bin,sbin,usr/bin,usr/sbin,usr/local/bin,lib,lib64,etc,dev,proc,sys,tmp,root,workspace,var/log}
 
     echo "Installing base system (Alpine Linux)..."
     ALPINE_VERSION="3.21"
     ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
 
     TMPDIR_ROOTFS="$(mktemp -d)"
-    trap "rm -rf '$TMPDIR_ROOTFS'" EXIT
+    trap 'rm -rf "$TMPDIR_ROOTFS"' EXIT
 
     wget -q "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/x86_64/APKINDEX.tar.gz" -O "$TMPDIR_ROOTFS/APKINDEX.tar.gz"
     tar -xzf "$TMPDIR_ROOTFS/APKINDEX.tar.gz" -C "$TMPDIR_ROOTFS" APKINDEX
@@ -143,14 +146,11 @@ NETEOF
     ln -sf /etc/init.d/marathon-network "$ROOTFS_DIR/etc/runlevels/default/marathon-network"
     ln -sf /etc/init.d/marathon-agent "$ROOTFS_DIR/etc/runlevels/default/marathon-agent"
 
-    echo "Installing marathon-vm-agent..."
-    if [ -f "../zig-out/bin/marathon-vm-agent" ]; then
-        cp ../zig-out/bin/marathon-vm-agent "$ROOTFS_DIR/usr/local/bin/"
-    else
-        echo "Warning: marathon-vm-agent not found, skipping"
-    fi
+
 fi
 
+# Refresh the agent even when reusing an existing rootfs directory.
+install -D -m 755 "$VM_AGENT_BIN" "$ROOTFS_DIR/usr/local/bin/marathon-vm-agent"
 echo "Creating ext4 filesystem image..."
 truncate -s "$ROOTFS_SIZE" "$OUTPUT"
 mkfs.ext4 -d "$ROOTFS_DIR" "$OUTPUT"
