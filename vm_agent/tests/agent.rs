@@ -781,3 +781,65 @@ async fn writer_failure_with_reader_open_is_counted_once() {
     assert!(runs <= 1, "Claude ran {runs} times");
     drop(host);
 }
+
+#[tokio::test]
+async fn cumulative_metrics_saturate_at_the_agent_boundary() {
+    let script = r#"n=$(cat counter 2>/dev/null || echo 0)
+n=$((n + 1)); echo "$n" > counter
+if [ "$n" = 1 ]; then
+  echo '{"usage":{"input_tokens":9223372036854775800,"output_tokens":9223372036854775790}}'
+  exit 1
+fi
+echo '{"usage":{"input_tokens":100,"output_tokens":200},"result":"<promise>DONE</promise>"}'"#;
+    let mut running = launch(script, false).await;
+    let mut host = connect(&running).await;
+    send_start(&mut host, start(Some("DONE"), 3)).await;
+    let (frames, complete) = terminal(&mut host).await;
+    let metrics: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Payload::Metrics(metrics) => Some(*metrics),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        metrics,
+        vec![
+            totals(i64::MAX - 7, i64::MAX - 17, 0, 0),
+            totals(i64::MAX, i64::MAX, 0, 0)
+        ]
+    );
+    match complete {
+        Payload::Complete(c) => {
+            assert_eq!(c.iteration, 2);
+            assert!(c.promise_found);
+            assert_eq!(c.metrics, Some(totals(i64::MAX, i64::MAX, 0, 0)));
+        }
+        other => panic!("Expected Complete: {other:?}"),
+    }
+    finish(&mut running).await;
+}
+
+#[tokio::test]
+async fn close_after_first_metrics_prevents_second_claude_run() {
+    let (guest, mut host) = tokio::io::duplex(1024);
+    let script = "printf x >> counter; exit 1";
+    let (tmp, registry, handle) = launch_stream(script, CleanupStrategy::None, guest);
+    assert!(matches!(receive(&mut host).await, Payload::Ready(_)));
+    send_frame(&mut host, Payload::Start(start(Some("DONE"), 3))).await;
+    bounded(async {
+        loop {
+            if matches!(receive(&mut host).await, Payload::Metrics(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+    drop(host);
+    bounded(handle).await.unwrap().unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path().join("work/counter")).unwrap(),
+        b"x"
+    );
+    assert_eq!(registry.error_count("host_disconnected"), 1);
+}

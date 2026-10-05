@@ -78,9 +78,11 @@ async fn send(tx: &mpsc::Sender<VsockMessage>, payload: Payload) -> bool {
 async fn send_error(
     tx: &mpsc::Sender<VsockMessage>,
     registry: &Registry,
+    finished: &AtomicBool,
     code: &'static str,
     message: String,
 ) {
+    finished.store(true, Ordering::Release);
     registry.error(code);
     tracing::error!(operation = "task_error", code, %message, "Task failed");
     send(
@@ -97,6 +99,7 @@ async fn read_frames(
     mut reader: impl AsyncRead + Unpin,
     cancelled: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
 ) {
     loop {
         match vsock::read_message(&mut reader).await {
@@ -113,8 +116,12 @@ async fn read_frames(
                 );
             }
             Err(error) => {
-                disconnected.store(true, Ordering::Release);
-                tracing::warn!(operation = "read_frame", %error, "Host reader closed");
+                // EOF after queuing a terminal frame is a normal host close.
+                // Writer failures still count if that terminal frame cannot be delivered.
+                if !finished.load(Ordering::Acquire) {
+                    disconnected.store(true, Ordering::Release);
+                    tracing::warn!(operation = "read_frame", %error, "Host reader closed");
+                }
                 break;
             }
         }
@@ -194,11 +201,17 @@ impl<P: RepoPreparer> Agent<P> {
                     .instrument(op.span().clone()),
             );
             let cancelled = Arc::new(AtomicBool::new(false));
+            let finished = Arc::new(AtomicBool::new(false));
             let reader_task = tokio::spawn(
-                read_frames(reader, cancelled.clone(), disconnected.clone())
-                    .instrument(op.span().clone()),
+                read_frames(
+                    reader,
+                    cancelled.clone(),
+                    disconnected.clone(),
+                    finished.clone(),
+                )
+                .instrument(op.span().clone()),
             );
-            self.run_task(&task, &tx, &cancelled, &disconnected)
+            self.run_task(&task, &tx, &cancelled, &disconnected, &finished)
                 .instrument(op.span().clone())
                 .await;
             reader_task.abort();
@@ -213,7 +226,7 @@ impl<P: RepoPreparer> Agent<P> {
                 writer_task.abort();
             }
             let _ = writer_task.await;
-            if task_disconnected {
+            if disconnected.load(Ordering::Acquire) {
                 self.registry.error("host_disconnected");
                 tracing::warn!(
                     operation = "task",
@@ -234,13 +247,21 @@ impl<P: RepoPreparer> Agent<P> {
         tx: &mpsc::Sender<VsockMessage>,
         cancelled: &AtomicBool,
         disconnected: &AtomicBool,
+        finished: &AtomicBool,
     ) {
         if let Err(error) = self
             .preparer
             .prepare(task, Path::new(&self.config.work_dir))
             .await
         {
-            send_error(tx, &self.registry, "setup_failed", error.to_string()).await;
+            send_error(
+                tx,
+                &self.registry,
+                finished,
+                "setup_failed",
+                error.to_string(),
+            )
+            .await;
             return;
         }
         let base = PromptWrapper::new(&self.config.prompt_template).wrap(
@@ -262,6 +283,7 @@ impl<P: RepoPreparer> Agent<P> {
                 send_error(
                     tx,
                     &self.registry,
+                    finished,
                     "cancelled",
                     "Task cancelled by user".into(),
                 )
@@ -286,6 +308,8 @@ impl<P: RepoPreparer> Agent<P> {
                     }),
                 )
                 .await;
+                // Let the inbound reader observe a close before starting another child.
+                tokio::task::yield_now().await;
                 if !sent || disconnected.load(Ordering::Acquire) {
                     return true;
                 }
@@ -303,7 +327,14 @@ impl<P: RepoPreparer> Agent<P> {
                 let result = match result {
                     Ok(result) => result,
                     Err(error) => {
-                        send_error(tx, &self.registry, "execution_failed", error.to_string()).await;
+                        send_error(
+                            tx,
+                            &self.registry,
+                            finished,
+                            "execution_failed",
+                            error.to_string(),
+                        )
+                        .await;
                         return true;
                     }
                 };
@@ -315,6 +346,8 @@ impl<P: RepoPreparer> Agent<P> {
                 {
                     return true;
                 }
+                // Give the writer a turn before the next iteration checks reader state.
+                tokio::task::yield_now().await;
                 let signals = parse_signals(
                     &String::from_utf8_lossy(&last_output),
                     task.completion_promise.as_deref(),
@@ -327,6 +360,7 @@ impl<P: RepoPreparer> Agent<P> {
                     send_error(
                         tx,
                         &self.registry,
+                        finished,
                         "needs_clarification",
                         format!(
                             "Clarification needed: {}",
@@ -344,6 +378,7 @@ impl<P: RepoPreparer> Agent<P> {
                     None
                 };
                 if let Some((pr_url, promise_found)) = completion {
+                    finished.store(true, Ordering::Release);
                     send(
                         tx,
                         Payload::Complete(VsockComplete {
@@ -377,6 +412,7 @@ impl<P: RepoPreparer> Agent<P> {
         send_error(
             tx,
             &self.registry,
+            finished,
             "max_iterations",
             "Reached iteration limit without completion".into(),
         )
@@ -387,6 +423,29 @@ impl<P: RepoPreparer> Agent<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reader_eof_after_terminal_transition_is_not_a_disconnect() {
+        let (reader, host) = tokio::io::duplex(1024);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(read_frames(
+            reader,
+            cancelled,
+            disconnected.clone(),
+            finished.clone(),
+        ));
+        // Reproduce the interval after terminal enqueue and before reader abort.
+        tokio::task::yield_now().await;
+        finished.store(true, Ordering::Release);
+        drop(host);
+        tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!disconnected.load(Ordering::Acquire));
+    }
 
     #[test]
     fn extract_repo_name_handles_https_url() {
