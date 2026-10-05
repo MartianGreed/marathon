@@ -49,16 +49,20 @@ pub enum CredentialError {
 impl ClientCredential {
     /// Add this credential to outgoing request metadata, replacing any
     /// existing value for the same key.
+    /// The value is marked sensitive, so `Debug` of the metadata or of the
+    /// `tonic::Request` does not print it.
     pub fn apply(&self, metadata: &mut MetadataMap) -> Result<(), CredentialError> {
         match self {
             Self::Bearer(token) => {
-                let value = MetadataValue::try_from(format!("{BEARER_PREFIX}{token}"))
+                let mut value = MetadataValue::try_from(format!("{BEARER_PREFIX}{token}"))
                     .map_err(|_| CredentialError::Malformed)?;
+                value.set_sensitive(true);
                 metadata.insert(AUTHORIZATION, value);
             }
             Self::ApiKey(key) => {
-                let value = MetadataValue::try_from(key.as_str())
+                let mut value = MetadataValue::try_from(key.as_str())
                     .map_err(|_| CredentialError::Malformed)?;
+                value.set_sensitive(true);
                 metadata.insert(API_KEY, value);
             }
         }
@@ -93,9 +97,67 @@ impl ClientCredential {
     }
 }
 
+/// Mark every `authorization` and `x-api-key` value in `metadata` sensitive
+/// so that `Debug` of the metadata or its request hides them. Servers call
+/// this on incoming requests (for example in an interceptor) before anything
+/// can log them.
+pub fn mark_credentials_sensitive(metadata: &mut MetadataMap) {
+    for key in [AUTHORIZATION, API_KEY] {
+        if let tonic::metadata::Entry::Occupied(mut entry) = metadata
+            .entry(key)
+            .expect("credential keys are valid ASCII metadata keys")
+        {
+            for value in entry.iter_mut() {
+                value.set_sensitive(true);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outgoing_credentials_hidden_in_request_debug() {
+        for cred in [
+            ClientCredential::Bearer("jwt-SECRET".into()),
+            ClientCredential::ApiKey("key-SECRET".into()),
+        ] {
+            let mut request = tonic::Request::new(());
+            cred.apply(request.metadata_mut()).unwrap();
+            let debug = format!("{request:?}");
+            assert!(!debug.contains("SECRET"), "{debug}");
+            assert!(!format!("{:?}", request.metadata()).contains("SECRET"));
+            // Still readable by the server side.
+            assert_eq!(
+                ClientCredential::from_metadata(request.metadata()),
+                Ok(Some(cred))
+            );
+        }
+    }
+
+    #[test]
+    fn incoming_credentials_can_be_hidden() {
+        let mut md = MetadataMap::new();
+        md.insert("authorization", "Bearer jwt-SECRET".parse().unwrap());
+        md.insert("x-api-key", "key-SECRET".parse().unwrap());
+        md.append("x-api-key", "key2-SECRET".parse().unwrap());
+        md.insert("x-request-id", "visible-id".parse().unwrap());
+        assert!(format!("{md:?}").contains("SECRET"));
+        mark_credentials_sensitive(&mut md);
+        let debug = format!("{md:?}");
+        assert!(!debug.contains("SECRET"), "{debug}");
+        assert!(debug.contains("visible-id"), "{debug}");
+        assert_eq!(
+            ClientCredential::from_metadata(&md),
+            Ok(Some(ClientCredential::Bearer("jwt-SECRET".into())))
+        );
+        // No credentials: nothing to do.
+        let mut empty = MetadataMap::new();
+        mark_credentials_sensitive(&mut empty);
+        assert!(empty.is_empty());
+    }
 
     #[test]
     fn bearer_round_trip() {

@@ -4,6 +4,10 @@
 //! logging a request never prints a password, token, API key or env var
 //! value. A secret prints as `<redacted>` when set and `""` when empty, so
 //! a missing value stays visible.
+//!
+//! Also: [`redact_url`] / [`SafeUrl`] for connection URLs, and [`Secret`] /
+//! [`OptSecret`] for hand-written `Debug` impls. Credentials in gRPC
+//! metadata are handled by [`crate::client_auth`].
 
 use std::fmt;
 
@@ -34,6 +38,42 @@ impl fmt::Debug for OptSecret<'_> {
             None => f.write_str("None"),
             Some(s) => write!(f, "Some({:?})", Secret(s)),
         }
+    }
+}
+
+/// A connection URL safe to log: user info (`user:password@`) and the query
+/// string (which can carry `password=`) are replaced by `<redacted>`.
+/// Errs on the side of hiding: everything before the last `@` ahead of the
+/// query is treated as user info, even an unencoded `/` in a password.
+///
+/// `redis://:pw@host:6379/0` becomes `redis://<redacted>@host:6379/0`.
+pub fn redact_url(url: &str) -> String {
+    let (scheme, rest) = match url.find("://") {
+        Some(i) => url.split_at(i + 3),
+        None => ("", url),
+    };
+    let (main, query) = match rest.find(['?', '#']) {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let main = match main.rfind('@') {
+        Some(at) => format!("{REDACTED}@{}", &main[at + 1..]),
+        None => main.to_owned(),
+    };
+    let query = if query.is_empty() {
+        String::new()
+    } else {
+        format!("{}{REDACTED}", &query[..1])
+    };
+    format!("{scheme}{main}{query}")
+}
+
+/// Debug-formats a connection URL through [`redact_url`].
+pub struct SafeUrl<'a>(pub &'a str);
+
+impl fmt::Debug for SafeUrl<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&redact_url(self.0), f)
     }
 }
 
@@ -261,6 +301,63 @@ mod tests {
                 password: SECRETS[2].into(),
             })
         ));
+    }
+
+    #[test]
+    fn node_auth_token_bytes_hidden() {
+        let token: Vec<u8> = (0u8..32)
+            .map(|i| i.wrapping_mul(7).wrapping_add(200))
+            .collect();
+        let auth = pb::NodeAuth {
+            node_id: "0f".repeat(16),
+            timestamp_ms: 42,
+            token: token.clone(),
+        };
+        assert_eq!(
+            format!("{auth:?}"),
+            format!(
+                "NodeAuth {{ node_id: \"{}\", timestamp_ms: 42, token: <redacted 32 bytes> }}",
+                "0f".repeat(16)
+            )
+        );
+        // No rendering of the bytes appears, whatever the format.
+        let debug = format!("{auth:#?}");
+        assert!(!debug.contains(&format!("{token:?}")[1..20]), "{debug}");
+        assert!(
+            !debug.contains(&format!("{:02x}{:02x}", token[0], token[1])),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn urls_lose_credentials() {
+        let cases = [
+            (
+                "redis://:pw@cache:6379/0",
+                "redis://<redacted>@cache:6379/0",
+            ),
+            (
+                "postgresql://marathon:marathon@localhost:5432/marathon",
+                "postgresql://<redacted>@localhost:5432/marathon",
+            ),
+            (
+                "postgres://u@h/db?sslmode=require&password=pw",
+                "postgres://<redacted>@h/db?<redacted>",
+            ),
+            ("redis://:p/w@h:1", "redis://<redacted>@h:1"),
+            ("redis://:p@w@h:1#frag", "redis://<redacted>@h:1#<redacted>"),
+            ("user:pw@host:5432", "<redacted>@host:5432"),
+            ("redis://localhost:6379", "redis://localhost:6379"),
+            ("localhost:2379", "localhost:2379"),
+            ("", ""),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact_url(input), want, "{input}");
+        }
+        assert_eq!(
+            format!("{:?}", SafeUrl("redis://:pw@h:1")),
+            "\"redis://<redacted>@h:1\""
+        );
     }
 
     #[test]

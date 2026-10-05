@@ -119,7 +119,7 @@ fn process_env(name: &str) -> Option<String> {
     std::env::var_os(name).map(|v| v.to_string_lossy().into_owned())
 }
 
-const REDACTED: &str = "<redacted>";
+use crate::redact::{REDACTED, SafeUrl};
 
 fn redact(value: &Option<String>) -> Option<&'static str> {
     value.as_ref().map(|_| REDACTED)
@@ -168,9 +168,16 @@ impl fmt::Debug for OrchestratorConfig {
             .field("listen_port", &self.listen_port)
             .field("node_timeout_ms", &self.node_timeout_ms)
             .field("heartbeat_interval_ms", &self.heartbeat_interval_ms)
-            .field("etcd_endpoints", &self.etcd_endpoints)
-            .field("redis_url", &self.redis_url)
-            .field("postgres_url", &REDACTED)
+            .field(
+                "etcd_endpoints",
+                &self
+                    .etcd_endpoints
+                    .iter()
+                    .map(|e| SafeUrl(e))
+                    .collect::<Vec<_>>(),
+            )
+            .field("redis_url", &SafeUrl(&self.redis_url))
+            .field("postgres_url", &SafeUrl(&self.postgres_url))
             .field(
                 "anthropic_api_key",
                 &if self.anthropic_api_key.is_empty() {
@@ -648,12 +655,25 @@ mod tests {
             ("MARATHON_POSTGRES_URL", "postgresql://u:pw-secret@h/db"),
             ("MARATHON_NODE_AUTH_KEY", "node-secret"),
             ("MARATHON_JWT_SECRET", "jwt-secret"),
+            (
+                "MARATHON_REDIS_URL",
+                "redis://:redis-secret@cache.internal:6379/0",
+            ),
         ]))
         .unwrap();
         let debug = format!("{c:?}");
-        for secret in ["sk-ant-secret", "pw-secret", "node-secret", "jwt-secret"] {
+        for secret in [
+            "sk-ant-secret",
+            "pw-secret",
+            "node-secret",
+            "jwt-secret",
+            "redis-secret",
+        ] {
             assert!(!debug.contains(secret), "{debug}");
         }
+        // Hosts stay visible for debugging.
+        assert!(debug.contains("cache.internal:6379/0"), "{debug}");
+        assert!(debug.contains("@h/db"), "{debug}");
     }
 
     #[test]
