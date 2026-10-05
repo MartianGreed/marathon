@@ -223,6 +223,8 @@ pub struct RunnerSettings {
     pub handshake_timeout: Duration,
     /// How long to wait for the agent's `ready` after the handshake.
     pub ready_timeout: Duration,
+    /// How long sending `start` may take.
+    pub write_timeout: Duration,
     /// How long to wait for the agent to answer a cancel.
     pub cancel_grace: Duration,
 }
@@ -234,6 +236,7 @@ impl Default for RunnerSettings {
             connect_delay: Duration::from_secs(2),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             ready_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
             cancel_grace: Duration::from_secs(30),
         }
     }
@@ -243,6 +246,8 @@ impl Default for RunnerSettings {
 pub const CANCEL_UNACKNOWLEDGED: &str = "Task cancelled; agent did not acknowledge";
 /// Error text when the agent never sends `ready`.
 pub const READY_TIMEOUT: &str = "VM agent did not send ready";
+/// Error text when the agent does not take the `start` frame in time.
+pub const START_WRITE_TIMEOUT: &str = "VM agent did not accept the task";
 /// Error text when a task is cancelled before it reached the agent.
 pub const CANCELLED_BEFORE_START: &str = "Task cancelled before start";
 /// Error text for a non-zero agent exit code.
@@ -385,9 +390,25 @@ impl TaskRunner {
         if cancel.is_cancelled() {
             return TaskResult::failed(CANCELLED_BEFORE_START, self.metrics);
         }
+        // A large start frame can block on a guest that stops reading.
+        // Cancel or the timeout abandon it; the connection is dropped with
+        // this function, so a partial frame is never continued.
         let msg = VsockMessage::from(Payload::Start(start));
-        if let Err(e) = common::vsock::write_message(&mut writer, &msg).await {
-            return TaskResult::failed(e.to_string(), self.metrics);
+        let written = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                tracing::info!(task_id = %self.task_id, "task cancelled while sending start");
+                return TaskResult::failed(CANCELLED_BEFORE_START, self.metrics);
+            }
+            r = tokio::time::timeout(self.settings.write_timeout, common::vsock::write_message(&mut writer, &msg)) => r,
+        };
+        match written {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return TaskResult::failed(e.to_string(), self.metrics),
+            Err(_) => {
+                tracing::error!(task_id = %self.task_id, "timed out sending start to the VM agent");
+                return TaskResult::failed(START_WRITE_TIMEOUT, self.metrics);
+            }
         }
         tracing::info!(task_id = %self.task_id, trace_id = %self.trace.trace_id(), "task started on VM");
 
@@ -407,11 +428,19 @@ impl TaskRunner {
                 }
                 () = cancel.cancelled(), if cancel_deadline.is_none() => {
                     tracing::info!(task_id = %self.task_id, "cancelling task on VM");
+                    let deadline = tokio::time::Instant::now() + self.settings.cancel_grace;
                     let msg = VsockMessage::from(Payload::Cancel(pb::VsockCancel {}));
-                    if let Err(e) = common::vsock::write_message(&mut writer, &msg).await {
-                        tracing::warn!(task_id = %self.task_id, error = %e, "failed to send cancel to agent");
+                    // The cancel write shares the grace period: a guest that
+                    // does not read cannot hold the task past it.
+                    match tokio::time::timeout_at(deadline, common::vsock::write_message(&mut writer, &msg)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!(task_id = %self.task_id, error = %e, "failed to send cancel to agent"),
+                        Err(_) => {
+                            tracing::warn!(task_id = %self.task_id, "agent did not read the cancel");
+                            return TaskResult::failed(CANCEL_UNACKNOWLEDGED, self.metrics);
+                        }
                     }
-                    cancel_deadline = Some(tokio::time::Instant::now() + self.settings.cancel_grace);
+                    cancel_deadline = Some(deadline);
                 }
                 () = sleep_until_opt(cancel_deadline) => {
                     tracing::warn!(task_id = %self.task_id, "agent did not acknowledge cancel");
@@ -536,6 +565,7 @@ mod tests {
             connect_delay: Duration::from_millis(10),
             handshake_timeout: Duration::from_secs(2),
             ready_timeout: Duration::from_secs(2),
+            write_timeout: Duration::from_secs(2),
             cancel_grace: Duration::from_millis(200),
         }
     }
@@ -1009,6 +1039,9 @@ mod tests {
                 .await
         });
         handshaken.await.unwrap();
+        // Let the runner leave `connect` and enter the ready wait, so the
+        // cancel lands in that phase rather than in the handshake.
+        tokio::time::sleep(Duration::from_millis(200)).await;
         cancel.cancel();
         let r = tokio::time::timeout(Duration::from_millis(500), run)
             .await
@@ -1036,6 +1069,79 @@ mod tests {
         .expect("ready wait is unbounded")
         .unwrap();
         assert_eq!(r.error_message.as_deref(), Some(READY_TIMEOUT));
+    }
+
+    /// An agent that sends `ready` and then never reads, so a large start
+    /// frame blocks on the socket buffer.
+    fn ready_then_deaf(path: &Path) -> tokio::sync::oneshot::Receiver<()> {
+        let listener = bind(path);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut s = accept(&listener).await;
+            send(&mut s, ready()).await;
+            let _ = tx.send(());
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        rx
+    }
+
+    fn huge_start(task: &TaskId) -> pb::VsockStart {
+        pb::VsockStart {
+            prompt: "x".repeat(8 * 1024 * 1024),
+            ..start_for(task)
+        }
+    }
+
+    // C-R2-01: cancel while the start frame is blocked returns promptly.
+    #[tokio::test]
+    async fn runner_cancel_during_blocked_start_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sock");
+        let ready_sent = ready_then_deaf(&path);
+        let task = TaskId::random();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        let mut settings = fast();
+        settings.write_timeout = Duration::from_secs(30);
+        let run = tokio::spawn(async move {
+            TaskRunner::new(&path, 9999, task)
+                .with_settings(settings)
+                .run(huge_start(&task), c)
+                .await
+        });
+        ready_sent.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !run.is_finished(),
+            "start write did not block; the test proves nothing"
+        );
+        cancel.cancel();
+        let r = tokio::time::timeout(Duration::from_millis(500), run)
+            .await
+            .expect("cancel during a blocked start write hangs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.error_message.as_deref(), Some(CANCELLED_BEFORE_START));
+    }
+
+    #[tokio::test]
+    async fn runner_start_write_timeout_fails_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sock");
+        let _ready_sent = ready_then_deaf(&path);
+        let task = TaskId::random();
+        let mut settings = fast();
+        settings.write_timeout = Duration::from_millis(200);
+        let r = tokio::time::timeout(
+            Duration::from_secs(3),
+            TaskRunner::new(&path, 9999, task)
+                .with_settings(settings)
+                .run(huge_start(&task), CancellationToken::new()),
+        )
+        .await
+        .expect("start write is unbounded")
+        .unwrap();
+        assert_eq!(r.error_message.as_deref(), Some(START_WRITE_TIMEOUT));
     }
 
     // Cancel during a handshake the agent never answers.

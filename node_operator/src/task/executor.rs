@@ -321,7 +321,9 @@ impl TaskExecutor {
             parent: op.span(),
             success = report.success,
             pr_url = ?common::redact::OptSafeUrl(report.pr_url.as_deref()),
-            error = report.error_message.as_deref().unwrap_or("none"),
+            // The error text can come from the agent and echo secrets: it
+            // goes to the orchestrator in the result, the log keeps its size.
+            error_bytes = report.error_message.as_deref().map_or(0, str::len),
             "task completed"
         );
         lock(&self.running).remove(&task_id);

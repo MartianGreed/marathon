@@ -33,23 +33,26 @@ impl Counter {
 
 /// Counters keyed by two labels, such as `(rpc, status)`.
 #[derive(Debug, Default)]
-pub struct CounterVec(Mutex<BTreeMap<(&'static str, &'static str), u64>>);
+pub struct CounterVec(Mutex<BTreeMap<(String, String), u64>>);
 
 impl CounterVec {
     pub const fn new() -> Self {
         Self(Mutex::new(BTreeMap::new()))
     }
 
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<(&'static str, &'static str), u64>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<(String, String), u64>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn inc(&self, a: &'static str, b: &'static str) {
-        *self.lock().entry((a, b)).or_insert(0) += 1;
+    pub fn inc(&self, a: &str, b: &str) {
+        *self.lock().entry((a.to_owned(), b.to_owned())).or_insert(0) += 1;
     }
 
-    pub fn get(&self, a: &'static str, b: &'static str) -> u64 {
-        self.lock().get(&(a, b)).copied().unwrap_or(0)
+    pub fn get(&self, a: &str, b: &str) -> u64 {
+        self.lock()
+            .get(&(a.to_owned(), b.to_owned()))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// `a{b}=n` pairs, sorted, for logs.
@@ -199,6 +202,10 @@ pub struct Metrics {
     pub firecracker_api_calls: Counter,
     pub firecracker_api_errors: Counter,
     pub firecracker_api_ms: Histogram,
+    /// Firecracker API calls by `(endpoint, status)`.
+    pub firecracker_api: CounterVec,
+    /// VM lifecycle and pool operations by `(operation, outcome)`.
+    pub vm_ops: CounterVec,
     pub warm_vms: Gauge,
     pub active_vms: Gauge,
 
@@ -246,6 +253,8 @@ impl Metrics {
             firecracker_api_calls: Counter::new(),
             firecracker_api_errors: Counter::new(),
             firecracker_api_ms: Histogram::new(),
+            firecracker_api: CounterVec::new(),
+            vm_ops: CounterVec::new(),
             warm_vms: Gauge::new(),
             active_vms: Gauge::new(),
             output_buffer_depth: Gauge::new(),
@@ -285,6 +294,8 @@ impl Metrics {
             rpc_calls = %self.rpc_calls.render(),
             commands = %self.commands.render(),
             tasks = %self.tasks.render(),
+            firecracker_api = %self.firecracker_api.render(),
+            vm_ops = %self.vm_ops.render(),
             heartbeat_connect_ms = %self.heartbeat_connect_ms.render(),
             report_rpc_ms = %self.report_rpc_ms.render(),
             task_duration_ms = %self.task_duration_ms.render(),

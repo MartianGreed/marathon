@@ -12,6 +12,7 @@ use common::config::NodeOperatorConfig;
 use common::{TaskId, VmId};
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
+use tokio_util::sync::CancellationToken;
 
 use super::{api, network};
 use crate::metrics;
@@ -150,6 +151,8 @@ pub struct Vm {
     pub tap_name: Option<String>,
     pub vm_index: u32,
     pub rootfs_copy_path: Option<PathBuf>,
+    /// The `cp` used for the rootfs copy (replaced in tests).
+    cp_program: PathBuf,
 }
 
 impl std::fmt::Debug for Vm {
@@ -233,6 +236,7 @@ impl Vm {
             tap_name: None,
             vm_index: next_vm_index(),
             rootfs_copy_path: None,
+            cp_program: PathBuf::from("cp"),
         }
     }
 
@@ -248,29 +252,35 @@ impl Vm {
 
     /// Per-VM copy of the base rootfs at `<base>.<vm id>`, reflinked when
     /// the filesystem supports it.
+    ///
+    /// The copy runs as its own task. If this future is dropped (a boot
+    /// cancelled by shutdown or by a task cancel), the task kills `cp`,
+    /// waits for any fallback copy to stop, and deletes the destination,
+    /// so nothing writes the file after the VM is gone.
     async fn copy_rootfs(&mut self, base: &str) -> Result<PathBuf, VmError> {
         let dest = PathBuf::from(format!("{base}.{}", self.id));
-        let reflinked = Command::new("cp")
-            .arg("--reflink=auto")
-            .arg(base)
-            .arg(&dest)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .is_ok_and(|s| s.success());
-        if !reflinked {
-            tokio::fs::copy(base, &dest).await.map_err(|source| {
-                tracing::error!(operation = "copy_rootfs", vm_id = %self.id, dest = %dest.display(), error = %source, "failed to copy rootfs");
-                VmError::RootfsCopyFailed {
-                    dest: dest.display().to_string(),
-                    source,
-                }
-            })?;
-        }
-        tracing::info!(operation = "copy_rootfs", vm_id = %self.id, dest = %dest.display(), reflinked, "created per-VM rootfs copy");
+        // Owned from the start, so a cancelled copy is still cleaned up.
         self.rootfs_copy_path = Some(dest.clone());
+        let abandon = CancellationToken::new();
+        let guard = abandon.clone().drop_guard();
+        let job = tokio::spawn(copy_job(
+            self.cp_program.clone(),
+            PathBuf::from(base),
+            dest.clone(),
+            abandon,
+        ));
+        let outcome = job
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        guard.disarm();
+        let reflinked = outcome.map_err(|source| {
+            tracing::error!(operation = "copy_rootfs", vm_id = %self.id, dest = %dest.display(), error = %source, "failed to copy rootfs");
+            VmError::RootfsCopyFailed {
+                dest: dest.display().to_string(),
+                source,
+            }
+        })?;
+        tracing::info!(operation = "copy_rootfs", vm_id = %self.id, task_id = ?self.task_id, node_id = %crate::identity::label(), dest = %dest.display(), reflinked, "created per-VM rootfs copy");
         Ok(dest)
     }
 
@@ -375,8 +385,8 @@ impl Vm {
     /// Cold boot: copy the rootfs, spawn Firecracker, configure it through
     /// its API and wait for the guest's vsock socket.
     pub async fn start(&mut self, config: &VmConfig) -> Result<(), VmError> {
-        let op = common::telemetry::Operation::start("vm_start");
-        tracing::info!(parent: op.span(), vm_id = %self.id, vm_index = self.vm_index, "starting VM (cold start)");
+        let op = common::telemetry::Operation::start("vm_start").node_id(&crate::identity::label());
+        tracing::info!(parent: op.span(), vm_id = %self.id, vm_index = self.vm_index, task_id = ?self.task_id, "starting VM (cold start)");
         let m = metrics::global();
         match self.start_inner(config).await {
             Ok(()) => {
@@ -384,6 +394,7 @@ impl Vm {
                 self.start_time = Some(Instant::now());
                 tracing::info!(parent: op.span(), vm_id = %self.id, cid = self.vsock_cid, "VM started");
                 m.vm_boots.inc();
+                m.vm_ops.inc("start", "ok");
                 m.vm_boot_ms.observe_ms(op.finish());
                 Ok(())
             }
@@ -391,6 +402,7 @@ impl Vm {
                 self.kill_process().await;
                 self.state = VmState::Failed;
                 m.vm_boot_failures.inc();
+                m.vm_ops.inc("start", "failed");
                 op.fail(&e);
                 Err(e)
             }
@@ -514,7 +526,8 @@ impl Vm {
         }
         let _ = std::fs::remove_file(&probe);
 
-        let op = common::telemetry::Operation::start("vm_restore");
+        let op =
+            common::telemetry::Operation::start("vm_restore").node_id(&crate::identity::label());
         tracing::info!(parent: op.span(), vm_id = %self.id, snapshot = %base.path.display(), "starting VM from snapshot");
         let _ = std::fs::remove_file(&self.socket_path);
         let _ = std::fs::remove_file(&self.vsock_uds_path);
@@ -585,7 +598,8 @@ impl Vm {
             network::destroy_tap(&tap);
         }
         self.state = VmState::Stopped;
-        tracing::debug!(operation = "vm_stop", vm_id = %self.id, "VM stopped");
+        metrics::global().vm_ops.inc("stop", "ok");
+        tracing::debug!(operation = "vm_stop", vm_id = %self.id, task_id = ?self.task_id, node_id = %crate::identity::label(), "VM stopped");
     }
 
     pub fn assign_task(&mut self, task_id: TaskId) {
@@ -628,6 +642,56 @@ impl Drop for Vm {
             tracing::warn!(vm_id = %self.id, path = %path.display(), error = %e, "failed to delete VM rootfs copy");
         }
     }
+}
+
+/// Copy `base` to `dest`: `cp --reflink=auto`, else a plain copy. Returns
+/// whether `cp` did it. When `abandon` fires, `cp` is killed and reaped,
+/// a running fallback copy is waited for, and `dest` is deleted.
+async fn copy_job(
+    cp: PathBuf,
+    base: PathBuf,
+    dest: PathBuf,
+    abandon: CancellationToken,
+) -> std::io::Result<bool> {
+    let abandoned = |dest: &Path| {
+        let _ = std::fs::remove_file(dest);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "rootfs copy abandoned",
+        ))
+    };
+    let spawned = Command::new(&cp)
+        .arg("--reflink=auto")
+        .arg(&base)
+        .arg(&dest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
+    let reflinked = match spawned {
+        Ok(mut child) => tokio::select! {
+            status = child.wait() => status.is_ok_and(|s| s.success()),
+            () = abandon.cancelled() => {
+                let _ = child.kill().await;
+                return abandoned(&dest);
+            }
+        },
+        Err(_) => false,
+    };
+    if abandon.is_cancelled() {
+        return abandoned(&dest);
+    }
+    if !reflinked {
+        // Not cancellable mid-way (it runs on a blocking thread); wait for
+        // it and clean up afterwards instead.
+        let copied = tokio::fs::copy(&base, &dest).await;
+        if abandon.is_cancelled() {
+            return abandoned(&dest);
+        }
+        copied?;
+    }
+    Ok(reflinked)
 }
 
 fn is_socket(path: &Path) -> bool {
@@ -810,6 +874,55 @@ mod tests {
         assert_eq!(copy, PathBuf::from(format!("{}.{}", base.display(), vm.id)));
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), "root filesystem");
         assert_eq!(vm.rootfs_copy_path.as_deref(), Some(copy.as_path()));
+    }
+
+    /// An executable `cp` stand-in: `cp --reflink=auto <base> <dest>`.
+    fn fake_cp(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-cp");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    // C-R2-02: a cancelled copy stops `cp` and leaves no file behind.
+    #[tokio::test]
+    async fn cancelled_rootfs_copy_leaves_nothing() {
+        let dir = short_dir();
+        let base = dir.path().join("rootfs.ext4");
+        std::fs::write(&base, "root").unwrap();
+        let mut vm = Vm::in_dir(dir.path());
+        vm.cp_program = fake_cp(
+            dir.path(),
+            r#"printf partial > "$3"; sleep 1; printf late >> "$3""#,
+        );
+        let dest = PathBuf::from(format!("{}.{}", base.display(), vm.id));
+        let base_str = base.display().to_string();
+        let r = tokio::time::timeout(Duration::from_millis(200), vm.copy_rootfs(&base_str)).await;
+        assert!(
+            r.is_err(),
+            "copy finished before the cancel; the test proves nothing"
+        );
+        drop(vm);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !dest.exists(),
+            "rootfs copy written or left after cancel: {:?}",
+            std::fs::read_to_string(&dest)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cp_falls_back_to_plain_copy() {
+        let dir = short_dir();
+        let base = dir.path().join("rootfs.ext4");
+        std::fs::write(&base, "root filesystem").unwrap();
+        let mut vm = Vm::in_dir(dir.path());
+        vm.cp_program = fake_cp(dir.path(), "exit 1");
+        let copy = vm.copy_rootfs(&base.display().to_string()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "root filesystem");
+        drop(vm);
+        assert!(!copy.exists(), "dropping the VM deletes its copy");
     }
 
     #[tokio::test]

@@ -198,6 +198,7 @@ pub async fn call_with_timeout(
     let elapsed = started.elapsed();
     m.firecracker_api_ms.observe(elapsed);
     let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    m.firecracker_api.inc(endpoint, api_status(&result));
     match &result {
         Ok(()) => tracing::debug!(
             operation = "firecracker_api",
@@ -220,6 +221,19 @@ pub async fn call_with_timeout(
         }
     }
     result
+}
+
+/// Metric label for an API call outcome.
+fn api_status(result: &Result<(), ApiError>) -> &'static str {
+    match result {
+        Ok(()) => "ok",
+        Err(ApiError::Connect { .. }) => "connect_error",
+        Err(ApiError::RequestTooLarge(_)) => "request_too_large",
+        Err(ApiError::Request(_) | ApiError::Response(_)) => "io_error",
+        Err(ApiError::EmptyResponse | ApiError::MalformedResponse) => "bad_response",
+        Err(ApiError::Timeout) => "timeout",
+        Err(ApiError::Failed { .. }) => "rejected",
+    }
 }
 
 async fn call_inner(
@@ -513,6 +527,23 @@ mod tests {
                 "/machine-config",
                 r#"{"vcpu_count":2,"mem_size_mib":512}"#
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn calls_are_counted_by_endpoint_and_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = metrics::global();
+        let ok_before = m.firecracker_api.get("/test-counted", "ok");
+        let err_before = m.firecracker_api.get("/test-counted", "connect_error");
+        let _ = call(&dir.path().join("none.sock"), "PUT", "/test-counted", "{}").await;
+        let sock = dir.path().join("api.sock");
+        let _fake = FakeApi::ok(&sock);
+        call(&sock, "PUT", "/test-counted", "{}").await.unwrap();
+        assert_eq!(m.firecracker_api.get("/test-counted", "ok"), ok_before + 1);
+        assert_eq!(
+            m.firecracker_api.get("/test-counted", "connect_error"),
+            err_before + 1
         );
     }
 

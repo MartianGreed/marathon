@@ -274,7 +274,12 @@ impl VmPool {
     /// Take a warm VM, if any.
     pub fn acquire(&self) -> Option<VmLease> {
         let mut s = self.lock();
-        let vm = s.warm.pop()?;
+        let Some(vm) = s.warm.pop() else {
+            metrics::global().vm_ops.inc("acquire", "empty");
+            return None;
+        };
+        metrics::global().vm_ops.inc("acquire", "warm");
+        tracing::debug!(operation = "acquire_vm", vm_id = %vm.id, node_id = %crate::identity::label(), "warm VM acquired");
         let lease = VmLease::of(&vm);
         s.active.insert(vm.id, vm);
         Self::update_gauges(&s);
@@ -286,17 +291,20 @@ impl VmPool {
         if let Some(lease) = self.acquire() {
             return Ok(lease);
         }
-        let slot = self
-            .reserve(|_| true)
-            .ok_or(PoolError::NoSlots(self.config.total_vm_slots))?;
+        let Some(slot) = self.reserve(|_| true) else {
+            metrics::global().vm_ops.inc("acquire", "no_slots");
+            return Err(PoolError::NoSlots(self.config.total_vm_slots));
+        };
         tracing::info!(
             operation = "acquire_vm",
             "no warm VMs available, creating on-demand"
         );
         let vm = self.boot(&slot).await.map_err(|e| {
             tracing::error!(operation = "acquire_vm", error = %e, "failed to start on-demand VM");
+            metrics::global().vm_ops.inc("acquire", "launch_failed");
             PoolError::LaunchFailed(e.to_string())
         })?;
+        metrics::global().vm_ops.inc("acquire", "on_demand");
         let lease = VmLease::of(&vm);
         let kept = self.keep(vm, Into::Active);
         // Drop the booting slot only after the VM is counted as active, so
@@ -334,8 +342,11 @@ impl VmPool {
             vm
         };
         let Some(mut vm) = vm else {
+            tracing::debug!(operation = "release_vm", vm_id = %vm_id, "release of unknown VM ignored");
             return;
         };
+        tracing::debug!(operation = "release_vm", vm_id = %vm_id, task_id = ?vm.task_id, node_id = %crate::identity::label(), "destroying used VM");
+        metrics::global().vm_ops.inc("release", "destroyed");
         vm.stop().await;
         drop(vm);
 
@@ -347,11 +358,13 @@ impl VmPool {
         };
         match self.boot(&slot).await {
             Ok(vm) => {
+                metrics::global().vm_ops.inc("replenish", "ok");
                 if let Some(mut vm) = self.keep(vm, Into::Warm) {
                     vm.stop().await;
                 }
             }
             Err(e) => {
+                metrics::global().vm_ops.inc("replenish", "failed");
                 tracing::warn!(operation = "replenish_pool", error = %e, "failed to replenish warm pool")
             }
         }
@@ -751,6 +764,53 @@ mod tests {
         assert!(matches!(r, Err(PoolError::LaunchFailed(_))), "{r:?}");
         assert_eq!(p.total_count(), 0);
         assert!(p.is_closing());
+    }
+
+    // N01: a boot that completes after closing is not kept.
+    #[tokio::test]
+    async fn closing_pool_refuses_a_completed_boot() {
+        let p = pool(false, 4, 0);
+        p.lock().closing = true;
+        let refused = p.keep(ready_vm(), Into::Warm);
+        assert!(refused.is_some(), "a closing pool kept a VM");
+        let refused = p.keep(ready_vm(), Into::Active);
+        assert!(refused.is_some(), "a closing pool kept a VM");
+        assert_eq!(p.total_count(), 0);
+    }
+
+    // N04: shutdown does not return while a slot is still reserved.
+    #[tokio::test]
+    async fn shutdown_waits_for_reserved_slots() {
+        let p = Arc::new(pool(false, 4, 0));
+        let slot_released = Arc::new(tokio::sync::Notify::new());
+        let reserved = Arc::new(tokio::sync::Notify::new());
+        let holder = {
+            let p = p.clone();
+            let slot_released = slot_released.clone();
+            let reserved = reserved.clone();
+            tokio::spawn(async move {
+                let slot = p.reserve(|_| true).expect("slot");
+                reserved.notify_one();
+                slot_released.notified().await;
+                drop(slot);
+            })
+        };
+        reserved.notified().await;
+        let shutting = {
+            let p = p.clone();
+            tokio::spawn(async move { p.shutdown().await })
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !shutting.is_finished(),
+            "shutdown returned while a slot was reserved"
+        );
+        slot_released.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), shutting)
+            .await
+            .expect("shutdown did not finish after the slot was released")
+            .unwrap();
+        holder.await.unwrap();
     }
 
     #[test]

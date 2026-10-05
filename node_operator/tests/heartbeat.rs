@@ -65,6 +65,8 @@ struct FakeOrchestrator {
     failed_results: Arc<AtomicUsize>,
     /// Delay every `ReportTaskResult` before accepting it.
     result_delay: Arc<Mutex<Duration>>,
+    /// `ReportTaskResult` calls received (accepted or not).
+    result_requests: Arc<AtomicUsize>,
 }
 
 impl FakeOrchestrator {
@@ -78,6 +80,7 @@ impl FakeOrchestrator {
             fail_next_result: Arc::default(),
             failed_results: Arc::default(),
             result_delay: Arc::default(),
+            result_requests: Arc::default(),
         }
     }
 
@@ -161,6 +164,7 @@ impl NodeService for FakeOrchestrator {
             self.log.lock().unwrap().push(Event::ReportRejected);
             return Err(s);
         }
+        self.result_requests.fetch_add(1, Ordering::SeqCst);
         if self.fail_next_result.swap(false, Ordering::SeqCst) {
             self.failed_results.fetch_add(1, Ordering::SeqCst);
             return Err(Status::unavailable("injected report failure"));
@@ -366,6 +370,7 @@ fn start_node_with(port: u16, key: Option<&str>, log: &Log, settings: HeartbeatS
                 connect_delay: Duration::from_millis(20),
                 handshake_timeout: Duration::from_secs(2),
                 ready_timeout: Duration::from_secs(2),
+                write_timeout: Duration::from_secs(2),
                 cancel_grace: Duration::from_secs(5),
             },
         },
@@ -919,4 +924,82 @@ async fn drain_preserves_the_running_task() {
     assert_eq!(r.error_message.as_deref(), Some("Task cancelled by user"));
     node.stop().await;
     server.abort();
+}
+
+// N06: a task started outside a heartbeat command still shortens a pending
+// idle wait (the loop wakes on its own, not only on stream traffic).
+#[tokio::test]
+async fn task_started_between_heartbeats_shortens_the_idle_wait() {
+    let log: Log = Arc::default();
+    let listener = bind(false).await;
+    let port = listener.local_addr().unwrap().port();
+    let orch = FakeOrchestrator::new(Some(KEY), log.clone());
+    let server = serve(listener, orch.clone());
+    let settings = HeartbeatSettings {
+        interval: Duration::from_millis(2000),
+        active_interval_cap: Duration::from_millis(100),
+        ..fast_settings()
+    };
+    let node = start_node_with(port, key(), &log, settings);
+    wait_for(&log, "registration", |ev| {
+        ev.iter()
+            .any(|e| matches!(e, Event::Heartbeat { .. }))
+            .then_some(())
+    })
+    .await;
+    // Past the registration answer: nothing else arrives on the stream.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let task = TaskId::random();
+    let Command::ExecuteTask(req) = execute(&task, "wait-for-cancel") else {
+        unreachable!()
+    };
+    node.executor.execute_task(req).unwrap();
+    let started = tokio::time::Instant::now();
+    wait_for(&log, "active heartbeat", |ev| {
+        ev.iter()
+            .any(|e| matches!(e, Event::Heartbeat { status, .. } if status.active_task_ids.contains(&task.to_hex())))
+            .then_some(())
+    })
+    .await;
+    let took = started.elapsed();
+    node.executor.cancel_task(&task.to_hex());
+    node.stop().await;
+    server.abort();
+    assert!(
+        took < Duration::from_millis(700),
+        "active heartbeat after {took:?}; the 2 s idle wait was not shortened"
+    );
+}
+
+// N08: stopping while a result report is in flight finishes that report;
+// the result is delivered exactly once.
+#[tokio::test]
+async fn stop_during_inflight_report_delivers_the_result_once() {
+    let log: Log = Arc::default();
+    let listener = bind(false).await;
+    let port = listener.local_addr().unwrap().port();
+    let orch = FakeOrchestrator::new(Some(KEY), log.clone());
+    *orch.result_delay.lock().unwrap() = Duration::from_millis(600);
+    let server = serve(listener, orch.clone());
+    let node = start_node(port, key(), &log);
+    let task = TaskId::random();
+    orch.push(execute(&task, "complete"));
+    let requests = orch.result_requests.clone();
+    wait_for(&log, "report in flight", |_| {
+        (requests.load(Ordering::SeqCst) >= 1).then_some(())
+    })
+    .await;
+    assert!(result_for(&log.lock().unwrap(), &task).is_none());
+    node.stop().await;
+    let accepted = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, Event::Results(r) if r.iter().any(|r| r.task_id == task.to_hex())))
+        .count();
+    server.abort();
+    assert_eq!(
+        accepted, 1,
+        "the in-flight result was not delivered exactly once"
+    );
 }

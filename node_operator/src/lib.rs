@@ -9,9 +9,10 @@
 //! - [`vsock`]: the host side of the conversation with the VM agent.
 //! - [`vm`]: Firecracker API, VM lifecycle, TAP networking, warm pool.
 //! - [`snapshot`]: snapshots on disk.
-//! - [`metrics`], [`trace`]: observability.
+//! - [`metrics`], [`trace`], [`identity`]: observability.
 
 pub mod heartbeat;
+pub mod identity;
 pub mod metrics;
 pub mod snapshot;
 pub mod task;

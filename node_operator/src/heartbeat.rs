@@ -226,6 +226,7 @@ impl HeartbeatClient {
     ) -> Self {
         let node_id = resolve_node_id(config);
         executor.set_node_id(node_id);
+        crate::identity::set(node_id);
         Self {
             target: OrchestratorTarget {
                 address: config.orchestrator_address.clone(),
