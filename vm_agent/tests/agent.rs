@@ -598,3 +598,186 @@ exit 1
         assert!(!r.tmp.path().join(path).exists());
     }
 }
+
+struct SingleListener<S>(Option<S>);
+
+impl<S: marathon_vm_agent::transport::AgentStream + 'static> marathon_vm_agent::transport::Listener
+    for SingleListener<S>
+{
+    type Stream = S;
+
+    async fn accept(&mut self) -> std::io::Result<(S, u32)> {
+        self.0
+            .take()
+            .map(|stream| (stream, 7))
+            .ok_or_else(|| std::io::Error::other("No more connections"))
+    }
+}
+
+fn launch_stream<S: marathon_vm_agent::transport::AgentStream + 'static>(
+    script: &str,
+    strategy: CleanupStrategy,
+    stream: S,
+) -> (TempDir, Arc<Registry>, JoinHandle<std::io::Result<()>>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let executable = tmp.path().join("claude");
+    std::fs::write(&executable, format!("#!/bin/sh\n{script}\n")).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::create_dir_all(tmp.path().join("work")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("cache")).unwrap();
+    std::fs::write(tmp.path().join("credentials"), "fake credential").unwrap();
+    let registry = Arc::new(Registry::default());
+    let agent = Agent {
+        config: VmAgentConfig {
+            claude_code_path: executable.to_string_lossy().into(),
+            work_dir: tmp.path().join("work").to_string_lossy().into(),
+            ..Default::default()
+        },
+        preparer: StubRepo { fail: false },
+        cleanup: Cleanup {
+            strategy,
+            cache_path: tmp.path().join("cache"),
+            credentials_path: tmp.path().join("credentials"),
+        },
+        run_as_marathon: false,
+        registry: registry.clone(),
+    };
+    let handle = tokio::spawn(async move { agent.serve(SingleListener(Some(stream))).await });
+    (tmp, registry, handle)
+}
+
+#[tokio::test]
+async fn slow_host_receives_every_output_byte_metrics_and_complete() {
+    // Adapted from verify-r2/slow_host_scratch.rs: backpressure must not lose frames.
+    let (guest, mut host) = tokio::io::duplex(1024);
+    let script = r#"head -c 163840 /dev/zero | tr '\0' a"#;
+    let (_tmp, registry, handle) = launch_stream(script, CleanupStrategy::None, guest);
+    assert!(matches!(receive(&mut host).await, Payload::Ready(_)));
+    send_frame(&mut host, Payload::Start(start(None, 1))).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    bounded(async {
+        assert!(matches!(receive(&mut host).await, Payload::Progress(p) if p.iteration == 1));
+        let mut output = Vec::new();
+        loop {
+            match receive(&mut host).await {
+                Payload::Output(chunk) => {
+                    assert_eq!(chunk.r#type, common::pb::OutputType::Stdout as i32);
+                    output.extend_from_slice(&chunk.data);
+                }
+                Payload::Metrics(metrics) => {
+                    assert_eq!(output, vec![b'a'; 163840]);
+                    assert_eq!(metrics, totals(0, 0, 0, 0));
+                    break;
+                }
+                other => panic!("Unexpected frame before Metrics: {other:?}"),
+            }
+        }
+        match receive(&mut host).await {
+            Payload::Complete(c) => {
+                assert_eq!(c.iteration, 1);
+                assert_eq!(c.exit_code, 0);
+                assert_eq!(c.metrics, Some(totals(0, 0, 0, 0)));
+            }
+            other => panic!("Expected Complete after Metrics: {other:?}"),
+        }
+    })
+    .await;
+    bounded(handle).await.unwrap().unwrap();
+    assert_eq!(registry.error_count("host_disconnected"), 0);
+}
+
+#[tokio::test]
+async fn normal_close_during_full_cleanup_is_not_a_disconnect() {
+    let (guest, mut host) = tokio::io::duplex(1024);
+    let (tmp, registry, handle) = launch_stream("exit 0", CleanupStrategy::Full, guest);
+    for n in 0..5000 {
+        std::fs::write(tmp.path().join("work").join(format!("file-{n}")), "data").unwrap();
+    }
+    assert!(matches!(receive(&mut host).await, Payload::Ready(_)));
+    send_frame(&mut host, Payload::Start(start(None, 1))).await;
+    bounded(async {
+        loop {
+            if matches!(receive(&mut host).await, Payload::Complete(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+    drop(host);
+    bounded(handle).await.unwrap().unwrap();
+    assert_eq!(registry.error_count("host_disconnected"), 0);
+    assert!(!tmp.path().join("work").exists());
+}
+
+#[tokio::test]
+async fn writer_failure_with_reader_open_is_counted_once() {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{DuplexStream, ReadBuf};
+
+    struct WriteFailure {
+        stream: DuplexStream,
+        writes: usize,
+    }
+
+    impl AsyncRead for WriteFailure {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for WriteFailure {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            // Ready succeeds; the first post-Start write fails. Host reads stay open.
+            if this.writes > 0 {
+                return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            }
+            let result = Pin::new(&mut this.stream).poll_write(cx, buf);
+            if matches!(result, Poll::Ready(Ok(_))) {
+                this.writes += 1;
+            }
+            result
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+        }
+    }
+
+    let (guest, mut host) = tokio::io::duplex(1024);
+    let script = "printf x >> counter; sleep 0.1; exit 1";
+    let (tmp, registry, handle) = launch_stream(
+        script,
+        CleanupStrategy::None,
+        WriteFailure {
+            stream: guest,
+            writes: 0,
+        },
+    );
+    assert!(matches!(receive(&mut host).await, Payload::Ready(_)));
+    send_frame(&mut host, Payload::Start(start(Some("DONE"), 5))).await;
+    bounded(handle).await.unwrap().unwrap();
+    // Keep host alive through completion: the inbound reader never sees EOF.
+    assert_eq!(registry.error_count("host_disconnected"), 1);
+    let runs = std::fs::read(tmp.path().join("work/counter"))
+        .unwrap_or_default()
+        .len();
+    assert!(runs <= 1, "Claude ran {runs} times");
+    drop(host);
+}

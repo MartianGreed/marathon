@@ -201,17 +201,19 @@ impl<P: RepoPreparer> Agent<P> {
             self.run_task(&task, &tx, &cancelled, &disconnected)
                 .instrument(op.span().clone())
                 .await;
+            reader_task.abort();
+            let _ = reader_task.await;
+            // Ignore a normal host close after the task ends, while cleanup runs.
+            let task_disconnected = disconnected.load(Ordering::Acquire);
             self.cleanup
                 .execute(Path::new(&self.config.work_dir), &task.task_id)
                 .await;
-            reader_task.abort();
-            let _ = reader_task.await;
             drop(tx);
-            if disconnected.load(Ordering::Acquire) {
+            if task_disconnected {
                 writer_task.abort();
             }
             let _ = writer_task.await;
-            if disconnected.load(Ordering::Acquire) {
+            if task_disconnected {
                 self.registry.error("host_disconnected");
                 tracing::warn!(
                     operation = "task",
@@ -256,10 +258,6 @@ impl<P: RepoPreparer> Agent<P> {
         let mut cumulative = UsageMetrics::default();
         let mut last_output = Vec::new();
         for iteration in 1..=max {
-            if disconnected.load(Ordering::Acquire) || tx.is_closed() {
-                disconnected.store(true, Ordering::Release);
-                return;
-            }
             if cancelled.load(Ordering::Acquire) {
                 send_error(
                     tx,
@@ -289,7 +287,6 @@ impl<P: RepoPreparer> Agent<P> {
                 )
                 .await;
                 if !sent || disconnected.load(Ordering::Acquire) {
-                    disconnected.store(true, Ordering::Release);
                     return true;
                 }
                 let prompt = if iteration == 1 {
@@ -316,7 +313,6 @@ impl<P: RepoPreparer> Agent<P> {
                 if disconnected.load(Ordering::Acquire)
                     || !send(tx, Payload::Metrics(wire_metrics(cumulative))).await
                 {
-                    disconnected.store(true, Ordering::Release);
                     return true;
                 }
                 let signals = parse_signals(

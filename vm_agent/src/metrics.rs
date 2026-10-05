@@ -63,6 +63,16 @@ impl Registry {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Return the recorded count for an error code, or zero if absent.
+    pub fn error_count(&self, code: &str) -> u64 {
+        self.errors
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(code)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// Record a duration in milliseconds for an operation.
     pub fn observe(&self, operation: &'static str, ms: u64) {
         self.durations
