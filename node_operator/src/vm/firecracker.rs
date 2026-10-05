@@ -153,6 +153,8 @@ pub struct Vm {
     pub rootfs_copy_path: Option<PathBuf>,
     /// The `cp` used for the rootfs copy (replaced in tests).
     cp_program: PathBuf,
+    /// Where this VM's rootfs copy jobs are counted (its pool's tracker).
+    copy_jobs: Arc<CopyJobs>,
 }
 
 impl std::fmt::Debug for Vm {
@@ -237,7 +239,13 @@ impl Vm {
             vm_index: next_vm_index(),
             rootfs_copy_path: None,
             cp_program: PathBuf::from("cp"),
+            copy_jobs: Arc::new(CopyJobs::new()),
         }
+    }
+
+    /// Count this VM's rootfs copy jobs in `jobs` (its pool's tracker).
+    pub fn track_copy_jobs(&mut self, jobs: Arc<CopyJobs>) {
+        self.copy_jobs = jobs;
     }
 
     pub fn has_process(&self) -> bool {
@@ -268,6 +276,7 @@ impl Vm {
             PathBuf::from(base),
             dest.clone(),
             abandon,
+            self.copy_jobs.clone(),
         ));
         let outcome = job
             .await
@@ -644,20 +653,46 @@ impl Drop for Vm {
     }
 }
 
-/// Rootfs copy jobs still running, joined by [`wait_for_copy_jobs`].
-static COPY_JOBS: AtomicU32 = AtomicU32::new(0);
-static COPY_JOBS_IDLE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+/// Rootfs copy jobs still running (including their cleanup) for one owner:
+/// a pool shares one with all its VMs, so its shutdown joins only its own.
+#[derive(Debug, Default)]
+pub struct CopyJobs {
+    count: AtomicU32,
+    idle: tokio::sync::Notify,
+}
 
-/// Wait until no rootfs copy job (or its cleanup) is running.
-pub async fn wait_for_copy_jobs() {
-    loop {
-        let idle = COPY_JOBS_IDLE.notified();
-        tokio::pin!(idle);
-        idle.as_mut().enable();
-        if COPY_JOBS.load(Ordering::SeqCst) == 0 {
-            return;
+impl CopyJobs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Jobs currently running.
+    pub fn active(&self) -> u32 {
+        self.count.load(Ordering::SeqCst)
+    }
+
+    /// Wait until none of these jobs is running.
+    pub async fn wait_idle(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            // Register before checking, so a job ending in between still
+            // wakes us.
+            idle.as_mut().enable();
+            if self.active() == 0 {
+                return;
+            }
+            idle.await;
         }
-        idle.await;
+    }
+
+    fn start(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn end(&self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        self.idle.notify_waiters();
     }
 }
 
@@ -668,15 +703,17 @@ pub async fn wait_for_copy_jobs() {
 struct CopyJobGuard {
     dest: PathBuf,
     abandon: CancellationToken,
+    jobs: Arc<CopyJobs>,
     finished: bool,
 }
 
 impl CopyJobGuard {
-    fn new(dest: PathBuf, abandon: CancellationToken) -> Self {
-        COPY_JOBS.fetch_add(1, Ordering::SeqCst);
+    fn new(dest: PathBuf, abandon: CancellationToken, jobs: Arc<CopyJobs>) -> Self {
+        jobs.start();
         Self {
             dest,
             abandon,
+            jobs,
             finished: false,
         }
     }
@@ -687,8 +724,7 @@ impl Drop for CopyJobGuard {
         if !self.finished || self.abandon.is_cancelled() {
             let _ = std::fs::remove_file(&self.dest);
         }
-        COPY_JOBS.fetch_sub(1, Ordering::SeqCst);
-        COPY_JOBS_IDLE.notify_waiters();
+        self.jobs.end();
     }
 }
 
@@ -701,10 +737,21 @@ fn abandoned_error() -> std::io::Error {
 /// a copy that only starts or ends after its async job is gone (runtime
 /// shutdown) still leaves nothing behind.
 fn blocking_copy(base: &Path, dest: &Path, abandon: &CancellationToken) -> std::io::Result<()> {
+    blocking_copy_with(base, dest, abandon, |b, d| std::fs::copy(b, d))
+}
+
+/// [`blocking_copy`] with the copy itself injected (tests cancel from
+/// inside it to hit the window after copying).
+fn blocking_copy_with(
+    base: &Path,
+    dest: &Path,
+    abandon: &CancellationToken,
+    copy: impl FnOnce(&Path, &Path) -> std::io::Result<u64>,
+) -> std::io::Result<()> {
     if abandon.is_cancelled() {
         return Err(abandoned_error());
     }
-    let copied = std::fs::copy(base, dest);
+    let copied = copy(base, dest);
     if abandon.is_cancelled() {
         let _ = std::fs::remove_file(dest);
         return Err(abandoned_error());
@@ -721,8 +768,9 @@ async fn copy_job(
     base: PathBuf,
     dest: PathBuf,
     abandon: CancellationToken,
+    jobs: Arc<CopyJobs>,
 ) -> std::io::Result<bool> {
-    let mut guard = CopyJobGuard::new(dest.clone(), abandon.clone());
+    let mut guard = CopyJobGuard::new(dest.clone(), abandon.clone(), jobs);
     let abandoned = |dest: &Path| {
         let _ = std::fs::remove_file(dest);
         Err(abandoned_error())
@@ -990,7 +1038,8 @@ mod tests {
         let dir = short_dir();
         let base = dir.path().join("rootfs.ext4");
         std::fs::write(&base, "rootfs").unwrap();
-        let cp = fake_cp(dir.path(), "exit 1");
+        // A missing `cp` fails to spawn at once: the fallback always runs.
+        let cp = dir.path().join("no-such-cp");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .max_blocking_threads(1)
@@ -1056,27 +1105,208 @@ mod tests {
         );
     }
 
+    /// Boots "VMs" by copying their rootfs with a given `cp`, nothing more.
+    struct CopyingLauncher {
+        dir: PathBuf,
+        cp: PathBuf,
+        base: PathBuf,
+    }
+
+    impl crate::vm::VmLauncher for CopyingLauncher {
+        fn launch<'a>(
+            &'a self,
+            vm: &'a mut Vm,
+        ) -> futures::future::BoxFuture<'a, Result<(), VmError>> {
+            Box::pin(async move {
+                vm.copy_rootfs(&self.base.display().to_string()).await?;
+                vm.mark_ready();
+                Ok(())
+            })
+        }
+
+        fn create(&self) -> Vm {
+            let mut vm = Vm::in_dir(&self.dir);
+            vm.cp_program = self.cp.clone();
+            vm
+        }
+    }
+
+    fn copying_pool(dir: &Path, cp: PathBuf, base: PathBuf) -> Arc<crate::vm::VmPool> {
+        Arc::new(crate::vm::VmPool::new(
+            Arc::new(CopyingLauncher {
+                dir: dir.to_path_buf(),
+                cp,
+                base,
+            }),
+            crate::vm::PoolConfig {
+                total_vm_slots: 2,
+                warm_pool_target: 0,
+            },
+        ))
+    }
+
+    fn copies_left(dir: &Path, base: &Path) -> Vec<String> {
+        let prefix = format!("{}.", base.file_name().unwrap().to_string_lossy());
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&prefix))
+            .collect()
+    }
+
+    // C-R4-01: an unrelated pool's copy job does not hold up shutdown.
     #[tokio::test]
-    async fn pool_shutdown_waits_for_copy_jobs() {
+    async fn pool_shutdown_ignores_other_pools_copy_jobs() {
         let dir = short_dir();
         let base = dir.path().join("rootfs.ext4");
         std::fs::write(&base, "root").unwrap();
-        let mut vm = Vm::in_dir(dir.path());
-        vm.cp_program = fake_cp(
-            dir.path(),
-            r#"printf partial > "$3"; sleep 1; printf late >> "$3""#,
-        );
-        let copy = tokio::spawn(async move {
-            let base = base.display().to_string();
-            let _ = vm.copy_rootfs(&base).await;
-            vm
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(COPY_JOBS.load(Ordering::SeqCst) >= 1);
-        copy.abort();
-        tokio::time::timeout(Duration::from_secs(3), wait_for_copy_jobs())
+        let cp = fake_cp(dir.path(), r#"printf partial > "$3"; exec sleep 10"#);
+        let busy = copying_pool(dir.path(), cp, base.clone());
+        let acquiring = {
+            let busy = busy.clone();
+            tokio::spawn(async move { busy.acquire_or_create().await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while busy.copy_jobs().active() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("copy job never started");
+
+        let idle = Arc::new(crate::vm::pool::testing::pool(false, 2, 0));
+        tokio::time::timeout(Duration::from_millis(500), idle.shutdown())
             .await
-            .expect("copy jobs never finished");
+            .expect("an idle pool's shutdown waited for another pool's copy job");
+
+        tokio::time::timeout(Duration::from_secs(3), busy.shutdown())
+            .await
+            .expect("the busy pool's shutdown hangs");
+        assert!(acquiring.await.unwrap().is_err());
+        assert_eq!(busy.copy_jobs().active(), 0);
+        assert!(copies_left(dir.path(), &base).is_empty());
+    }
+
+    // D04: shutdown waits for its own copy cleanup, here a fallback copy
+    // queued behind a held blocking thread.
+    #[test]
+    fn pool_shutdown_joins_its_own_copy_cleanup() {
+        let dir = short_dir();
+        let base = dir.path().join("rootfs.ext4");
+        std::fs::write(&base, "rootfs").unwrap();
+        // A missing `cp` fails to spawn at once: the fallback always queues.
+        let cp = dir.path().join("no-such-cp");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let _hold = tokio::task::spawn_blocking(move || {
+                let _ = held.recv();
+            });
+            let pool = copying_pool(dir.path(), cp, base.clone());
+            let acquiring = {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.acquire_or_create().await })
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while pool.copy_jobs().active() == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("copy job never started");
+            // Let `cp` fail and the fallback queue behind the held thread.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let shutting = {
+                let pool = pool.clone();
+                tokio::spawn(async move { pool.shutdown().await })
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                !shutting.is_finished(),
+                "shutdown returned while its copy cleanup was still pending"
+            );
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), shutting)
+                .await
+                .expect("shutdown hangs after the cleanup can run")
+                .unwrap();
+            assert!(acquiring.await.unwrap().is_err());
+            assert_eq!(pool.copy_jobs().active(), 0);
+            assert!(copies_left(dir.path(), &base).is_empty());
+        });
+    }
+
+    // D01: an abandoned copy that has not started never touches the
+    // destination.
+    #[test]
+    fn abandoned_blocking_copy_does_not_start() {
+        let dir = short_dir();
+        let base = dir.path().join("base");
+        let dest = dir.path().join("dest");
+        std::fs::write(&base, "new").unwrap();
+        std::fs::write(&dest, "keep").unwrap();
+        let abandon = CancellationToken::new();
+        abandon.cancel();
+        let err = blocking_copy(&base, &dest, &abandon).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "keep");
+    }
+
+    // D02: an abandon that lands while copying deletes what was written.
+    #[test]
+    fn blocking_copy_abandoned_during_copy_cleans_up() {
+        let dir = short_dir();
+        let base = dir.path().join("base");
+        let dest = dir.path().join("dest");
+        std::fs::write(&base, "rootfs").unwrap();
+        let abandon = CancellationToken::new();
+        let during = abandon.clone();
+        let err = blocking_copy_with(&base, &dest, &abandon, |b, d| {
+            let n = std::fs::copy(b, d);
+            during.cancel();
+            n
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert!(!dest.exists());
+    }
+
+    // D03: the guard keeps only a finished, not abandoned copy, and always
+    // ends its job.
+    #[test]
+    fn copy_job_guard_cleanup_rules() {
+        let dir = short_dir();
+        let jobs = Arc::new(CopyJobs::new());
+        let cases = [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+            (false, true, false),
+        ];
+        for (finished, abandoned, kept) in cases {
+            let dest = dir.path().join("dest");
+            std::fs::write(&dest, "x").unwrap();
+            let abandon = CancellationToken::new();
+            if abandoned {
+                abandon.cancel();
+            }
+            let mut guard = CopyJobGuard::new(dest.clone(), abandon, jobs.clone());
+            assert_eq!(jobs.active(), 1);
+            guard.finished = finished;
+            drop(guard);
+            assert_eq!(jobs.active(), 0);
+            assert_eq!(
+                dest.exists(),
+                kept,
+                "finished={finished} abandoned={abandoned}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use common::{TaskId, VmId};
 use futures::future::BoxFuture;
 use tokio_util::sync::CancellationToken;
 
-use super::firecracker::{Vm, VmConfig, VmError};
+use super::firecracker::{CopyJobs, Vm, VmConfig, VmError};
 use crate::metrics;
 use crate::snapshot::SnapshotManager;
 
@@ -155,6 +155,8 @@ pub struct VmPool {
     boots_done: tokio::sync::Notify,
     /// Cancelled by `shutdown` to abort boots in flight.
     closing_token: CancellationToken,
+    /// Rootfs copy jobs of this pool's VMs.
+    copy_jobs: Arc<CopyJobs>,
 }
 
 impl VmPool {
@@ -165,7 +167,13 @@ impl VmPool {
             state: Mutex::new(PoolState::default()),
             boots_done: tokio::sync::Notify::new(),
             closing_token: CancellationToken::new(),
+            copy_jobs: Arc::new(CopyJobs::new()),
         }
+    }
+
+    /// This pool's rootfs copy jobs.
+    pub fn copy_jobs(&self) -> &Arc<CopyJobs> {
+        &self.copy_jobs
     }
 
     /// Keep a booted VM unless the pool is shutting down. A refused VM is
@@ -220,6 +228,7 @@ impl VmPool {
     /// Boot one VM in a reserved slot.
     async fn boot(&self, _slot: &StartingSlot<'_>) -> Result<Vm, VmError> {
         let mut vm = self.launcher.create();
+        vm.track_copy_jobs(self.copy_jobs.clone());
         let launched = tokio::select! {
             r = self.launcher.launch(&mut vm) => r,
             () = self.closing_token.cancelled() => {
@@ -403,7 +412,7 @@ impl VmPool {
         }
         // A cancelled boot may still be cleaning up its rootfs copy; a
         // released slot does not mean that cleanup is done.
-        super::firecracker::wait_for_copy_jobs().await;
+        self.copy_jobs.wait_idle().await;
         let vms: Vec<Vm> = {
             let mut s = self.lock();
             let mut vms: Vec<Vm> = std::mem::take(&mut s.warm);

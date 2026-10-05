@@ -922,6 +922,56 @@ mod tests {
         assert_eq!(r.error_message.as_deref(), Some("Task cancelled by user"));
     }
 
+    // Lane D's contract: after sending cancel the node keeps its side open
+    // until the agent replies, so the agent never sees EOF in between.
+    #[tokio::test]
+    async fn runner_does_not_half_close_after_cancel() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sock");
+        let listener = bind(&path);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let agent = tokio::spawn(async move {
+            let mut s = accept(&listener).await;
+            send(&mut s, ready()).await;
+            let _ = recv(&mut s).await;
+            started_tx.send(()).unwrap();
+            assert!(matches!(recv(&mut s).await, Payload::Cancel(_)));
+            // Nothing may arrive, and the stream must not end, before we
+            // answer.
+            let mut b = [0u8; 1];
+            let early = tokio::time::timeout(Duration::from_millis(150), s.read(&mut b)).await;
+            assert!(
+                early.is_err(),
+                "node closed or wrote after cancel: {early:?}"
+            );
+            send(
+                &mut s,
+                Payload::Error(pb::VsockError {
+                    code: "cancelled".into(),
+                    message: "Task cancelled by user".into(),
+                }),
+            )
+            .await;
+        });
+        let task = TaskId::random();
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            started_rx.await.unwrap();
+            c.cancel();
+        });
+        let mut settings = fast();
+        settings.cancel_grace = Duration::from_secs(5);
+        let r = TaskRunner::new(&path, 9999, task)
+            .with_settings(settings)
+            .run(start_for(&task), cancel)
+            .await
+            .unwrap();
+        agent.await.unwrap();
+        assert_eq!(r.error_message.as_deref(), Some("Task cancelled by user"));
+    }
+
     #[tokio::test]
     async fn runner_cancel_without_ack_gives_up_after_grace() {
         let dir = tempfile::tempdir().unwrap();
