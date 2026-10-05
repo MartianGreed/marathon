@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ids::{ClientId, NodeId, TaskId, VmId};
 use crate::pb;
-use crate::redact::{OptSecret, Secret};
+use crate::redact::{OptSecret, SafeUrl, Secret};
 
 /// Current unix time in milliseconds.
 pub fn now_ms() -> i64 {
@@ -319,7 +319,7 @@ impl std::fmt::Debug for Task {
             .field("id", &self.id)
             .field("client_id", &self.client_id)
             .field("state", &self.state)
-            .field("repo_url", &self.repo_url)
+            .field("repo_url", &SafeUrl(&self.repo_url))
             .field("branch", &self.branch)
             .field("prompt", &self.prompt)
             .field("node_id", &self.node_id)

@@ -19,6 +19,9 @@ const SECRET_MESSAGES: &[&str] = &[
     ".marathon.v1.NodeAuth",
     ".marathon.v1.ExecuteTask",
     ".marathon.v1.VsockStart",
+    // Repository URLs can embed credentials (https://user:token@host/...).
+    ".marathon.v1.Task",
+    ".marathon.v1.TaskSummary",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -28,8 +31,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
-        // These carry passwords, tokens, API keys or env var values. Their
-        // redacting `Debug` impls live in `src/redact.rs`.
+        // These carry passwords, tokens, API keys, env var values or
+        // repository URLs. Their redacting `Debug` impls live in
+        // `src/redact.rs`.
         .skip_debug(SECRET_MESSAGES.iter().copied())
         .compile_protos(PROTOS, &[PROTO_ROOT])?;
     Ok(())
