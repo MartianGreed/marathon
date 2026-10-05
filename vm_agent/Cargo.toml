@@ -1,0 +1,19 @@
+[package]
+name = "marathon-vm-agent"
+description = "Marathon VM agent: runs Claude Code inside the guest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "marathon-vm-agent"
+path = "src/main.rs"
+
+[dependencies]
+common.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

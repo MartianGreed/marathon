@@ -1,0 +1,218 @@
+syntax = "proto3";
+
+package marathon.v1;
+
+import "marathon/v1/types.proto";
+
+// Client -> orchestrator API, served by the orchestrator.
+//
+// Authentication travels in gRPC request metadata, never in message fields:
+//   authorization: Bearer <jwt>    JWT returned by Register or Login
+//   x-api-key: <api key>           API key returned by Register or Login
+// Metadata keys are lowercase ASCII as gRPC requires. When both are present
+// the Bearer token takes precedence. Register and Login need neither; every
+// other RPC fails with UNAUTHENTICATED without a valid credential. The
+// orchestrator derives the caller's client id from the credential, so no
+// request carries a client id.
+//
+// Failures use gRPC status codes (for example INVALID_ARGUMENT for a bad
+// repository URL, GitHub token or id, NOT_FOUND for an unknown task).
+service MarathonService {
+  // Queue a task. The first streamed event is QUEUED and carries the new task
+  // id. The server keeps streaming state changes and output until the task
+  // reaches a terminal state; a caller that only needs the id may close the
+  // stream after the first event.
+  rpc SubmitTask(SubmitTaskRequest) returns (stream TaskEvent);
+
+  // Current task snapshot.
+  rpc GetTask(GetTaskRequest) returns (Task);
+
+  // Cancel a queued, starting or running task.
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+
+  // Aggregated usage of the authenticated client over a time range.
+  rpc GetUsage(GetUsageRequest) returns (UsageReport);
+
+  // Tasks of the authenticated client, newest first.
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+
+  // Task events for `marathon submit -f` / follow mode. With follow=false the
+  // server sends one event with the current state, then the buffered output
+  // events, then ends the stream. With follow=true it keeps streaming new
+  // events until the task reaches a terminal state, ending with a
+  // TaskComplete event.
+  rpc GetTaskEvents(GetTaskEventsRequest) returns (stream TaskEvent);
+
+  // Create an account. Unauthenticated.
+  rpc Register(RegisterRequest) returns (AuthResponse);
+
+  // Exchange email and password for a JWT and the account's API key.
+  // Unauthenticated.
+  rpc Login(LoginRequest) returns (AuthResponse);
+}
+
+message Task {
+  // 64 lowercase hex characters.
+  string id = 1;
+  // 32 lowercase hex characters.
+  string client_id = 2;
+  TaskState state = 3;
+
+  string repo_url = 4;
+  string branch = 5;
+  string prompt = 6;
+
+  // Set once the task is assigned (32 lowercase hex characters each).
+  optional string node_id = 7;
+  optional string vm_id = 8;
+
+  int64 created_at = 9;
+  optional int64 started_at = 10;
+  optional int64 completed_at = 11;
+
+  optional string error_message = 12;
+  optional string pr_url = 13;
+
+  UsageMetrics usage = 14;
+
+  bool create_pr = 15;
+  optional string pr_title = 16;
+  optional string pr_body = 17;
+
+  // Ralph loop configuration.
+  optional uint32 max_iterations = 18;
+  optional string completion_promise = 19;
+
+  // The GitHub token and environment variable values are secrets and are
+  // never returned.
+}
+
+message SubmitTaskRequest {
+  string repo_url = 1;
+  string branch = 2;
+  string prompt = 3;
+
+  // The client's own GitHub token, used inside the VM for clone and PR.
+  string github_token = 4;
+
+  bool create_pr = 5;
+  optional string pr_title = 6;
+  optional string pr_body = 7;
+
+  // Environment variables for the agent, in order (`-e KEY=VALUE`).
+  repeated EnvVar env_vars = 8;
+
+  // Ralph loop configuration (`--max-iterations`, `--completion-promise`).
+  optional uint32 max_iterations = 9;
+  optional string completion_promise = 10;
+}
+
+message TaskEvent {
+  string task_id = 1;
+  // Task state when the event was produced.
+  TaskState state = 2;
+  int64 timestamp = 3;
+
+  oneof event {
+    TaskStateChange state_change = 4;
+    TaskOutput output = 5;
+    TaskError error = 6;
+    TaskComplete complete = 7;
+  }
+}
+
+message TaskStateChange {
+  // State before this change, UNSPECIFIED when unknown.
+  TaskState previous_state = 1;
+}
+
+message TaskOutput {
+  OutputType type = 1;
+  bytes data = 2;
+}
+
+message TaskError {
+  string code = 1;
+  string message = 2;
+}
+
+// Sent once, when the task reaches a terminal state (event.state).
+message TaskComplete {
+  UsageMetrics usage = 1;
+  optional string pr_url = 2;
+  optional string error_message = 3;
+}
+
+message GetTaskRequest {
+  string task_id = 1;
+}
+
+message CancelTaskRequest {
+  string task_id = 1;
+}
+
+message CancelTaskResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetUsageRequest {
+  // Inclusive range, unix millis.
+  int64 start_time = 1;
+  int64 end_time = 2;
+}
+
+message UsageReport {
+  string client_id = 1;
+  int64 start_time = 2;
+  int64 end_time = 3;
+  UsageMetrics total = 4;
+  uint32 task_count = 5;
+}
+
+message ListTasksRequest {
+  // Only tasks in this state; all states when absent.
+  optional TaskState state_filter = 1;
+  uint32 limit = 2;
+  uint32 offset = 3;
+}
+
+message ListTasksResponse {
+  repeated TaskSummary tasks = 1;
+  // Number of matching tasks before limit/offset.
+  uint32 total_count = 2;
+}
+
+message TaskSummary {
+  string task_id = 1;
+  TaskState state = 2;
+  string repo_url = 3;
+  int64 created_at = 4;
+  optional int64 completed_at = 5;
+}
+
+message GetTaskEventsRequest {
+  string task_id = 1;
+  bool follow = 2;
+}
+
+message RegisterRequest {
+  string email = 1;
+  string password = 2;
+}
+
+message LoginRequest {
+  string email = 1;
+  string password = 2;
+}
+
+// Result of Register or Login. A rejected attempt (email taken, wrong
+// password) is success=false with a human-readable message, not a gRPC error.
+message AuthResponse {
+  bool success = 1;
+  // HS256 JWT for `authorization: Bearer`.
+  optional string token = 2;
+  // API key for `x-api-key`.
+  optional string api_key = 3;
+  string message = 4;
+}

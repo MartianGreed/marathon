@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package marathon.v1;
+
+// Shared Marathon types used by the client, node and vsock contracts.
+//
+// Identifier encoding: every id travels as a lowercase hexadecimal string.
+//   task id:                 32 bytes -> 64 hex characters
+//   node, vm, client, user:  16 bytes -> 32 hex characters
+// Receivers accept either case; senders always emit lowercase.
+//
+// Timestamps are unix milliseconds unless the field name says otherwise.
+
+// Task lifecycle: QUEUED -> STARTING -> RUNNING -> COMPLETED | FAILED | CANCELLED.
+// QUEUED and STARTING may also go to CANCELLED, STARTING may go to FAILED.
+// COMPLETED, FAILED and CANCELLED are terminal.
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED = 1;
+  TASK_STATE_STARTING = 2;
+  TASK_STATE_RUNNING = 3;
+  TASK_STATE_COMPLETED = 4;
+  TASK_STATE_FAILED = 5;
+  TASK_STATE_CANCELLED = 6;
+}
+
+// Origin of a chunk of task output.
+enum OutputType {
+  OUTPUT_TYPE_UNSPECIFIED = 0;
+  OUTPUT_TYPE_STDOUT = 1;
+  OUTPUT_TYPE_STDERR = 2;
+  // Claude Code structured output.
+  OUTPUT_TYPE_CLAUDE = 3;
+}
+
+// Token and compute usage for one task, or an aggregate of several.
+message UsageMetrics {
+  int64 compute_time_ms = 1;
+  int64 input_tokens = 2;
+  int64 output_tokens = 3;
+  int64 cache_read_tokens = 4;
+  int64 cache_write_tokens = 5;
+  int64 tool_calls = 6;
+}
+
+// One environment variable passed to the agent. A list rather than a map so
+// that order and duplicates are preserved exactly as the client sent them.
+message EnvVar {
+  string key = 1;
+  string value = 2;
+}

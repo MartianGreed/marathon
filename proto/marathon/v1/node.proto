@@ -1,0 +1,153 @@
+syntax = "proto3";
+
+package marathon.v1;
+
+import "marathon/v1/types.proto";
+
+// Node operator -> orchestrator API, served by the orchestrator.
+//
+// Nodes dial out to the orchestrator (they often sit behind NAT), so the
+// orchestrator serves this service and pushes work down the Heartbeat stream.
+// The earlier node-served NodeOperatorService was removed because nothing
+// can dial into a node.
+//
+// Node authentication: every request message carries a NodeAuth. When the
+// orchestrator has MARATHON_NODE_AUTH_KEY set it rejects messages whose token
+// does not verify (see NodeAuth) with UNAUTHENTICATED, ending the stream.
+service NodeService {
+  // Long-lived bidirectional stream. The node sends a NodeHeartbeat right
+  // after connecting and then every heartbeat interval; the orchestrator
+  // answers each heartbeat with a HeartbeatResponse carrying any pending
+  // commands. A node reconnects when the stream ends.
+  rpc Heartbeat(stream NodeHeartbeat) returns (stream HeartbeatResponse);
+
+  // Final results of finished tasks.
+  rpc ReportTaskResult(ReportTaskResultRequest) returns (ReportTaskResultResponse);
+
+  // Task output produced since the previous report, for client streaming.
+  rpc ReportTaskOutput(ReportTaskOutputRequest) returns (ReportTaskOutputResponse);
+}
+
+// Proof that a message comes from a node holding MARATHON_NODE_AUTH_KEY.
+//
+//   token = HMAC-SHA256(key, node_id_bytes || timestamp_ms_le)
+//
+// node_id_bytes is the 16 raw bytes of node_id (not its hex text) and
+// timestamp_ms_le is timestamp_ms as a signed 64-bit little-endian integer.
+// The orchestrator accepts a timestamp within 5 minutes of its own clock in
+// either direction. A node without a key sends an empty token. The token does
+// not cover the rest of the message; transport security is TLS.
+message NodeAuth {
+  // 32 lowercase hex characters.
+  string node_id = 1;
+  int64 timestamp_ms = 2;
+  // 32 bytes when a key is configured.
+  bytes token = 3;
+}
+
+message NodeHeartbeat {
+  NodeAuth auth = 1;
+  NodeStatus status = 2;
+}
+
+message NodeStatus {
+  string hostname = 1;
+
+  uint32 total_vm_slots = 2;
+  uint32 active_vms = 3;
+  uint32 warm_vms = 4;
+
+  // Fractions in [0, 1].
+  double cpu_usage = 5;
+  double memory_usage = 6;
+  int64 disk_available_bytes = 7;
+
+  bool healthy = 8;
+  bool draining = 9;
+  int64 uptime_seconds = 10;
+  optional int64 last_task_at = 11;
+
+  repeated string active_task_ids = 12;
+}
+
+message HeartbeatResponse {
+  int64 timestamp = 1;
+  bool acknowledged = 2;
+  repeated NodeCommand commands = 3;
+}
+
+message NodeCommand {
+  oneof command {
+    ExecuteTask execute_task = 1;
+    CancelTask cancel_task = 2;
+    Drain drain = 3;
+    WarmPool warm_pool = 4;
+  }
+}
+
+// Run a task on this node. Carries everything the VM needs.
+message ExecuteTask {
+  string task_id = 1;
+  string repo_url = 2;
+  string branch = 3;
+  string prompt = 4;
+
+  // Secrets injected by the orchestrator.
+  string github_token = 5;
+  string anthropic_api_key = 6;
+
+  bool create_pr = 7;
+  optional string pr_title = 8;
+  optional string pr_body = 9;
+
+  int64 timeout_ms = 10;
+  int64 max_tokens = 11;
+
+  repeated EnvVar env_vars = 12;
+
+  // Ralph loop configuration.
+  optional uint32 max_iterations = 13;
+  optional string completion_promise = 14;
+}
+
+message CancelTask {
+  string task_id = 1;
+}
+
+// Stop accepting new tasks.
+message Drain {}
+
+// Adjust the warm VM pool. Without a target the node uses its configured
+// MARATHON_WARM_POOL_TARGET.
+message WarmPool {
+  optional uint32 target = 1;
+}
+
+message ReportTaskResultRequest {
+  NodeAuth auth = 1;
+  repeated TaskResult results = 2;
+}
+
+message TaskResult {
+  string task_id = 1;
+  bool success = 2;
+  optional string error_message = 3;
+  UsageMetrics metrics = 4;
+  optional string pr_url = 5;
+}
+
+message ReportTaskResultResponse {}
+
+message ReportTaskOutputRequest {
+  NodeAuth auth = 1;
+  repeated TaskOutputEvent events = 2;
+}
+
+message TaskOutputEvent {
+  string task_id = 1;
+  OutputType type = 2;
+  int64 timestamp = 3;
+  bytes data = 4;
+}
+
+message ReportTaskOutputResponse {}
