@@ -271,12 +271,16 @@ impl Vm {
         self.rootfs_copy_path = Some(dest.clone());
         let abandon = CancellationToken::new();
         let guard = abandon.clone().drop_guard();
+        // Registered now, before the task exists: a shutdown that runs
+        // before the task is first polled still waits for it. If the task
+        // is never polled, dropping it drops the guard and ends the job.
+        let job_guard = CopyJobGuard::new(dest.clone(), abandon.clone(), self.copy_jobs.clone());
         let job = tokio::spawn(copy_job(
             self.cp_program.clone(),
             PathBuf::from(base),
             dest.clone(),
             abandon,
-            self.copy_jobs.clone(),
+            job_guard,
         ));
         let outcome = job
             .await
@@ -768,13 +772,17 @@ async fn copy_job(
     base: PathBuf,
     dest: PathBuf,
     abandon: CancellationToken,
-    jobs: Arc<CopyJobs>,
+    mut guard: CopyJobGuard,
 ) -> std::io::Result<bool> {
-    let mut guard = CopyJobGuard::new(dest.clone(), abandon.clone(), jobs);
     let abandoned = |dest: &Path| {
         let _ = std::fs::remove_file(dest);
         Err(abandoned_error())
     };
+    // Abandoned before this task first ran (cancelled boot, shutdown):
+    // start nothing.
+    if abandon.is_cancelled() {
+        return abandoned(&dest);
+    }
     let spawned = Command::new(&cp)
         .arg("--reflink=auto")
         .arg(&base)
@@ -1185,6 +1193,44 @@ mod tests {
             .expect("the busy pool's shutdown hangs");
         assert!(acquiring.await.unwrap().is_err());
         assert_eq!(busy.copy_jobs().active(), 0);
+        assert!(copies_left(dir.path(), &base).is_empty());
+    }
+
+    // C-R5-01: a copy task submitted but not yet polled when its boot is
+    // cancelled is still joined by shutdown, and never starts `cp`.
+    #[tokio::test]
+    async fn pool_shutdown_joins_a_copy_task_not_yet_polled() {
+        let dir = short_dir();
+        let base = dir.path().join("rootfs.ext4");
+        std::fs::write(&base, "root").unwrap();
+        let marker = dir.path().join("cp-ran");
+        let cp = fake_cp(
+            dir.path(),
+            &format!(r#"touch "{}"; printf partial > "$3""#, marker.display()),
+        );
+        let pool = copying_pool(dir.path(), cp, base.clone());
+        {
+            // One poll submits the copy task (current-thread runtime: it
+            // cannot run yet); dropping the future cancels the boot.
+            let mut acquiring = Box::pin(pool.acquire_or_create());
+            assert!(futures::poll!(acquiring.as_mut()).is_pending());
+            assert_eq!(pool.copy_jobs().active(), 1, "job not registered at submit");
+        }
+        tokio::time::timeout(Duration::from_secs(3), pool.shutdown())
+            .await
+            .expect("shutdown hangs");
+        assert_eq!(
+            pool.copy_jobs().active(),
+            0,
+            "shutdown returned before its copy job ended"
+        );
+        // Give a late task every chance to run.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(pool.copy_jobs().active(), 0);
+        assert!(!marker.exists(), "cp started after the boot was cancelled");
         assert!(copies_left(dir.path(), &base).is_empty());
     }
 
