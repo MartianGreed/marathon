@@ -176,6 +176,13 @@ pub enum Claim {
 /// A booting slot owned by a task until its VM is up.
 pub struct BootSlot(StartingSlot<Arc<VmPool>>);
 
+/// A booted VM the closing pool would not keep, with the slot it still
+/// holds until the VM is stopped.
+struct Refused<P: Deref<Target = VmPool>> {
+    vm: Vm,
+    slot: StartingSlot<P>,
+}
+
 /// The node's VMs.
 pub struct VmPool {
     launcher: Arc<dyn VmLauncher>,
@@ -208,34 +215,45 @@ impl VmPool {
 
     /// Keep a VM booted in `slot` unless the pool is shutting down. The
     /// VM and the slot's `starting` count swap in one critical section, so
-    /// the VM is never counted twice (or not at all). A refused VM is
-    /// handed back for the caller to stop; its slot is released normally.
+    /// the VM is never counted twice (or not at all).
+    ///
+    /// A refused VM comes back together with its still-armed slot: the
+    /// caller stops the VM and only then drops the slot, so `shutdown`
+    /// (which waits for `starting == 0`) cannot return while that VM is
+    /// still being torn down. Use [`VmPool::stop_refused`].
     #[must_use]
     fn keep_from_slot<P: Deref<Target = VmPool>>(
         &self,
         vm: Vm,
         into: Into,
         mut slot: StartingSlot<P>,
-    ) -> Option<Vm> {
-        {
-            let mut s = self.lock();
-            if !s.closing {
-                match into {
-                    Into::Warm => s.warm.push(vm),
-                    Into::Active => {
-                        s.active.insert(vm.id, vm);
-                    }
-                }
-                s.starting = s.starting.saturating_sub(1);
-                slot.armed = false;
-                Self::update_gauges(&s);
-                drop(s);
-                self.boots_done.notify_waiters();
-                return None;
+    ) -> Option<Refused<P>> {
+        let mut s = self.lock();
+        if s.closing {
+            drop(s);
+            return Some(Refused { vm, slot });
+        }
+        match into {
+            Into::Warm => s.warm.push(vm),
+            Into::Active => {
+                s.active.insert(vm.id, vm);
             }
         }
+        s.starting = s.starting.saturating_sub(1);
+        slot.armed = false;
+        Self::update_gauges(&s);
+        drop(s);
+        self.boots_done.notify_waiters();
+        None
+    }
+
+    /// Stop a VM the closing pool refused, then release its slot.
+    async fn stop_refused<P: Deref<Target = VmPool>>(refused: Refused<P>) {
+        let Refused { mut vm, slot } = refused;
+        tracing::info!(operation = "pool_shutdown", vm_id = %vm.id, "pool shutting down, stopping freshly booted VM");
+        vm.stop().await;
+        drop(vm);
         drop(slot);
-        Some(vm)
     }
 
     pub fn is_closing(&self) -> bool {
@@ -332,8 +350,8 @@ impl VmPool {
         })?;
         metrics::global().vm_ops.inc("acquire", "on_demand");
         let lease = VmLease::of(&vm);
-        if let Some(mut vm) = self.keep_from_slot(vm, Into::Active, slot) {
-            vm.stop().await;
+        if let Some(refused) = self.keep_from_slot(vm, Into::Active, slot) {
+            Self::stop_refused(refused).await;
             return Err(PoolError::ShuttingDown);
         }
         Ok(lease)
@@ -376,9 +394,8 @@ impl VmPool {
             match self.boot(&slot).await {
                 Ok(vm) => {
                     failures = 0;
-                    if let Some(mut vm) = self.keep_from_slot(vm, Into::Warm, slot) {
-                        tracing::info!(parent: op.span(), vm_id = %vm.id, "pool shutting down, stopping freshly booted VM");
-                        vm.stop().await;
+                    if let Some(refused) = self.keep_from_slot(vm, Into::Warm, slot) {
+                        Self::stop_refused(refused).await;
                         break;
                     }
                 }
@@ -465,8 +482,8 @@ impl VmPool {
         match self.boot(&slot).await {
             Ok(vm) => {
                 metrics::global().vm_ops.inc("replenish", "ok");
-                if let Some(mut vm) = self.keep_from_slot(vm, Into::Warm, slot) {
-                    vm.stop().await;
+                if let Some(refused) = self.keep_from_slot(vm, Into::Warm, slot) {
+                    Self::stop_refused(refused).await;
                 }
             }
             Err(e) => {
@@ -882,15 +899,23 @@ mod tests {
         let warm_slot = p.reserve(|_| true).unwrap();
         let active_slot = p.reserve(|_| true).unwrap();
         p.lock().closing = true;
-        let refused = p.keep_from_slot(ready_vm(), Into::Warm, warm_slot);
-        assert!(refused.is_some(), "a closing pool kept a VM");
-        let refused = p.keep_from_slot(ready_vm(), Into::Active, active_slot);
-        assert!(refused.is_some(), "a closing pool kept a VM");
+        let warm = p.keep_from_slot(ready_vm(), Into::Warm, warm_slot);
+        let active = p.keep_from_slot(ready_vm(), Into::Active, active_slot);
+        let (Some(warm), Some(active)) = (warm, active) else {
+            panic!("a closing pool kept a VM");
+        };
         assert_eq!(p.total_count(), 0);
         assert_eq!(
             p.starting_count(),
+            2,
+            "refused VMs keep their slots until stopped"
+        );
+        VmPool::stop_refused(warm).await;
+        VmPool::stop_refused(active).await;
+        assert_eq!(
+            p.starting_count(),
             0,
-            "refused VMs still release their slots"
+            "stopping a refused VM releases its slot"
         );
     }
 
@@ -1014,15 +1039,105 @@ mod tests {
         assert_eq!(p.starting_count(), 0);
     }
 
+    /// Boots a VM with a real child process and, as the boot completes,
+    /// starts the pool's shutdown, so the pool refuses the VM it just booted.
+    struct ClosingOnLaunch {
+        pool: std::sync::OnceLock<std::sync::Weak<VmPool>>,
+        socket: Mutex<Option<PathBuf>>,
+    }
+
+    impl VmLauncher for ClosingOnLaunch {
+        fn launch<'a>(&'a self, vm: &'a mut Vm) -> BoxFuture<'a, Result<(), VmError>> {
+            Box::pin(async move {
+                // `Vm::stop` removes this file: it marks cleanup done.
+                std::fs::write(&vm.socket_path, "").unwrap();
+                *self.socket.lock().unwrap() = Some(vm.socket_path.clone());
+                let child = tokio::process::Command::new("sleep")
+                    .arg("30")
+                    .kill_on_drop(true)
+                    .spawn()
+                    .unwrap();
+                vm.attach_process(child);
+                vm.mark_ready();
+                if let Some(pool) = self.pool.get().and_then(std::sync::Weak::upgrade) {
+                    pool.lock().closing = true;
+                }
+                Ok(())
+            })
+        }
+
+        fn create(&self) -> Vm {
+            Vm::in_dir(&std::env::temp_dir())
+        }
+    }
+
+    // C-R10-01: shutdown cannot return while a VM the closing pool refused
+    // is still being stopped; its slot is held until the stop is done.
+    #[tokio::test]
+    async fn shutdown_waits_for_a_refused_vm_to_stop() {
+        let mut windows = 0;
+        for _ in 0..20 {
+            let launcher = Arc::new(ClosingOnLaunch {
+                pool: std::sync::OnceLock::new(),
+                socket: Mutex::new(None),
+            });
+            let p = Arc::new(VmPool::new(
+                launcher.clone(),
+                PoolConfig {
+                    total_vm_slots: 1,
+                    warm_pool_target: 0,
+                },
+            ));
+            launcher.pool.set(Arc::downgrade(&p)).unwrap();
+            let claim = p.claim().unwrap();
+            let mut boot = Box::pin(p.start_claimed(claim));
+            // One poll boots the VM and reaches the refused VM's stop, which
+            // waits for the killed child to be reaped.
+            if futures::poll!(boot.as_mut()).is_pending() {
+                let socket = launcher.socket.lock().unwrap().clone().unwrap();
+                assert!(socket.exists(), "refused VM already cleaned up");
+                windows += 1;
+                let early = tokio::time::timeout(Duration::from_millis(100), p.shutdown()).await;
+                assert!(
+                    early.is_err(),
+                    "shutdown returned while the refused VM was still stopping"
+                );
+            }
+            assert!(matches!(boot.await, Err(PoolError::ShuttingDown)));
+            tokio::time::timeout(Duration::from_secs(2), p.shutdown())
+                .await
+                .expect("shutdown hangs after the refused VM stopped");
+            let socket = launcher.socket.lock().unwrap().clone().unwrap();
+            assert!(!socket.exists(), "refused VM was not cleaned up");
+            assert_eq!(p.starting_count(), 0);
+        }
+        assert!(
+            windows > 0,
+            "the stop never yielded; the test proved nothing"
+        );
+    }
+
     // C-R9-02: the handoff from booting to kept is atomic.
     #[test]
     fn keep_from_slot_hands_the_count_over() {
-        let p = pool(false, 1, 0);
+        let p = pool(false, 2, 0);
         let slot = p.reserve(|_| true).unwrap();
-        assert_eq!(p.occupied_count(), 1);
+        // Another boot is outstanding: the handoff must consume exactly
+        // one count, never this one too.
+        let other = p.reserve(|_| true).unwrap();
+        assert_eq!(p.occupied_count(), 2);
         assert!(p.keep_from_slot(ready_vm(), Into::Active, slot).is_none());
-        let s = p.lock();
-        assert_eq!((s.active.len(), s.starting), (1, 0));
+        {
+            let s = p.lock();
+            assert_eq!(
+                (s.active.len(), s.starting),
+                (1, 1),
+                "the handoff released another slot"
+            );
+        }
+        drop(other);
+        assert_eq!(p.starting_count(), 0);
+        assert_eq!(p.occupied_count(), 1);
     }
 
     // C-R9-02: an observer never sees more occupied slots than exist.
