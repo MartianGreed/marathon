@@ -133,6 +133,25 @@ mod tests {
     const KNOWN_TOKEN_HEX: &str =
         "65931a9fcea57f2c5e145d7b5b099b36893bf5a370576a3e5432adb63eae895d";
 
+    /// The window is a security property: pin it with literals, not the
+    /// constant under test.
+    #[test]
+    fn skew_window_is_exactly_300000_ms() {
+        assert_eq!(MAX_CLOCK_SKEW_MS, 300_000);
+        let ts = 1_700_000_000_000_i64;
+        let token = sign(KEY, &node(), ts);
+        assert_eq!(verify(KEY, &node(), ts, &token, ts + 300_000), Ok(()));
+        assert_eq!(verify(KEY, &node(), ts, &token, ts - 300_000), Ok(()));
+        assert_eq!(
+            verify(KEY, &node(), ts, &token, ts + 300_001),
+            Err(NodeAuthError::ClockSkew { skew_ms: 300_001 })
+        );
+        assert_eq!(
+            verify(KEY, &node(), ts, &token, ts - 300_001),
+            Err(NodeAuthError::ClockSkew { skew_ms: 300_001 })
+        );
+    }
+
     #[test]
     fn sign_then_verify() {
         let now = 1_700_000_000_000;

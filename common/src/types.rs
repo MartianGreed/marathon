@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ids::{ClientId, NodeId, TaskId, VmId};
 use crate::pb;
+use crate::redact::{OptSecret, Secret};
 
 /// Current unix time in milliseconds.
 pub fn now_ms() -> i64 {
@@ -243,11 +244,21 @@ impl From<UsageMetrics> for pb::VsockMetrics {
     }
 }
 
-/// One environment variable for the agent. Order is significant.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// One environment variable for the agent. Order is significant. `Debug`
+/// hides the value.
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct EnvVar {
     pub key: String,
     pub value: String,
+}
+
+impl std::fmt::Debug for EnvVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvVar")
+            .field("key", &self.key)
+            .field("value", &Secret(&self.value))
+            .finish()
+    }
 }
 
 impl From<pb::EnvVar> for EnvVar {
@@ -268,8 +279,9 @@ impl From<EnvVar> for pb::EnvVar {
     }
 }
 
-/// A task as the orchestrator tracks it.
-#[derive(Debug, Clone, PartialEq, Default)]
+/// A task as the orchestrator tracks it. `Debug` hides the GitHub token and
+/// env var values.
+#[derive(Clone, PartialEq, Default)]
 pub struct Task {
     pub id: TaskId,
     pub client_id: ClientId,
@@ -299,6 +311,34 @@ pub struct Task {
     pub env_vars: Vec<EnvVar>,
     pub max_iterations: Option<u32>,
     pub completion_promise: Option<String>,
+}
+
+impl std::fmt::Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Task")
+            .field("id", &self.id)
+            .field("client_id", &self.client_id)
+            .field("state", &self.state)
+            .field("repo_url", &self.repo_url)
+            .field("branch", &self.branch)
+            .field("prompt", &self.prompt)
+            .field("node_id", &self.node_id)
+            .field("vm_id", &self.vm_id)
+            .field("created_at", &self.created_at)
+            .field("started_at", &self.started_at)
+            .field("completed_at", &self.completed_at)
+            .field("error_message", &self.error_message)
+            .field("pr_url", &self.pr_url)
+            .field("usage", &self.usage)
+            .field("create_pr", &self.create_pr)
+            .field("pr_title", &self.pr_title)
+            .field("pr_body", &self.pr_body)
+            .field("github_token", &OptSecret(self.github_token.as_deref()))
+            .field("env_vars", &self.env_vars)
+            .field("max_iterations", &self.max_iterations)
+            .field("completion_promise", &self.completion_promise)
+            .finish()
+    }
 }
 
 impl Task {
@@ -576,6 +616,21 @@ mod tests {
         let debug = format!("{proto:?}");
         assert!(!debug.contains("ghp_secret"));
         assert!(!debug.contains("sk-secret"));
+    }
+
+    #[test]
+    fn task_debug_redacts_secrets() {
+        let mut task = Task::new(ClientId::random(), "https://github.com/a/b", "dev", "p");
+        task.github_token = Some("ghp_secret".into());
+        task.env_vars = vec![EnvVar {
+            key: "API_KEY".into(),
+            value: "sk-secret".into(),
+        }];
+        let debug = format!("{task:?}");
+        assert!(!debug.contains("ghp_secret"), "{debug}");
+        assert!(!debug.contains("sk-secret"), "{debug}");
+        assert!(debug.contains("API_KEY"), "{debug}");
+        assert!(debug.contains("https://github.com/a/b"), "{debug}");
     }
 
     #[test]

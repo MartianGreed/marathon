@@ -260,6 +260,7 @@ mod tests {
         EnvVar, OutputType, VsockCancel, VsockComplete, VsockError, VsockMetrics, VsockOutput,
         VsockProgress, VsockReady, VsockStart,
     };
+    use std::time::Duration;
     use tokio::io::duplex;
     use vsock_message::Payload;
 
@@ -778,7 +779,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(line, "OK 1073741824");
-        assert_eq!(read_message(&mut host).await.unwrap(), ready);
+        // If the handshake had swallowed the frame this read would wait
+        // forever; fail fast instead.
+        let next = tokio::time::timeout(Duration::from_secs(5), read_message(&mut host))
+            .await
+            .expect("frame after the handshake reply was consumed by the handshake");
+        assert_eq!(next.unwrap(), ready);
         drop(firecracker.await.unwrap());
     }
 

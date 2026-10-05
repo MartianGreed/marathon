@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 /// Environment variable names.
 pub mod vars {
@@ -67,12 +66,44 @@ pub enum ConfigError {
     },
 }
 
-fn parse_num<T: FromStr>(
+/// Parse an unsigned decimal the way Zig's `std.fmt.parseInt(T, s, 10)`
+/// (0.15) does:
+/// - one optional leading `+` or `-`;
+/// - ASCII digits, with `_` allowed anywhere except first or last;
+/// - `-` is accepted only when the value is zero (`-0`, `-0_0`);
+/// - no whitespace, no base prefix; overflow of `T` is an error.
+pub fn parse_zig_unsigned<T: TryFrom<u64>>(s: &str) -> Option<T> {
+    let (negative, digits) = match s.as_bytes().first()? {
+        b'+' => (false, &s[1..]),
+        b'-' => (true, &s[1..]),
+        _ => (false, s),
+    };
+    let bytes = digits.as_bytes();
+    if bytes.is_empty() || bytes[0] == b'_' || bytes[bytes.len() - 1] == b'_' {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &c in bytes {
+        if c == b'_' {
+            continue;
+        }
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
+    }
+    if negative && value != 0 {
+        return None;
+    }
+    T::try_from(value).ok()
+}
+
+fn parse_num<T: TryFrom<u64>>(
     var: &'static str,
     value: String,
     expected: &'static str,
 ) -> Result<T, ConfigError> {
-    value.parse().map_err(|_| ConfigError::InvalidValue {
+    parse_zig_unsigned(&value).ok_or(ConfigError::InvalidValue {
         var,
         value,
         expected,
@@ -454,9 +485,18 @@ pub const DOTENV_MAX_BYTES: u64 = 1024 * 1024;
 /// - a later duplicate key wins.
 ///
 /// There is no `export` prefix, escape or interpolation support.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// `Debug` lists the keys only, since values are often secrets.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct DotEnv {
     vars: HashMap<String, String>,
+}
+
+impl fmt::Debug for DotEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut keys: Vec<&str> = self.vars.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        f.debug_struct("DotEnv").field("keys", &keys).finish()
+    }
 }
 
 impl DotEnv {
@@ -875,6 +915,73 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Cases checked against Zig 0.15.2 `std.fmt.parseInt(T, s, 10)`.
+    #[test]
+    fn zig_integer_rules() {
+        let ok_u16: &[(&str, u16)] = &[
+            ("8080", 8080),
+            ("+8080", 8080),
+            ("8_080", 8080),
+            ("8__0_80", 8080),
+            ("007", 7),
+            ("0", 0),
+            ("-0", 0),
+            ("+0", 0),
+            ("-0_0", 0),
+            ("-000", 0),
+            ("65535", 65535),
+            ("6_5_5_3_5", 65535),
+        ];
+        for &(s, want) in ok_u16 {
+            assert_eq!(parse_zig_unsigned::<u16>(s), Some(want), "{s:?}");
+        }
+        let bad_u16 = [
+            "", "+", "-", "_8080", "8080_", "+_1", "-_0", "_", "-1", "-01", "-0_1", "65536", " 1",
+            "1 ", "\t1", "0x10", "1e3", "1.0", "1,0", "٣", "++1", "+-1",
+        ];
+        for s in bad_u16 {
+            assert_eq!(parse_zig_unsigned::<u16>(s), None, "{s:?}");
+        }
+        assert_eq!(parse_zig_unsigned::<u32>("4294967295"), Some(u32::MAX));
+        assert_eq!(parse_zig_unsigned::<u32>("4294967296"), None);
+        assert_eq!(
+            parse_zig_unsigned::<u64>("18446744073709551615"),
+            Some(u64::MAX)
+        );
+        assert_eq!(parse_zig_unsigned::<u64>("18446744073709551616"), None);
+        assert_eq!(parse_zig_unsigned::<u64>("99999999999999999999999"), None);
+    }
+
+    #[test]
+    fn loaders_use_zig_integer_rules() {
+        let c = OrchestratorConfig::from_lookup(env(&[("MARATHON_LISTEN_PORT", "8_081")])).unwrap();
+        assert_eq!(c.listen_port, 8081);
+        let c = NodeOperatorConfig::from_lookup(env(&[
+            ("MARATHON_WARM_POOL_TARGET", "-0"),
+            ("MARATHON_TOTAL_VM_SLOTS", "+1_6"),
+            ("MARATHON_ORCHESTRATOR_PORT", "4_43"),
+        ]))
+        .unwrap();
+        assert_eq!(c.warm_pool_target, 0);
+        assert_eq!(c.total_vm_slots, 16);
+        assert_eq!(c.orchestrator_port, 443);
+        assert!(c.tls_enabled);
+        let c = VmAgentConfig::from_lookup(env(&[("MARATHON_VSOCK_PORT", "+9_999")])).unwrap();
+        assert_eq!(c.vsock_port, 9999);
+        let dotenv = DotEnv::parse("MARATHON_ORCHESTRATOR_PORT=4_43\n");
+        let c = ClientConfig::from_sources(none, Some(&dotenv)).unwrap();
+        assert_eq!(c.orchestrator_port, 443);
+        assert!(c.tls_enabled);
+    }
+
+    #[test]
+    fn dotenv_debug_hides_values() {
+        let d = DotEnv::parse("GITHUB_TOKEN=ghp_dotenv_secret\nB=1\n");
+        let debug = format!("{d:?}");
+        assert!(!debug.contains("ghp_dotenv_secret"), "{debug}");
+        assert!(debug.contains("GITHUB_TOKEN"), "{debug}");
     }
 
     #[test]
