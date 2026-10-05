@@ -1184,13 +1184,16 @@ mod tests {
             let busy = busy.clone();
             tokio::spawn(async move { busy.acquire_or_create().await })
         };
+        // Wait until `cp` is really running (spawned), not just submitted,
+        // so cancelling below always lands after the spawn.
         tokio::time::timeout(Duration::from_secs(2), async {
-            while busy.copy_jobs().active() == 0 {
+            while busy.copy_jobs().cp_spawns() == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("copy job never started");
+        .expect("cp was never spawned");
+        assert_eq!(busy.copy_jobs().active(), 1);
 
         let idle = Arc::new(crate::vm::pool::testing::pool(false, 2, 0));
         tokio::time::timeout(Duration::from_millis(500), idle.shutdown())
