@@ -180,7 +180,8 @@ pub struct BootSlot(StartingSlot<Arc<VmPool>>);
 /// holds until the VM is stopped.
 struct Refused<P: Deref<Target = VmPool>> {
     vm: Vm,
-    slot: StartingSlot<P>,
+    /// Held only so it drops after `vm`: field order is drop order.
+    _slot: StartingSlot<P>,
 }
 
 /// The node's VMs.
@@ -231,7 +232,7 @@ impl VmPool {
         let mut s = self.lock();
         if s.closing {
             drop(s);
-            return Some(Refused { vm, slot });
+            return Some(Refused { vm, _slot: slot });
         }
         match into {
             Into::Warm => s.warm.push(vm),
@@ -248,12 +249,15 @@ impl VmPool {
     }
 
     /// Stop a VM the closing pool refused, then release its slot.
-    async fn stop_refused<P: Deref<Target = VmPool>>(refused: Refused<P>) {
-        let Refused { mut vm, slot } = refused;
-        tracing::info!(operation = "pool_shutdown", vm_id = %vm.id, "pool shutting down, stopping freshly booted VM");
-        vm.stop().await;
-        drop(vm);
-        drop(slot);
+    ///
+    /// `refused` stays whole across the await: if this future is dropped
+    /// mid-stop (a cancelled task), its fields drop in declaration order,
+    /// VM (and its cleanup) before slot. Destructuring into locals would
+    /// reverse that, as locals drop last-declared first.
+    async fn stop_refused<P: Deref<Target = VmPool>>(mut refused: Refused<P>) {
+        tracing::info!(operation = "pool_shutdown", vm_id = %refused.vm.id, "pool shutting down, stopping freshly booted VM");
+        refused.vm.stop().await;
+        drop(refused);
     }
 
     pub fn is_closing(&self) -> bool {
@@ -1071,45 +1075,147 @@ mod tests {
         }
     }
 
-    // C-R10-01: shutdown cannot return while a VM the closing pool refused
-    // is still being stopped; its slot is held until the stop is done.
+    fn closing_pool(
+        total_vm_slots: u32,
+        warm_pool_target: u32,
+    ) -> (Arc<VmPool>, Arc<ClosingOnLaunch>) {
+        let launcher = Arc::new(ClosingOnLaunch {
+            pool: std::sync::OnceLock::new(),
+            socket: Mutex::new(None),
+        });
+        let p = Arc::new(VmPool::new(
+            launcher.clone(),
+            PoolConfig {
+                total_vm_slots,
+                warm_pool_target,
+            },
+        ));
+        launcher.pool.set(Arc::downgrade(&p)).unwrap();
+        (p, launcher)
+    }
+
+    fn refused_socket(launcher: &ClosingOnLaunch) -> PathBuf {
+        launcher.socket.lock().unwrap().clone().unwrap()
+    }
+
+    /// The pool path under test, driven until its refused VM is stopping.
+    #[derive(Clone, Copy, Debug)]
+    enum RefusedPath {
+        OnDemand,
+        WarmPool,
+        Replenish,
+    }
+
+    /// A pool, and the future that boots (and has refused) a VM through
+    /// `path`. Polling it once reaches the refused VM's stop.
+    fn refused_boot(
+        path: RefusedPath,
+    ) -> (Arc<VmPool>, Arc<ClosingOnLaunch>, BoxFuture<'static, ()>) {
+        match path {
+            RefusedPath::OnDemand => {
+                let (p, l) = closing_pool(1, 0);
+                let claim = p.claim().unwrap();
+                let q = p.clone();
+                let fut = Box::pin(async move {
+                    assert!(matches!(
+                        q.start_claimed(claim).await,
+                        Err(PoolError::ShuttingDown)
+                    ));
+                });
+                (p, l, fut)
+            }
+            RefusedPath::WarmPool => {
+                let (p, l) = closing_pool(1, 0);
+                let q = p.clone();
+                (p, l, Box::pin(async move { q.warm_pool(1).await }))
+            }
+            RefusedPath::Replenish => {
+                let (p, l) = closing_pool(1, 1);
+                p.insert_warm(ready_vm());
+                let lease = p.acquire().unwrap();
+                let q = p.clone();
+                (p, l, Box::pin(async move { q.release(lease.vm_id).await }))
+            }
+        }
+    }
+
+    // C-R10-01 / C-R11-03: on every path, shutdown cannot return while a VM
+    // the closing pool refused is still being stopped.
     #[tokio::test]
     async fn shutdown_waits_for_a_refused_vm_to_stop() {
-        let mut windows = 0;
-        for _ in 0..20 {
-            let launcher = Arc::new(ClosingOnLaunch {
-                pool: std::sync::OnceLock::new(),
-                socket: Mutex::new(None),
-            });
-            let p = Arc::new(VmPool::new(
-                launcher.clone(),
-                PoolConfig {
-                    total_vm_slots: 1,
-                    warm_pool_target: 0,
-                },
-            ));
-            launcher.pool.set(Arc::downgrade(&p)).unwrap();
-            let claim = p.claim().unwrap();
-            let mut boot = Box::pin(p.start_claimed(claim));
-            // One poll boots the VM and reaches the refused VM's stop, which
-            // waits for the killed child to be reaped.
-            if futures::poll!(boot.as_mut()).is_pending() {
-                let socket = launcher.socket.lock().unwrap().clone().unwrap();
-                assert!(socket.exists(), "refused VM already cleaned up");
-                windows += 1;
-                let early = tokio::time::timeout(Duration::from_millis(100), p.shutdown()).await;
+        for path in [
+            RefusedPath::OnDemand,
+            RefusedPath::WarmPool,
+            RefusedPath::Replenish,
+        ] {
+            let mut windows = 0;
+            for _ in 0..20 {
+                let (p, launcher, mut boot) = refused_boot(path);
+                // One poll boots the VM and reaches the refused VM's stop,
+                // which usually waits for the killed child to be reaped.
+                if futures::poll!(boot.as_mut()).is_pending() {
+                    assert!(
+                        refused_socket(&launcher).exists(),
+                        "{path:?}: refused VM already cleaned up"
+                    );
+                    windows += 1;
+                    let early =
+                        tokio::time::timeout(Duration::from_millis(100), p.shutdown()).await;
+                    assert!(
+                        early.is_err(),
+                        "{path:?}: shutdown returned while the refused VM was still stopping"
+                    );
+                    boot.await;
+                }
+                // Ready on the first poll: the stop finished at once, and the
+                // completed future is not polled again.
+                tokio::time::timeout(Duration::from_secs(2), p.shutdown())
+                    .await
+                    .expect("shutdown hangs after the refused VM stopped");
                 assert!(
-                    early.is_err(),
-                    "shutdown returned while the refused VM was still stopping"
+                    !refused_socket(&launcher).exists(),
+                    "{path:?}: refused VM was not cleaned up"
                 );
+                assert_eq!(p.starting_count(), 0);
             }
-            assert!(matches!(boot.await, Err(PoolError::ShuttingDown)));
-            tokio::time::timeout(Duration::from_secs(2), p.shutdown())
+            assert!(
+                windows > 0,
+                "{path:?}: the stop never yielded; the test proved nothing"
+            );
+        }
+    }
+
+    // C-R11-01: cancelling the task while its refused VM stops must clean
+    // the VM up before its slot is released. A shutdown on another worker
+    // checks the VM's cleanup marker the moment it returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_refused_stop_cleans_up_before_releasing_its_slot() {
+        let mut windows = 0;
+        for _ in 0..200 {
+            let (p, launcher, mut boot) = refused_boot(RefusedPath::OnDemand);
+            if futures::poll!(boot.as_mut()).is_ready() {
+                continue;
+            }
+            windows += 1;
+            let socket = refused_socket(&launcher);
+            let shutting = {
+                let p = p.clone();
+                tokio::spawn(async move {
+                    p.shutdown().await;
+                    socket.exists()
+                })
+            };
+            // Let the shutdown register its wait, then cancel the boot.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            drop(boot);
+            let marker_left = tokio::time::timeout(Duration::from_secs(2), shutting)
                 .await
-                .expect("shutdown hangs after the refused VM stopped");
-            let socket = launcher.socket.lock().unwrap().clone().unwrap();
-            assert!(!socket.exists(), "refused VM was not cleaned up");
-            assert_eq!(p.starting_count(), 0);
+                .expect("shutdown hangs after the cancelled stop")
+                .unwrap();
+            assert!(
+                !marker_left,
+                "shutdown returned before the cancelled refused VM was cleaned up"
+            );
         }
         assert!(
             windows > 0,
