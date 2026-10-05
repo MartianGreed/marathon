@@ -662,6 +662,9 @@ impl Drop for Vm {
 #[derive(Debug, Default)]
 pub struct CopyJobs {
     count: AtomicU32,
+    /// `cp` processes started for these jobs (tests pin that an abandoned
+    /// job starts none).
+    cp_spawns: AtomicU32,
     idle: tokio::sync::Notify,
 }
 
@@ -688,6 +691,11 @@ impl CopyJobs {
             }
             idle.await;
         }
+    }
+
+    /// `cp` processes started so far.
+    pub fn cp_spawns(&self) -> u32 {
+        self.cp_spawns.load(Ordering::SeqCst)
     }
 
     fn start(&self) {
@@ -783,6 +791,7 @@ async fn copy_job(
     if abandon.is_cancelled() {
         return abandoned(&dest);
     }
+    guard.jobs.cp_spawns.fetch_add(1, Ordering::SeqCst);
     let spawned = Command::new(&cp)
         .arg("--reflink=auto")
         .arg(&base)
@@ -1193,6 +1202,11 @@ mod tests {
             .expect("the busy pool's shutdown hangs");
         assert!(acquiring.await.unwrap().is_err());
         assert_eq!(busy.copy_jobs().active(), 0);
+        assert_eq!(
+            busy.copy_jobs().cp_spawns(),
+            1,
+            "the spawn counter counts real spawns"
+        );
         assert!(copies_left(dir.path(), &base).is_empty());
     }
 
@@ -1231,6 +1245,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(pool.copy_jobs().active(), 0);
         assert!(!marker.exists(), "cp started after the boot was cancelled");
+        assert_eq!(
+            pool.copy_jobs().cp_spawns(),
+            0,
+            "cp was spawned for an abandoned copy"
+        );
         assert!(copies_left(dir.path(), &base).is_empty());
     }
 
