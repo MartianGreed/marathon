@@ -1,0 +1,419 @@
+//! Runs `ExecuteTask` commands on pooled VMs.
+//!
+//! Each task gets a VM from the pool, runs to completion on it in its own
+//! tokio task, and leaves a `TaskResult` for the heartbeat loop to report.
+//! The VM is destroyed afterwards. Running tasks can be cancelled; a
+//! draining node rejects new tasks.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Instant;
+
+use common::pb;
+use common::{TaskId, UsageMetrics};
+use tokio_util::sync::CancellationToken;
+
+use crate::metrics;
+use crate::task::output_buffer::OutputBuffer;
+use crate::trace::TraceContext;
+use crate::vm::VmPool;
+use crate::vsock::handler::{RunnerSettings, TaskRunner};
+
+/// Error text for a task rejected because the node is draining.
+pub const DRAINING: &str = "node is draining";
+/// Error text for a task id that does not parse.
+pub const INVALID_TASK_ID: &str = "invalid task id";
+
+/// Executor settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutorSettings {
+    pub vsock_port: u32,
+    pub runner: RunnerSettings,
+}
+
+impl Default for ExecutorSettings {
+    fn default() -> Self {
+        Self {
+            vsock_port: common::vsock::DEFAULT_PORT,
+            runner: RunnerSettings::default(),
+        }
+    }
+}
+
+/// Why an execute command was not started.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ExecuteError {
+    #[error("invalid task id {0:?}")]
+    InvalidTaskId(String),
+    #[error("task {0} is already running")]
+    AlreadyRunning(TaskId),
+    #[error("node is draining")]
+    Draining,
+}
+
+/// The node's task runner.
+pub struct TaskExecutor {
+    pool: Arc<VmPool>,
+    settings: ExecutorSettings,
+    results: Mutex<Vec<pb::TaskResult>>,
+    output: Arc<OutputBuffer>,
+    running: Mutex<HashMap<TaskId, CancellationToken>>,
+    draining: AtomicBool,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Build the agent's start message from the orchestrator's command.
+pub fn vsock_start(req: &pb::ExecuteTask) -> pb::VsockStart {
+    pb::VsockStart {
+        task_id: req.task_id.clone(),
+        repo_url: req.repo_url.clone(),
+        branch: req.branch.clone(),
+        prompt: req.prompt.clone(),
+        github_token: req.github_token.clone(),
+        anthropic_api_key: req.anthropic_api_key.clone(),
+        create_pr: req.create_pr,
+        pr_title: req.pr_title.clone(),
+        pr_body: req.pr_body.clone(),
+        max_iterations: req.max_iterations,
+        completion_promise: req.completion_promise.clone(),
+        env_vars: req.env_vars.clone(),
+    }
+}
+
+fn failed_result(task_id: String, message: impl Into<String>) -> pb::TaskResult {
+    pb::TaskResult {
+        task_id,
+        success: false,
+        error_message: Some(message.into()),
+        metrics: Some(UsageMetrics::default().into()),
+        pr_url: None,
+    }
+}
+
+impl TaskExecutor {
+    pub fn new(pool: Arc<VmPool>, settings: ExecutorSettings) -> Arc<Self> {
+        Arc::new(Self {
+            pool,
+            settings,
+            results: Mutex::new(Vec::new()),
+            output: Arc::new(OutputBuffer::new()),
+            running: Mutex::new(HashMap::new()),
+            draining: AtomicBool::new(false),
+        })
+    }
+
+    pub fn pool(&self) -> &Arc<VmPool> {
+        &self.pool
+    }
+
+    pub fn output_buffer(&self) -> &Arc<OutputBuffer> {
+        &self.output
+    }
+
+    /// Take the finished results, oldest first.
+    pub fn drain_results(&self) -> Vec<pb::TaskResult> {
+        std::mem::take(&mut *lock(&self.results))
+    }
+
+    /// Put back results whose report failed, ahead of newer ones.
+    pub fn requeue_results(&self, mut results: Vec<pb::TaskResult>) {
+        let mut queued = lock(&self.results);
+        results.append(&mut queued);
+        *queued = results;
+    }
+
+    /// Take the buffered output.
+    pub fn drain_output(&self) -> Vec<pb::TaskOutputEvent> {
+        self.output.drain()
+    }
+
+    pub fn set_draining(&self, draining: bool) {
+        self.draining.store(draining, Ordering::SeqCst);
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Ids of the tasks currently running, lowercase hex.
+    pub fn active_task_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = lock(&self.running).keys().map(TaskId::to_hex).collect();
+        ids.sort();
+        ids
+    }
+
+    pub fn active_task_count(&self) -> usize {
+        lock(&self.running).len()
+    }
+
+    fn push_result(&self, result: pb::TaskResult) {
+        lock(&self.results).push(result);
+    }
+
+    /// Start a task in the background. A rejected task also leaves a
+    /// failed result so the orchestrator does not wait for it forever.
+    pub fn execute_task(self: &Arc<Self>, req: pb::ExecuteTask) -> Result<(), ExecuteError> {
+        let m = metrics::global();
+        let Ok(task_id) = TaskId::parse(&req.task_id) else {
+            tracing::error!(operation = "execute_task", task_id = %req.task_id, "invalid task id");
+            m.tasks_rejected.inc();
+            self.push_result(failed_result(req.task_id.clone(), INVALID_TASK_ID));
+            return Err(ExecuteError::InvalidTaskId(req.task_id));
+        };
+        if self.is_draining() {
+            tracing::warn!(operation = "execute_task", task_id = %task_id, "rejecting task: node is draining");
+            m.tasks_rejected.inc();
+            self.push_result(failed_result(task_id.to_hex(), DRAINING));
+            return Err(ExecuteError::Draining);
+        }
+        let token = CancellationToken::new();
+        {
+            let mut running = lock(&self.running);
+            if running.contains_key(&task_id) {
+                tracing::warn!(operation = "execute_task", task_id = %task_id, "duplicate execute ignored: task already running");
+                return Err(ExecuteError::AlreadyRunning(task_id));
+            }
+            running.insert(task_id, token.clone());
+        }
+        tracing::info!(operation = "execute_task", task_id = %task_id, "received task");
+        m.tasks_started.inc();
+        let this = self.clone();
+        tokio::spawn(async move { this.run_task(task_id, req, token).await });
+        Ok(())
+    }
+
+    /// Cancel a running task. Returns whether it was running.
+    pub fn cancel_task(&self, task_id: &str) -> bool {
+        let Ok(id) = TaskId::parse(task_id) else {
+            tracing::warn!(
+                operation = "cancel_task",
+                task_id,
+                "cancel for invalid task id ignored"
+            );
+            return false;
+        };
+        match lock(&self.running).get(&id) {
+            Some(token) => {
+                tracing::info!(operation = "cancel_task", task_id = %id, "cancelling task");
+                token.cancel();
+                true
+            }
+            None => {
+                tracing::warn!(operation = "cancel_task", task_id = %id, "cancel for unknown task ignored");
+                false
+            }
+        }
+    }
+
+    async fn run_task(
+        self: Arc<Self>,
+        task_id: TaskId,
+        req: pb::ExecuteTask,
+        token: CancellationToken,
+    ) {
+        let op = common::telemetry::Operation::start("run_task").task_id(&task_id);
+        let started = Instant::now();
+        let trace = TraceContext::new_root();
+        tracing::info!(parent: op.span(), trace_id = %trace.trace_id(), "task starting");
+
+        let (report, used_vm) = match self.pool.acquire_or_create().await {
+            Err(e) => {
+                tracing::error!(parent: op.span(), error = %e, "failed to acquire VM");
+                (failed_result(task_id.to_hex(), e.to_string()), None)
+            }
+            Ok(lease) => {
+                tracing::info!(parent: op.span(), vm_id = %lease.vm_id, "task assigned to VM");
+                self.pool.assign_task(lease.vm_id, task_id);
+                let mut runner =
+                    TaskRunner::new(&lease.vsock_uds_path, self.settings.vsock_port, task_id)
+                        .with_settings(self.settings.runner)
+                        .with_output_buffer(self.output.clone())
+                        .with_trace(trace);
+                let report = match runner.run(vsock_start(&req), token.clone()).await {
+                    Ok(r) => pb::TaskResult {
+                        task_id: task_id.to_hex(),
+                        success: r.success,
+                        error_message: r.error_message,
+                        metrics: Some(r.metrics.into()),
+                        pr_url: r.pr_url,
+                    },
+                    Err(e) => {
+                        tracing::error!(parent: op.span(), error = %e, "task execution failed");
+                        failed_result(task_id.to_hex(), e.to_string())
+                    }
+                };
+                (report, Some(lease.vm_id))
+            }
+        };
+
+        let m = metrics::global();
+        m.task_duration_ms.observe(started.elapsed());
+        if report.success {
+            m.tasks_succeeded.inc();
+        } else if token.is_cancelled() {
+            m.tasks_cancelled.inc();
+        } else {
+            m.tasks_failed.inc();
+        }
+        tracing::info!(
+            parent: op.span(),
+            success = report.success,
+            pr_url = ?common::redact::OptSafeUrl(report.pr_url.as_deref()),
+            error = report.error_message.as_deref().unwrap_or("none"),
+            "task completed"
+        );
+        lock(&self.running).remove(&task_id);
+        self.push_result(report);
+        // Queue the result first: releasing may boot a replacement VM.
+        if let Some(vm_id) = used_vm {
+            self.pool.release(vm_id).await;
+        }
+        op.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::pool::testing::pool;
+
+    fn executor(fail_launch: bool) -> Arc<TaskExecutor> {
+        TaskExecutor::new(
+            Arc::new(pool(fail_launch, 2, 0)),
+            ExecutorSettings::default(),
+        )
+    }
+
+    // Port of Zig `test "task executor init"`.
+    #[test]
+    fn task_executor_init() {
+        let e = executor(true);
+        assert!(e.drain_results().is_empty());
+        assert!(e.drain_output().is_empty());
+        assert!(!e.is_draining());
+        assert!(e.active_task_ids().is_empty());
+    }
+
+    #[test]
+    fn vsock_start_copies_every_field() {
+        let req = pb::ExecuteTask {
+            task_id: "ab".repeat(32),
+            repo_url: "https://github.com/o/r".into(),
+            branch: "dev".into(),
+            prompt: "p".into(),
+            github_token: "ghp".into(),
+            anthropic_api_key: "sk".into(),
+            create_pr: true,
+            pr_title: Some("t".into()),
+            pr_body: Some("b".into()),
+            timeout_ms: 1,
+            max_tokens: 2,
+            env_vars: vec![
+                pb::EnvVar {
+                    key: "A".into(),
+                    value: "1".into(),
+                },
+                pb::EnvVar {
+                    key: "A".into(),
+                    value: "2".into(),
+                },
+            ],
+            max_iterations: Some(4),
+            completion_promise: Some("DONE".into()),
+        };
+        let s = vsock_start(&req);
+        assert_eq!(s.task_id, req.task_id);
+        assert_eq!(s.repo_url, req.repo_url);
+        assert_eq!(s.branch, req.branch);
+        assert_eq!(s.prompt, req.prompt);
+        assert_eq!(s.github_token, req.github_token);
+        assert_eq!(s.anthropic_api_key, req.anthropic_api_key);
+        assert!(s.create_pr);
+        assert_eq!(s.pr_title, req.pr_title);
+        assert_eq!(s.pr_body, req.pr_body);
+        assert_eq!(s.env_vars, req.env_vars);
+        assert_eq!(s.max_iterations, Some(4));
+        assert_eq!(s.completion_promise.as_deref(), Some("DONE"));
+    }
+
+    #[tokio::test]
+    async fn invalid_task_id_is_reported_failed() {
+        let e = executor(false);
+        let err = e
+            .execute_task(pb::ExecuteTask {
+                task_id: "nope".into(),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert_eq!(err, ExecuteError::InvalidTaskId("nope".into()));
+        let r = e.drain_results();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].task_id, "nope");
+        assert_eq!(r[0].error_message.as_deref(), Some(INVALID_TASK_ID));
+    }
+
+    #[tokio::test]
+    async fn draining_rejects_with_failed_result() {
+        let e = executor(false);
+        e.set_draining(true);
+        let id = TaskId::random();
+        assert_eq!(
+            e.execute_task(pb::ExecuteTask {
+                task_id: id.to_hex(),
+                ..Default::default()
+            }),
+            Err(ExecuteError::Draining)
+        );
+        let r = e.drain_results();
+        assert_eq!(r[0].task_id, id.to_hex());
+        assert!(!r[0].success);
+        assert_eq!(r[0].error_message.as_deref(), Some(DRAINING));
+    }
+
+    async fn wait_result(e: &TaskExecutor) -> pb::TaskResult {
+        for _ in 0..500 {
+            if let Some(r) = e.drain_results().pop() {
+                return r;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no result");
+    }
+
+    #[tokio::test]
+    async fn no_available_vm_is_reported_failed() {
+        let e = executor(true);
+        let id = TaskId::random();
+        e.execute_task(pb::ExecuteTask {
+            task_id: id.to_hex(),
+            ..Default::default()
+        })
+        .unwrap();
+        let r = wait_result(&e).await;
+        assert_eq!(r.task_id, id.to_hex());
+        assert!(!r.success);
+        assert!(r.error_message.unwrap().starts_with("no available VM"));
+        assert!(e.active_task_ids().is_empty());
+        assert_eq!(e.pool().total_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn requeued_results_come_first() {
+        let e = executor(false);
+        e.push_result(failed_result("new".into(), "x"));
+        e.requeue_results(vec![failed_result("old".into(), "x")]);
+        let ids: Vec<_> = e.drain_results().into_iter().map(|r| r.task_id).collect();
+        assert_eq!(ids, ["old", "new"]);
+    }
+
+    #[tokio::test]
+    async fn cancel_unknown_task_is_false() {
+        let e = executor(false);
+        assert!(!e.cancel_task(&TaskId::random().to_hex()));
+        assert!(!e.cancel_task("zz"));
+    }
+}

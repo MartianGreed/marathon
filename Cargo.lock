@@ -1454,6 +1454,17 @@ name = "marathon-node-operator"
 version = "0.1.0"
 dependencies = [
  "common",
+ "futures",
+ "hex",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
  "tracing",
 ]
 
