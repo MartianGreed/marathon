@@ -1,0 +1,75 @@
+[workspace]
+resolver = "3"
+members = ["common", "orchestrator", "node_operator", "vm_agent", "client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/MartianGreed/marathon"
+
+# Every crate inherits these with `workspace = true` so versions stay in one
+# place. Crates add dependencies in their own Cargo.toml, preferring the pins
+# below.
+[workspace.dependencies]
+common = { path = "common" }
+
+# Async runtime and streams
+tokio = { version = "1.53", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["net", "sync"] }
+tokio-util = { version = "0.7.19", features = ["codec"] }
+futures = "0.3.34"
+
+# gRPC and protobuf
+tonic = { version = "0.14.6", features = ["tls-ring", "tls-native-roots"] }
+tonic-prost = "0.14.6"
+tonic-prost-build = "0.14.6"
+prost = "0.14.4"
+prost-types = "0.14.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+# Observability
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+
+# Errors
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+
+# Serialization, CLI and configuration
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dotenvy = "0.15.7"
+
+# Crypto and auth: node HMAC tokens, PBKDF2 password hashes, HS256 JWTs
+rand = "0.10.3"
+hex = "0.4.3"
+sha2 = "0.11.0"
+hmac = "0.13.0"
+pbkdf2 = "0.13.0"
+subtle = "2.6.1"
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
+
+# Persistence. sqlx over tokio-postgres: built-in pool and migrations, typed
+# row mapping, and runtime queries that build without a live database.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "macros", "migrate"] }
+
+# Linux-only vsock sockets (guest agent and node operator)
+tokio-vsock = "0.7.2"
+libc = "0.2"
+
+# Tests
+tempfile = "3.27.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

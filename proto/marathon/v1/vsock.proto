@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package marathon.v1;
+
+import "marathon/v1/types.proto";
+
+// Node operator <-> VM agent messages over vsock.
+//
+// Framing: each message is a 4-byte unsigned big-endian length followed by
+// that many bytes of an encoded VsockMessage. Frames larger than 16 MiB are
+// rejected. Through Firecracker the host side first connects to the VM's
+// vsock Unix socket, writes "CONNECT <port>\n" and reads one line that must
+// start with "OK " before framing starts.
+//
+// Conversation: the agent sends ready; the node sends start; the agent sends
+// any number of output, metrics and progress messages, then exactly one of
+// complete or error. The node may send cancel at any time after start.
+message VsockMessage {
+  oneof payload {
+    VsockReady ready = 1;
+    VsockStart start = 2;
+    VsockCancel cancel = 3;
+    VsockOutput output = 4;
+    VsockMetrics metrics = 5;
+    VsockProgress progress = 6;
+    VsockComplete complete = 7;
+    VsockError error = 8;
+  }
+}
+
+// Agent -> node: listening and ready for a task.
+message VsockReady {
+  // The guest's vsock context id.
+  uint32 vm_id = 1;
+}
+
+// Node -> agent: run this task.
+message VsockStart {
+  string task_id = 1;
+  string repo_url = 2;
+  string branch = 3;
+  string prompt = 4;
+  string github_token = 5;
+  string anthropic_api_key = 6;
+  bool create_pr = 7;
+  optional string pr_title = 8;
+  optional string pr_body = 9;
+  optional uint32 max_iterations = 10;
+  optional string completion_promise = 11;
+  repeated EnvVar env_vars = 12;
+}
+
+// Node -> agent: stop the running task.
+message VsockCancel {}
+
+// Agent -> node: a chunk of output.
+message VsockOutput {
+  OutputType type = 1;
+  bytes data = 2;
+}
+
+// Agent -> node: cumulative token usage so far.
+message VsockMetrics {
+  int64 input_tokens = 1;
+  int64 output_tokens = 2;
+  int64 cache_read_tokens = 3;
+  int64 cache_write_tokens = 4;
+  int64 tool_calls = 5;
+}
+
+// Agent -> node: Ralph loop progress.
+message VsockProgress {
+  uint32 iteration = 1;
+  uint32 max_iterations = 2;
+  string status = 3;
+}
+
+// Agent -> node: the task finished.
+message VsockComplete {
+  int32 exit_code = 1;
+  optional string pr_url = 2;
+  VsockMetrics metrics = 3;
+  // Iteration on which the loop stopped.
+  uint32 iteration = 4;
+  // Whether the completion promise was found in the output.
+  bool promise_found = 5;
+}
+
+// Agent -> node: the task could not run or failed outside Claude Code.
+message VsockError {
+  string code = 1;
+  string message = 2;
+}

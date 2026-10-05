@@ -29,3 +29,6 @@ __pycache__/
 logs/
 test-build
 zig-out/
+
+# Rust
+target/
